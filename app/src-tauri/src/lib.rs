@@ -2709,7 +2709,12 @@ fn default_state_root() -> PathBuf {
         return PathBuf::from(d);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/agent-teams")
+    // NESTED under harness-ready/ (one level below Application Support) so the fixed-name
+    // SIBLINGS of state_root — agent-teams-mcp.sock, the live registry, persist/audit files —
+    // land in harness-ready/, private to this fork. The production Agent Teams app uses
+    // Application Support/agent-teams with siblings directly in Application Support/; sharing
+    // that dir meant our startup wipe + socket bind clobbered the other app's fleet.
+    PathBuf::from(home).join("Library/Application Support/harness-ready/agent-teams")
 }
 
 /// Staging dir for the bundled hooks — a sibling of `state_root`, so the startup
@@ -13555,6 +13560,13 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let state_root = default_state_root();
+            // The default state_root parent (…/harness-ready/) does not pre-exist the way
+            // Application Support/ does — create it BEFORE the sibling writers touch it
+            // (instance.lock flock, live-registry write, mcp socket bind). Idempotent,
+            // best-effort; also covers an AGENT_TEAMS_STATE_DIR override with a fresh parent.
+            if let Some(parent) = state_root.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let worktree_registry = default_registry_path();
             // Q4 Stage-4 D6 write-ahead store: a sibling of state_root (survives the startup
             // wipe) so an id we asked the daemon to spawn is reconcilable after a crash/relaunch.

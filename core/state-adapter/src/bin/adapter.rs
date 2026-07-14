@@ -7,7 +7,7 @@
 //!   adapter inject <cursor|claude> <id> <repo-dir> # inject hooks (AGENT_TEAMS_HOOKS_DIR)
 //!
 //! STATE_DIR defaults to $AGENT_TEAMS_STATE_DIR, else
-//! ~/Library/Application Support/agent-teams.
+//! ~/Library/Application Support/harness-ready/agent-teams.
 
 use state_adapter::inject::{inject, InjectConfig, InjectHarness};
 use state_adapter::watch::{current_states, discover};
@@ -103,7 +103,7 @@ fn default_state_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/agent-teams")
+    PathBuf::from(home).join("Library/Application Support/harness-ready/agent-teams")
 }
 
 fn now_ms() -> u64 {

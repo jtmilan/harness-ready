@@ -12,7 +12,7 @@
 # agent: swallow errors, ALWAYS exit 0. No hard python3 dependency (pure date + printf).
 
 WSID="${1:-unknown}"
-STATE_BASE="${2:-${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}}"
+STATE_BASE="${2:-${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}}"
 DIR="$STATE_BASE/$WSID"
 mkdir -p "$DIR" 2>/dev/null
 

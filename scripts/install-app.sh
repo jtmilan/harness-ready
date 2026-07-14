@@ -52,7 +52,7 @@ DEST_NAME="$APP_NAME"
 if [[ "$TESTING" == "1" ]]; then
   DEST_NAME="Agent Teams Dev"
   DEV_BUNDLE_ID="com.jeffrymilan.agentteams.dev"
-  DEV_STATE_DIR="$HOME/Library/Application Support/agent-teams-dev"
+  DEV_STATE_DIR="$HOME/Library/Application Support/harness-ready/agent-teams-dev"
 fi
 DEST="/Applications/$DEST_NAME.app"
 
@@ -242,12 +242,12 @@ elif [[ ! -x "$_DAEMON_BINARY" || "${AGENT_TEAMS_DAEMON_LAUNCHAGENT:-0}" != "1" 
   # owed a security review of the live PTY-ownership transfer, design Q4).
   echo "==> daemon LaunchAgent registration gated OFF (set AGENT_TEAMS_DAEMON_LAUNCHAGENT=1 to enable) — skipping"
 else
-  # AGENT_TEAMS_STATE_DIR (default ~/Library/Application Support/agent-teams) IS
+  # AGENT_TEAMS_STATE_DIR (default ~/Library/Application Support/harness-ready/agent-teams) IS
   # state_root — the SAME value the app's default_state_root() (app/src-tauri/src/lib.rs)
   # and the daemon's resolve_state_root() (core/daemon/src/main.rs) both resolve. Do NOT
   # append /agent-teams: that would double-nest state_root and place the socket INSIDE it
   # (the inside path is wiped on every app launch — see state_sibling()).
-  _DAEMON_STATE_ROOT="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}"
+  _DAEMON_STATE_ROOT="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}"
   # Socket path mirrors agent_teams_core::socket_path EXACTLY:
   #   socket_path(state_root) = state_root.parent()/agent-teams-mcp.sock
   # i.e. a SIBLING of state_root, one level up (NOT inside it). This is the same UDS the
@@ -259,7 +259,9 @@ else
   _DAEMON_LOG_DIR="$HOME/Library/Logs/agent-teams"
   _DAEMON_LOG="$_DAEMON_LOG_DIR/daemon.log"
 
-  mkdir -p "$_DAEMON_PLIST_DIR" "$_DAEMON_LOG_DIR"
+  # The socket's parent (state_root's parent, …/harness-ready/) is NOT pre-existing the way
+  # Application Support/ is — launchd needs it present to bind SockPathName.
+  mkdir -p "$_DAEMON_PLIST_DIR" "$_DAEMON_LOG_DIR" "$(dirname "$_DAEMON_SOCK_PATH")"
 
   echo "==> installing daemon LaunchAgent plist (D45 A1 socket-activation)…"
   cat > "$_DAEMON_PLIST" <<DAEMON_PLIST_EOF
@@ -323,7 +325,7 @@ fi
 if [[ "$TESTING" == "1" ]]; then
   STATE_DIR="$DEV_STATE_DIR"
 else
-  STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}"
+  STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}"
 fi
 DEV_SOURCE="$(dirname "$STATE_DIR")/$(basename "$STATE_DIR")-dev-source"
 mkdir -p "$(dirname "$DEV_SOURCE")"
