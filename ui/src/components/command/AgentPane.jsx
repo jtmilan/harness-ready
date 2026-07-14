@@ -90,6 +90,9 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   const fitRef = useRef(null);
   const writtenRef = useRef(0); // bytes of agent.raw already written to the terminal
   const genRef = useRef(agent.gen || 0);
+  // Debounced fit→resize_pty trigger owned by the mount effect; exposed via a ref so
+  // the layout-props effect below can nudge it without re-running the mount effect.
+  const pushResizeRef = useRef(null);
   // Per-pane renderer state for the WebGL policy (term set at mount; webgl managed by visibility).
   const glRef = useRef({ term: null, webgl: null, webglBlocked: false });
 
@@ -119,30 +122,78 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // Sync the backend PTY winsize to the terminal so TUIs paint at the widget size.
     // Prod-parity fitSession guard (agent-teams main.js:667-675): only tell the PTY to
     // resize when rows/cols ACTUALLY changed — prevents a resize→SIGWINCH→repaint→resize
-    // feedback loop, and keeps a seam drag from flooding resize_pty per pixel. The fit
-    // itself is rAF-coalesced so a burst of ResizeObserver ticks costs one reflow.
-    let lastRows = 0;
+    // feedback loop, and keeps a seam drag from flooding resize_pty per pixel.
+    //
+    // lastRows/lastCols hold the dims the BACKEND ACKED, not the dims we last tried:
+    // resize_pty races the multi-second spawn_workspace (the optimistic pane mounts
+    // before the PTY registers → "no such workspace"), and the old code cached the
+    // dims on a swallowed failure — leaving the PTY at its 30×100 spawn size FOREVER
+    // (the change-guard blocked every later sync). On failure we now keep the guard
+    // stale and retry on a timer until the PTY acks, so a pane that finishes spawning
+    // gets its winsize without needing another geometry change.
+    let lastRows = 0;   // last dims acked by resize_pty (0 = never synced)
     let lastCols = 0;
-    let fitRaf = 0;
-    const pushResize = () => {
-      if (fitRaf) return;
-      fitRaf = requestAnimationFrame(() => {
-        fitRaf = 0;
-        try { fit && fit.fit(); } catch { return; }
-        if (!term.rows || !term.cols) return;
-        if (term.rows === lastRows && term.cols === lastCols) return;
-        lastRows = term.rows;
-        lastCols = term.cols;
-        if (onResize) onResize(agent.id, term.rows, term.cols);
-      });
+    let syncing = false;  // resize_pty in flight
+    let pending = false;  // geometry changed while an invoke was in flight
+    let retries = 0;      // autonomous retry budget (reset by fresh geometry events)
+    let debTimer = 0;
+    let retryTimer = 0;
+    let disposed = false;
+    const MAX_RETRIES = 40; // × 500ms ≈ 20s — covers a slow worktree-backed spawn
+
+    const syncNow = () => {
+      if (disposed || !term.element) return; // never fit() before term.open()
+      // 0×0 / collapsed rect (display:none ws, transient layout): skip — the
+      // ResizeObserver fires again when the pane gets a real box. Without this,
+      // FitAddon can propose its 2×1 minimum and SIGWINCH the TUI into garbage.
+      const box = mountRef.current && mountRef.current.getBoundingClientRect();
+      if (!box || box.width < 2 || box.height < 2) return;
+      try { fit && fit.fit(); } catch { return; }
+      const rows = term.rows;
+      const cols = term.cols;
+      if (!rows || !cols) return;
+      if (rows === lastRows && cols === lastCols) return; // PTY already matches
+      if (syncing) { pending = true; return; }
+      syncing = true;
+      Promise.resolve(onResize && onResize(agent.id, rows, cols))
+        .then(() => { lastRows = rows; lastCols = cols; })
+        .catch(() => {
+          // Backend can't resize yet (pane still spawning / transient) — leave the
+          // acked dims stale so the guard stays open, and retry until it lands.
+          if (!disposed && retries < MAX_RETRIES) {
+            retries += 1;
+            clearTimeout(retryTimer);
+            retryTimer = setTimeout(syncNow, 500);
+          }
+        })
+        .finally(() => {
+          syncing = false;
+          if (pending && !disposed) { pending = false; syncNow(); }
+        });
     };
+    // Trailing ~80ms debounce: a live window drag / seam drag fires ResizeObserver
+    // per frame; one fit + at most one resize_pty lands after the burst settles.
+    const pushResize = () => {
+      if (disposed) return;
+      retries = 0; // a fresh geometry event re-arms the retry budget
+      clearTimeout(debTimer);
+      debTimer = setTimeout(syncNow, 80);
+    };
+    pushResizeRef.current = pushResize;
     pushResize();
+    // Container geometry (tiling/seam drag/maximize/restore/cross-ws move all end up
+    // resizing this element) + window resize as belt-and-braces for webview quirks.
     const ro = new ResizeObserver(pushResize);
     if (mountRef.current) ro.observe(mountRef.current);
+    window.addEventListener("resize", pushResize);
 
     return () => {
-      if (fitRaf) cancelAnimationFrame(fitRaf);
+      disposed = true;
+      clearTimeout(debTimer);
+      clearTimeout(retryTimer);
+      window.removeEventListener("resize", pushResize);
       ro.disconnect();
+      pushResizeRef.current = null;
       onDataDisposable.dispose();
       detachWebgl(glRef.current);
       glRef.current.term = null;
@@ -153,6 +204,16 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     };
     // agent.id is stable for a pane's lifetime; deliberately mount-once.
   }, [agent.id]);
+
+  // Deterministic re-fit on layout-driven geometry changes (tiling mode switch,
+  // maximize/restore, seam-drag commit, visibility flip). The ResizeObserver above
+  // covers these too, but keying on the actual rect props costs nothing and keeps
+  // the pane correct even if an observation is missed under WKWebView.
+  const styleW = style ? style.width : undefined;
+  const styleH = style ? style.height : undefined;
+  useEffect(() => {
+    if (pushResizeRef.current) pushResizeRef.current();
+  }, [styleW, styleH, visible]);
 
   // WebGL on visible panes only (prod policy): attach when shown, free the GPU context on hide.
   useEffect(() => {

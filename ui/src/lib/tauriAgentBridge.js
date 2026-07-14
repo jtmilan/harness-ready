@@ -145,10 +145,27 @@ export class TauriAgentBridge {
       // was replayed from a later base, so the accumulated scrollback is stale. Reset
       // this pane's buffer and bump its generation so the terminal does a full RIS.
       if (d.truncated) {
-        this.raw[d.id] = d.data;
+        // Cap a huge replay too (backend retains 4MB) — the gen bump below already
+        // resets the terminal, so starting mid-stream costs at most one cosmetic
+        // fragment at the very top of scrollback.
+        this.raw[d.id] = d.data.slice(-160000);
         this.gen[d.id] = (this.gen[d.id] || 0) + 1;
       } else {
-        this.raw[d.id] = ((this.raw[d.id] || "") + d.data).slice(-200000);
+        // The pane writes raw.slice(writtenRef) — an ABSOLUTE cursor into this
+        // string. The old silent `.slice(-200000)` front-trim shifted the string
+        // under that cursor: the first crossing dropped delta bytes mid-escape
+        // (literal "245;48;5;233m" fragments on grok panes), and once pinned at
+        // exactly the cap, raw.length === writtenRef → the pane FROZE (no new
+        // bytes ever written; backend truncation at 4MB never fires because our
+        // `since` cursor keeps advancing). Trim in big hysteresis steps WITH a
+        // gen bump instead, so the pane does reset + full rewrite of the window.
+        const grown = (this.raw[d.id] || "") + d.data;
+        if (grown.length > 240000) {
+          this.raw[d.id] = grown.slice(-120000);
+          this.gen[d.id] = (this.gen[d.id] || 0) + 1;
+        } else {
+          this.raw[d.id] = grown;
+        }
       }
       if (typeof d.next === "number") this.offsets[d.id] = d.next;
     }
@@ -219,7 +236,11 @@ export class TauriAgentBridge {
   // Raw keystrokes from the xterm terminal — sent verbatim (NO trailing newline; the
   // terminal already includes \r etc.). Distinct from sendInput's line-submit path.
   sendRaw(id, data) { return invoke("send_input", { id, data }); }
-  resizePane(id, rows, cols) { return invoke("resize_pty", { id, rows, cols }).catch(() => {}); }
+  // NO .catch here: the rejection is the AgentPane's signal to keep its "acked
+  // dims" guard open and retry — resize_pty races the multi-second spawn_workspace
+  // (optimistic pane mounts first → "no such workspace"), and swallowing that left
+  // the PTY at its 30×100 spawn size forever while xterm re-fit without it.
+  resizePane(id, rows, cols) { return invoke("resize_pty", { id, rows, cols }); }
   delegate(id, task) { return this.sendInput(id, task); }
   broadcast(text) { return Promise.all(this.agents.map((a) => this.sendInput(a.id, text))); }
   broadcastTo(ids, text) { return Promise.all(ids.map((id) => this.sendInput(id, text))); }
