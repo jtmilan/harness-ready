@@ -754,6 +754,9 @@ async fn list_harness_models(harness: String) -> serde_json::Value {
             // generic probe risks the codex-style billed trap) → fallback tiles until one is
             // verified. Explicit arm so a reader doesn't mistake it for an oversight.
             Some(Harness::Cline) => None,
+            // grok: no verified credit-free list command (model flag AMBIGUOUS / unverified) →
+            // fallback tiles until one is verified. Explicit arm (LAST, after cline).
+            Some(Harness::Grok) => None,
             // claude (no list command — it's a billed trap), bash (no model), unknown wire.
             Some(Harness::Claude) | Some(Harness::Bash) | None => None,
         }
@@ -1515,9 +1518,9 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
                     do_resume = false; // → session_args = [] (fresh chat)
                 }
             }
-            // bash + codex + commandcode + opencode + cline never resume (session_args is
+            // bash + codex + commandcode + opencode + cline + grok never resume (session_args is
             // always [] for them) → no safety-net downgrade needed; a fresh spawn is the only path.
-            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline => {}
+            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline | Harness::Grok => {}
         }
     }
 

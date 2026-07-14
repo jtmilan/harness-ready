@@ -145,7 +145,8 @@ fn session_args(harness: Harness, session_id: Option<&str>, resume: bool) -> Vec
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline => {
+        | Harness::Cline
+        | Harness::Grok => {
             vec![]
         }
     }
@@ -194,7 +195,8 @@ fn mcp_args(harness: Harness, claude_cfg: Option<&Path>, is_worker: bool) -> Vec
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline => vec![],
+        | Harness::Cline
+        | Harness::Grok => vec![],
     }
 }
 
@@ -213,7 +215,8 @@ fn model_args(harness: Harness, model: Option<&str>) -> Vec<String> {
     }
     match harness {
         Harness::Claude | Harness::Cursor => vec!["--model".into(), m.into()],
-        Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline => {
+        // grok CLI exposes `-m, --model <MODEL>` (v0.2.101) — short form matches this arm.
+        Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline | Harness::Grok => {
             vec!["-m".into(), m.into()]
         }
         Harness::Bash => vec![],
@@ -1904,6 +1907,10 @@ mod tests {
             vec!["-m", "anthropic/claude-sonnet-4"]
         );
         assert_eq!(
+            model_args(Harness::Grok, Some("grok-4")),
+            vec!["-m", "grok-4"]
+        );
+        assert_eq!(
             model_args(Harness::Bash, Some("anything")),
             Vec::<String>::new()
         );
@@ -2036,13 +2043,14 @@ mod tests {
         let all = Harness::all();
         assert_eq!(
             all.len(),
-            7,
-            "Claude, Cursor, Bash, Codex, CommandCode, OpenCode, Cline"
+            8,
+            "Claude, Cursor, Bash, Codex, CommandCode, OpenCode, Cline, Grok"
         );
         assert!(all.contains(&Harness::Codex));
         assert!(all.contains(&Harness::CommandCode));
         assert!(all.contains(&Harness::OpenCode));
         assert!(all.contains(&Harness::Cline));
+        assert!(all.contains(&Harness::Grok));
         let oc = Harness::OpenCode.descriptor();
         assert_eq!(oc.command, "opencode");
         assert_eq!(oc.wire, "opencode");
@@ -2058,6 +2066,15 @@ mod tests {
         assert!(
             cl.inject.is_none(),
             "cline is state-blind (no hook injection)"
+        );
+        let gk = Harness::Grok.descriptor();
+        assert_eq!(gk.command, "grok");
+        assert_eq!(gk.wire, "grok");
+        assert_eq!(gk.display, "Grok Build");
+        assert_eq!(gk.spawn_args, &[] as &[&str]);
+        assert!(
+            gk.inject.is_none(),
+            "grok is state-blind (no hook injection)"
         );
         // every descriptor is complete, wires are unique, and each round-trips through
         // the wire id (the table-driven parse_harness keys on exactly this).

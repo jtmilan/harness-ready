@@ -94,6 +94,7 @@ fn harness_str(h: Harness) -> &'static str {
         Harness::CommandCode => "commandcode",
         Harness::OpenCode => "opencode",
         Harness::Cline => "cline",
+        Harness::Grok => "grok",
     }
 }
 
@@ -789,6 +790,7 @@ pub fn split_settle_ms(wire: &str, payload_len: usize) -> u64 {
         "opencode" => 180,    // joined the coalescing set (06-08)
         "commandcode" => 200, // Ink, slowest batching observed
         "cline" => 200,       // Ink TUI, slowest-batch class (= commandcode)
+        "grok" => 200,        // conservative base (= cline); TUI coalescing unmeasured
         "bash" => return 0,   // never splits (harness_needs_split_submit=false)
         _ => 100,             // unknown harness → claude-equivalent safe default
     };
@@ -869,7 +871,7 @@ pub fn op_external_spawn_allowed(req: &SocketRequest) -> bool {
 pub fn external_spawn_harness_allowed(harness: &str) -> bool {
     matches!(
         harness.trim().to_ascii_lowercase().as_str(),
-        "claude" | "cursor" | "codex" | "opencode" | "commandcode" | "cline"
+        "claude" | "cursor" | "codex" | "opencode" | "commandcode" | "cline" | "grok"
     )
 }
 

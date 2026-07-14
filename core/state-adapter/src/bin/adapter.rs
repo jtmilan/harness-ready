@@ -162,6 +162,7 @@ fn harness_str(h: Harness) -> &'static str {
         Harness::CommandCode => "commandcode",
         Harness::OpenCode => "opencode",
         Harness::Cline => "cline",
+        Harness::Grok => "grok",
     }
 }
 

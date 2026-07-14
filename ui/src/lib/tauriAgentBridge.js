@@ -23,8 +23,8 @@ const POLL_MS = 120;
 // UI kind (agentTypes.js key) → backend harness wire string. Wire strings are the
 // `descriptor().wire` values in agent-teams core/harness/src/lib.rs, parsed by
 // `parse_harness` (app/src-tauri/src/lib.rs) — NOT the CLI command name (cursor's
-// cmd is "cursor-agent" but its wire string is "cursor"). Kinds the backend has no
-// harness for (grok) fall back to "bash".
+// cmd is "cursor-agent" but its wire string is "cursor"). Unknown kinds fall
+// back to "bash".
 const HARNESS_WIRE = {
   "claude-code": "claude",
   cursor: "cursor",
@@ -32,6 +32,7 @@ const HARNESS_WIRE = {
   opencode: "opencode",
   commandcode: "commandcode",
   cline: "cline",
+  grok: "grok",
   bash: "bash",
 };
 
@@ -68,10 +69,11 @@ export class TauriAgentBridge {
     this.raw = {};           // pane id → accumulated RAW PTY bytes (fed verbatim to xterm)
     this.gen = {};           // pane id → generation; bumps on a `truncated` history gap → term reset
     this.spawned = loadSpawned(); // pane id → {kind, role} the adapter itself spawned; read set is
-                             // the UNION of these and list_queue ids, so a bash/grok pane (which
-                             // never writes events.jsonl → never enters list_queue) still streams.
-                             // Persisted: a webview reload must not orphan live bash panes (their
-                             // PTYs survive in the backend but list_queue never surfaces them).
+                             // the UNION of these and list_queue ids, so a state-blind pane
+                             // (bash, grok, … — never writes events.jsonl → never enters
+                             // list_queue) still streams.
+                             // Persisted: a webview reload must not orphan live state-blind panes
+                             // (their PTYs survive in the backend but list_queue never surfaces them).
     this.listeners = new Set();
     this.timer = null;
   }
@@ -118,10 +120,11 @@ export class TauriAgentBridge {
     for (const row of queue) rowById[row.id] = row;
 
     // 2. Read output for the UNION of queue ids and adapter-spawned ids. `list_queue`
-    //    only surfaces panes that have an on-disk events.jsonl, so a bash/grok pane (no
-    //    hook, excluded from the synthetic ready event) never appears there — reading
-    //    only queue ids leaves it silent forever. Spawned ids close that gap (mirrors
-    //    the prod frontend reading over its own session map, not the queue).
+    //    only surfaces panes that have an on-disk events.jsonl, so a state-blind pane
+    //    like bash or grok (no hook, excluded from the synthetic ready event) never
+    //    appears there — reading only queue ids leaves it silent forever. Spawned ids
+    //    close that gap (mirrors the prod frontend reading over its own session map,
+    //    not the queue).
     const ids = Array.from(new Set([...queue.map((r) => r.id), ...Object.keys(this.spawned)]));
     const reqs = ids.map((id) => ({ id, since: this.offsets[id] || 0 }));
     const deltas = reqs.length ? await invoke("read_output_delta_batch", { reqs }) : [];

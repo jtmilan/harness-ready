@@ -5,9 +5,9 @@ export const AGENT_KINDS = {
   cursor: { label: "CURSOR", cmd: "cursor-agent" },
   opencode: { label: "OPENCODE", cmd: "opencode" },
   codex: { label: "CODEX", cmd: "codex" },
-  grok: { label: "GROK", cmd: "grok" },
   commandcode: { label: "COMMANDCODE", cmd: "commandcode" },
   cline: { label: "CLINE", cmd: "cline" },
+  grok: { label: "GROK", cmd: "grok" },
   bash: { label: "BASH", cmd: "bash" },
 };
 

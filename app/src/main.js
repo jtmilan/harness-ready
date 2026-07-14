@@ -5671,8 +5671,8 @@ let fwWorkers = 3;
 // CLAUDE is live-verifiable AND keeps the token/cost meter (it emits parseable usage) + a tight
 // allowlist (commit ✓ / push ✗). The others run on YOUR subscription (the meter goes blind →
 // "subscription" label) via a coarser autonomous-commit mode, and are UNVERIFIED → experimental.
-const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline"];
-const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline" };
+const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline", "grok"];
+const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline", grok: "Grok Build" };
 // Curated quick-pick models per harness. NOT exhaustive + ACCOUNT-SCOPED (ids rot + depend on your
 // auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "default"
 // chip) = the harness account default (no --model), the SAFEST pick (a stale/unauthed id 400s).
@@ -5685,6 +5685,7 @@ const FW_MODELS = {
   commandcode: ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"],
   opencode: ["github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
   cline: ["anthropic/claude-sonnet-4", "anthropic/claude-opus-4", "openai/gpt-5"],
+  grok: ["grok-4.5"],
 };
 let fwHarness = "claude";
 function fwModelTextEl() { return document.getElementById("fw-model-text"); }

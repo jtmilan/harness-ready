@@ -137,6 +137,7 @@ fn parse_latest_line(line: &str) -> Option<(Harness, AgentState)> {
         "commandcode" => Harness::CommandCode,
         "opencode" => Harness::OpenCode,
         "cline" => Harness::Cline,
+        "grok" => Harness::Grok,
         _ => return None,
     };
     let event = str_field(line, "event")?.to_string();
