@@ -1,0 +1,47 @@
+[package]
+name = "agent-teams-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — detached daemon skeleton (Phase 08 Sub-build 1): launch-agnostic lifecycle DECISION LOGIC + trait/placeholder surfaces. Owns NO PTY and NO socket yet (later sub-builds)."
+
+[lib]
+name = "agent_teams_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-teams-daemon"
+path = "src/main.rs"
+
+# SSOT: reuse core/mcp's `socket_path` / `registry_path` / `LiveRegistry` by PATH
+# DEP — never redefine them here. Adding this dep is NOT "editing core/mcp"; this
+# crate touches no file under core/mcp/. The only NEW path code lives in
+# `runstate.rs` (`DAEMON_RUNSTATE_FILE` + `daemon_runstate_path`), mirroring
+# `agent_teams_core::registry_path`.
+[dependencies]
+agent-teams-core = { path = "../mcp" }
+# Sub-build 2 (08-T4): `DaemonSups` is the relocated owner of real `Supervisor`s
+# (the PTY master fds), so it depends on the supervisor crate. Adding this dep does
+# NOT touch any file under core/supervisor; it only lets the daemon HOLD a Supervisor.
+supervisor = { path = "../supervisor" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# FFI for launch_activate_socket (macOS launchd socket-activation, D45 / 08-T2).
+# Only used in `launch.rs` under `#[cfg(target_os = "macos")]`.
+libc = "0.2"
+# The typed agent-role enum + the PURE coordinator-only socket gate (`coordinator_gate` +
+# `resolve_role_from_ancestry`). A HARD dep: the coordinator-parity gate runs in the BASE
+# build (SendInput/Focus are served WITHOUT the daemon-spawn feature), so the gate SSOT must
+# link unconditionally. `roles` is a tiny std-only leaf crate. Under `daemon-spawn` it is
+# ALSO used by `RealSpawnExec` to map a wire `SpawnSpec.role` into the supervisor spec.
+roles = { path = "../roles" }
+
+[features]
+# Q4 daemon-spawns-on-behalf (approach B). Compiled OUT by default (mirrors the app's
+# `delegate-live = []`): WITHOUT this feature the daemon-spawn handler, lifecycle reaper,
+# spawn-state, and the live `Spawn`/`Close` route wiring DO NOT EXIST in the binary —
+# `route_request` answers `SPAWN_UNAVAILABLE` and the daemon serves the empty map exactly
+# as today. Even WITH the feature compiled in, a `Spawn` still needs BOTH
+# `allow_mutations=true` AND `daemon_spawn_enabled=true` (both default OFF). Flip ON only
+# after the Q4 security review + AC-1 live-verify. The pure handler/validator logic +
+# its unit tests compile under `cfg(test)` so `cargo test` exercises them without this flag.
+daemon-spawn = []

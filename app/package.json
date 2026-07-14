@@ -1,0 +1,30 @@
+{
+  "name": "app",
+  "private": true,
+  "version": "0.9.0",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "test": "vitest run",
+    "lint": "eslint src",
+    "test:watch": "vitest",
+    "test:visual": "playwright test",
+    "test:visual:update": "playwright test --update-snapshots"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/user-event": "^14.6.1",
+    "eslint": "^9.39.4",
+    "globals": "^17.7.0",
+    "happy-dom": "^20.10.6",
+    "vitest": "^3"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "three": "^0.185.1"
+  }
+}

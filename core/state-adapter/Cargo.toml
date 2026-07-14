@@ -1,0 +1,24 @@
+[package]
+name = "state-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — cross-harness state adapter core (normalize hook events → {state, waiting_reason, needs_human})"
+
+[lib]
+name = "state_adapter"
+path = "src/lib.rs"
+
+# Task 2 (lib + normalize tests) is intentionally dependency-free so `cargo test`
+# runs offline. Task 4 (watcher + CLI) adds serde_json + notify for the bin target.
+[dependencies]
+
+# Test-only: 16-01 inject_mcp_config tests parse the rendered config to assert the
+# command + AGENT_TEAMS_STATE_DIR env shape. The shipped lib stays std-only — this
+# is a dev-dependency, never linked into the runtime crate.
+# `harness` is a dev-dep CYCLE (harness deps state-adapter; cargo allows dev-dep
+# cycles) powering the cross-crate exhaustiveness test: `watch::parse_latest_line`
+# must recognize the wire name of EVERY core/harness descriptor, so a newly added
+# harness can't silently be invisible to the ranked queue.
+[dev-dependencies]
+serde_json = "1"
+harness = { path = "../harness" }

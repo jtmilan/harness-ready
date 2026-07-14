@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "agent-teams": {
+      "transport": {
+        "type": "stdio",
+        "command": "{{SIDECAR}}",
+        "args": []
+      },
+      "env": {
+        "AGENT_TEAMS_STATE_DIR": "{{STATE_DIR}}",
+        "AGENT_TEAMS_PANE_ID": "{{PANE_ID}}",
+        "AGENT_TEAMS_MEMORY_REPO_KEY": "{{REPO_KEY}}",
+        "AGENT_TEAMS_TASK_SCOPE": "{{TASK_SCOPE}}"
+      }
+    }{{BRIDGEAGENT}}
+  }
+}

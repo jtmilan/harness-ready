@@ -1,0 +1,18 @@
+# Phase 08 Sub-build 2 substrate: a bounded byte ring buffer — the invariant
+# data structure that will replace the daemon/supervisor's unbounded per-pane
+# output buffer (today an Arc<Mutex<Vec<u8>>>). std-only, pure, no I/O.
+#
+# The delta / cursor / subscription / streaming API is DEFERRED to Sub-build 3
+# (the streaming protocol is still undesigned). This crate ships the bare
+# bounded buffer only.
+[package]
+name = "agent-teams-ringbuf"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "agent_teams_ringbuf"
+path = "src/lib.rs"
+
+# No dependencies — std only (no serde, no Tauri, no supervisor dep).
+[dependencies]

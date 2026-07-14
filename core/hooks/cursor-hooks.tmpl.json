@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "\"{{WRITER}}\" cursor sessionStart {{WSID}}" }],
+    "beforeShellExecution": [{ "command": "\"{{WRITER}}\" cursor beforeShellExecution {{WSID}}" }],
+    "afterShellExecution": [{ "command": "\"{{WRITER}}\" cursor afterShellExecution {{WSID}}" }],
+    "preToolUse": [{ "command": "\"{{WRITER}}\" cursor preToolUse {{WSID}}" }],
+    "stop": [{ "command": "\"{{WRITER}}\" cursor stop {{WSID}}" }]
+  }
+}

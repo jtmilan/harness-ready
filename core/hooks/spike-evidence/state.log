@@ -1,0 +1,5 @@
+10:37:30	sessionStart	{"conversation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","generation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","model":"default","is_backg
+10:38:28	beforeShell	{"conversation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","generation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","model":"default","command"
+10:38:29	afterShell	{"conversation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","generation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","model":"default","command"
+10:38:34	beforeShell	{"conversation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","generation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","model":"default","command"
+10:38:36	afterShell	{"conversation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","generation_id":"44b47a20-0383-4477-87aa-6b413dfa31b7","model":"default","command"

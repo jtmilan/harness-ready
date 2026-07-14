@@ -1,0 +1,19 @@
+[package]
+name = "agent-teams-task"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — persisted Task model: the first durable, human-owned product entity (option-b plan-item #1). A sibling-of-state_root JSONL store, independent of the state machine."
+
+[lib]
+name = "agent_teams_task"
+path = "src/lib.rs"
+
+# DEPENDENCY DISCIPLINE (load-bearing): serde + serde_json ONLY.
+#  · NO state-adapter — a Task is independent of the agent state machine; a dep
+#    would re-couple it to pane/RunRecord lifecycle (see the seams in lib.rs).
+#  · NO schemars — there is no MCP wire need for the Task type.
+#  · ZERO Tauri — the store is unit-testable offline, like core/mcp compute_queue.
+#  · NO tempfile — tests hand-roll a `Scratch` tempdir (mirrors core/mcp).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

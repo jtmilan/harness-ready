@@ -1,0 +1,20 @@
+[package]
+name = "agent-teams-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — BridgeMemory note store (Mem-1, Phase 10): zero-dep per-note-file store with atomic-rename + last-writer-wins, sibling-of-state_root + repo-keyed. Targets pain #3 (context loss). NO embeddings, NO single-JSONL upsert race."
+
+[lib]
+name = "agent_teams_memory"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Optional, OFF by default → the default build stays zero-dep (serde + std). The
+# sidecar enables `schema` so Note/Suggestion can root an MCP outputSchema (mirrors
+# core/mcp gating schemars behind a feature). Pin the SAME 1.x the sidecar uses.
+schemars = { version = "1", optional = true }
+
+[features]
+schema = ["dep:schemars"]

@@ -1,0 +1,66 @@
+{
+  "name": "AgentTemplate",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Template display name"
+    },
+    "description": {
+      "type": "string",
+      "description": "What this agent team is for"
+    },
+    "agents": {
+      "type": "array",
+      "description": "Agent configurations to launch",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "cursor",
+              "opencode",
+              "codex",
+              "grok",
+              "commandcode",
+              "cline",
+              "bash"
+            ],
+            "default": "claude-code",
+            "description": "Which interactive coding agent CLI to spawn"
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "low",
+              "normal",
+              "high"
+            ],
+            "default": "normal"
+          },
+          "autonomy": {
+            "type": "string",
+            "enum": [
+              "supervised",
+              "semi",
+              "full"
+            ],
+            "default": "semi"
+          }
+        },
+        "required": [
+          "role"
+        ]
+      }
+    }
+  },
+  "required": [
+    "name",
+    "agents"
+  ]
+}

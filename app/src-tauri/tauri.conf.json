@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Harness Ready",
+  "version": "0.9.0",
+  "identifier": "com.jeffrymilan.harnessready",
+  "build": {
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeBuildCommand": "bash ../scripts/fetch-whisper-model.sh && npm --prefix ../ui run build",
+    "frontendDist": "../../ui/dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Harness Ready",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "externalBin": ["binaries/whisper-cli", "binaries/agent-teams-mcp", "binaries/agent-teams-mcp-coordinator", "binaries/agent-teams-daemon"],
+    "resources": {
+      "../../core/hooks/state-writer.sh": "hooks/state-writer.sh",
+      "../../core/hooks/codex-notify.sh": "hooks/codex-notify.sh",
+      "../../core/hooks/opencode-state-plugin.js": "hooks/opencode-state-plugin.js",
+      "../../core/hooks/claude-hooks.tmpl.json": "hooks/claude-hooks.tmpl.json",
+      "../../core/hooks/cursor-hooks.tmpl.json": "hooks/cursor-hooks.tmpl.json",
+      "../../core/hooks/claude-mcp.tmpl.json": "hooks/claude-mcp.tmpl.json",
+      "../../core/hooks/cursor-mcp.tmpl.json": "hooks/cursor-mcp.tmpl.json",
+      "../../core/hooks/commandcode-mcp.tmpl.json": "hooks/commandcode-mcp.tmpl.json",
+      "../../core/hooks/cline-mcp.tmpl.json": "hooks/cline-mcp.tmpl.json",
+      "../../core/hooks/cursor-role.tmpl.md": "hooks/cursor-role.tmpl.md",
+      "models/ggml-tiny.en.bin": "models/ggml-tiny.en.bin"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+[package]
+name = "agent-teams-core"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — serde-able queue projection over the zero-dep state-adapter (MCP Phase A; the future extraction target for app/src-tauri compute_queue)"
+
+[lib]
+name = "agent_teams_core"
+path = "src/lib.rs"
+
+# This crate is the home the PRD §14 / .paul/analysis/context-router-mcp.md
+# designate for the serde-able `QueueRow` + projection: `state-adapter` must
+# stay zero-dep, and `QueueRow: Serialize` cannot live there. Ranking stays
+# single-source — we call `state_adapter::watch::current_states` (→ `rank()`),
+# never a second comparator. Only the *wire projection* lives here, and it is
+# the corrected `turn_end`/`rate_limit` form (adapter.rs:151-159), with `since`.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# serde_json parses the sibling live registry (`agent-teams-live.json`). This is
+# NOT state-adapter (which stays zero-dep / hand-rolls its JSONL reader); this
+# crate already carries serde, so a real JSON parser is fine here.
+serde_json = "1"
+# Phase-12 (D51) sidecar-dial HMAC-SHA256 identity-challenge SSOT primitive.
+# PROVISIONAL — the phases-10-15 SLATE §7 routed "add hmac+sha2 to the deliberately
+# dep-lean core/mcp vs hand-roll" to the security review's dep-lean ruling; this dep-add
+# is PENDING that ruling, NOT a settled decision (see 12-01-PLAN "Dep decision" note).
+# We use the well-audited `hmac`+`sha2` rather than hand-rolling SHA-256 (you do not
+# hand-roll a hash); the constant-time MAC compare still reuses this crate's own
+# hand-rolled `constant_time_eq` (no `subtle`/extra constant-time dep). `hex` does the
+# token/nonce decode + MAC encode (also provisional under the same ruling).
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# Optional: derive `schemars::JsonSchema` on `QueueRow` so the MCP sidecar can
+# build a valid (object-root) tool outputSchema from the single shared type
+# instead of duplicating the row shape. Off by default — keeps this crate's
+# default build lean; the bin enables it via `features = ["schema"]`.
+schemars = { version = "1", optional = true }
+state-adapter = { path = "../state-adapter" }
+
+[features]
+# Adds `JsonSchema` to the wire types (for MCP outputSchema generation).
+schema = ["dep:schemars"]

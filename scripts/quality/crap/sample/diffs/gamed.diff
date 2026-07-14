@@ -1,0 +1,21 @@
+diff --git a/index.test.js b/index.test.js
+--- a/index.test.js
++++ b/index.test.js
+@@ -0,0 +1,8 @@
++const { gnarly } = require('./index.js');
++test('covers gnarly branches', () => {
++  gnarly(3, 4, 0);
++  gnarly(-9, 0, 1);
++  gnarly(12, 1, 0);
++  gnarly(-12, 0, 9);
++});
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -50,0 +51,6 @@
++    #[test]
++    fn exercises_gnarly() {
++        gnarly(3, 4, 0);
++        gnarly(-9, 0, 1);
++        let _ = gnarly(12, 1, 0);
++    }

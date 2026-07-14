@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["core/state-adapter", "core/supervisor", "core/harness", "core/flywheel", "core/mcp", "agent-teams-mcp", "core/daemon", "core/task", "core/ringbuf", "core/memory", "core/roles", "core/agent"]
+# app/ is the Tauri project — its own build (own target, own deps tree); it
+# depends on the core crates by path. Excluded so cargo doesn't absorb it.
+exclude = ["app"]
+
+# Agent Teams — cargo workspace.
+# core/state-adapter : Phase 01 — hook normalization + ranking + injection (dep-free)
+# core/supervisor    : Phase 02 — PTY session supervisor + git-worktree isolation
+# core/mcp           : Phase A  — serde-able QueueRow projection over state-adapter
+# agent-teams-mcp    : Phase A  — read-only MCP sidecar (rmcp, stdio) over core/mcp
+# core/daemon        : Phase 08 — detached-daemon launch-agnostic skeleton (pre-seed stub)
+# core/task          : Phase 09 — persisted Task model (option-b plan-item #1; pre-seed stub)
+# core/roles         : Phase 17 — typed agent-role persona SSOT (Coordinator/Builder/Scout/Reviewer)
+# core/agent         : Phase 14-T4 — persisted Agent/persona record store (per-record file, sibling-of-state_root)
+# app/src-tauri      : Phase 02 — Tauri shell (added in 02-02)

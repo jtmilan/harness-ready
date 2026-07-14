@@ -1,0 +1,109 @@
+# This Tauri app is its own cargo workspace root: `app/` is excluded from the repo
+# root workspace (own target + deps tree). The empty [workspace] table stops cargo
+# walking UP into an enclosing workspace — required when the checkout is a git
+# worktree physically nested inside the main repo (else cargo binds to the main
+# repo's workspace and errors). Harmless in the main checkout (app already excluded).
+# resolver "2" pinned to match the repo root workspace + how v0.1.1 was built
+# (a bare table can default to resolver 1 → different feature unification).
+[workspace]
+resolver = "2"
+
+[package]
+name = "app"
+version = "0.9.0"
+description = "Agent Teams — desktop supervisor for parallel AI coding agents in isolated git worktrees, surfaced through one ranked who-needs-you queue."
+authors = ["Jeffry M <jtmilan@gmail.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Autonomous workers. OFF by default: the default build ships the GATED
+# `socket_delegate` handler + the fast-ack contract but NOT the live controller body —
+# a delegation is refused with DELEGATE_UNAVAILABLE rather than spawning workers.
+# The controller HAS passed its P1 security review
+# (prototype/autonomous-workers/P1-SECURITY-REVIEW-VERDICT.md) and has been
+# live-verified across the 5 headless harness worker paths, but it stays compiled
+# OUT of default builds on purpose: enabling it is a deliberate build-time opt-in
+# (`install-app.sh -f delegate-live`), and at RUNTIME every delegation is still
+# triple-gated — allow_mutations + autonomy_ceiling>=1 + the per-run arm — so the
+# feature flag is the outermost layer, never the only one.
+delegate-live = []
+
+# 06-02 Phase-B loopback-HTTP transport (DRAFT — pending security review; default OFF).
+# Gates the ~1k-line tiny_http listener path (spawn_http_listener + serve_http_request +
+# the pure classify gate) OUT of default builds: `tiny_http` is an OPTIONAL dep pulled in
+# ONLY by this feature (`dep:tiny_http`), so the default build never compiles the HTTP
+# server. The pure classify gate stays compiled under `test` so its unit tests still run.
+phase-b-http = ["dep:tiny_http"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Crash/error monitoring (GUI app only). DSN is baked at BUILD time via
+# option_env!("AGENT_TEAMS_SENTRY_DSN") — never committed; inert (no init) when unset.
+sentry = "0.48"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+supervisor = { path = "../../core/supervisor" }
+state-adapter = { path = "../../core/state-adapter" }
+# Phase 2 (vendor→upstream) Stage 1: the orchestrate-pure layer (PaneCtx/Wave/Dispatch/
+# Orchestration/ClaudeUsage + build_orchestration_prompt/parse_orchestration) is the SSOT
+# in core/flywheel; the app delegates to it instead of carrying its own copy.
+flywheel = { path = "../../core/flywheel" }
+# 08-T4: AppState.sups is now the daemon-owned live-pane abstraction (DaemonSups) —
+# the relocated owner of the PTY master fds. In this slice it runs IN-PROCESS (the
+# daemon is not yet the socket server — Sub-build 3); the type move is what lets the
+# server own it later without touching every call site again.
+agent-teams-daemon = { path = "../../core/daemon" }
+# D37: the SSOT queue projection — the app imports QueueRow + compute_queue from here
+# (deleting its own copies), becoming the second thin caller after the MCP sidecar.
+agent-teams-core = { path = "../../core/mcp" }
+# 17-01: typed agent-role persona SSOT — do_spawn parses the wire role into
+# AgentRole for WorkspaceSpec.role (the supervisor injects the persona).
+roles = { path = "../../core/roles" }
+# Phase 14 task model — the app projects the MCP task log/store onto the alt-view
+# board (list_mcp_tasks). Read-only here: fold the append-only log, never mutate.
+agent-teams-task = { path = "../../core/task" }
+# Phase 11 memory graph — the app exposes `memory_graph` (a thin Tauri read command
+# returning the {nodes,edges} projection) for the frontend graph view. Pure read;
+# the schemars feature is NOT enabled here (we serde the types directly, no MCP
+# outputSchema needed on the Tauri wire).
+agent-teams-memory = { path = "../../core/memory" }
+# Phase 14-T4 agent persona store — `create_agent`/`list_agents` project the
+# `core/agent` record store onto the frontend (an agent record spawns no PTY).
+agent-teams-agent = { path = "../../core/agent" }
+# 06-02 Phase-B socket seam: getpeereid (peer euid) + geteuid for the same-user
+# (euid) check on the Unix-domain mutation socket. macOS uses getpeereid (not the
+# Linux SO_PEERCRED). libc (not nix) keeps the dep surface minimal.
+libc = "0.2"
+# Plan 05-04 (voice INPUT): in-app mic capture. cpal = raw CoreAudio input stream
+# (NOT a Tauri plugin → no capability entry; TCC is owned by the entitled app bundle,
+# the 05-03 lesson). hound writes the captured PCM to a WAV; afconvert (system bin)
+# downsamples to whisper's 16 kHz s16le (cpal+hound do NOT resample).
+cpal = "0.16"
+hound = "3.5"
+# 06-02 Phase-B HTTP transport (DRAFT — security review; not shipped). A blocking
+# HTTP/1.1 server (no tokio — the app has no async runtime in setup(), the same
+# constraint that put the UDS listener on a dedicated std thread). The Bearer-token
+# + Host/Origin gate (load-bearing on loopback TCP, where there is no peer euid) is
+# in core/mcp; this only carries the bytes. OPTIONAL: compiled ONLY under the
+# `phase-b-http` feature (default builds ship no HTTP server — see [features]).
+tiny_http = { version = "0.12", optional = true }
+# OS entropy for the 32-byte HTTP Bearer token (the at-rest secret is the same-user
+# boundary for the HTTP path). getrandom reads the OS CSPRNG directly — no extra
+# state, no seeding. NOT for any keystream, just the one token.
+getrandom = "0.2"
+

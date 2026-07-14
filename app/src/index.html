@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Teams</title>
+    <!-- Nothing OS type stack: Doto (dot-matrix display) · Space Grotesk (UI) · Space Mono (labels/data).
+         Bundled locally — @font-face blocks live in the polish layer, woff2 under /vendor/fonts/.
+         CDN runtime dependency removed (was fonts.googleapis.com css2 + 2 preconnects). -->
+    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+    <!-- skin bootstrap (pre-paint) — sets html[data-skin] before first paint so a persisted /
+         deep-linked skin doesn't flash the default. Mirrors the SKINS allowlist in main.js,
+         which re-confirms idempotently on load. -->
+    <script>
+      (function () {
+        try {
+          var allow = ["aurora", "atelier", "phosphor", "precision", "liquid-glass"];
+          var q = new URLSearchParams(location.search).get("skin");
+          var s = q || localStorage.getItem("at_skin") || "";
+          if (allow.indexOf(s) !== -1) document.documentElement.dataset.skin = s;
+        } catch (e) {}
+      })();
+    </script>
+    <!-- P5 (unified-engine §3.6/§3.10) smart-PR-review + CRAP-delta surface. READ-ONLY display
+         in the run-result detail; absent on advisory/old runs (degrades gracefully → nothing
+         rendered). Kept here (not styles.css) because P5 edits are scoped to main.js + index.html. -->
+    <style>
+      .dg-review { margin-bottom: var(--s-2); border-top: 1px solid var(--line); padding-top: var(--s-2); }
+      .dg-review-head { display: flex; align-items: center; gap: var(--s-2); margin-bottom: var(--s-2); flex-wrap: wrap; }
+      .dg-review-decision {
+        font-size: 10px; font-weight: var(--fw-semibold); letter-spacing: 0.02em;
+        border-radius: var(--r-pill, 999px); padding: 1px var(--s-2); white-space: nowrap;
+      }
+      .dg-review-decision.approve { background: var(--success); color: var(--on-attention); }
+      .dg-review-decision.request_changes { background: var(--danger); color: var(--on-attention); }
+      .dg-review-decision.unknown { background: var(--bg-hover); color: var(--muted); border: 1px solid var(--line); }
+      /* ADVISORY-ONLY badge: P5 reviewer logs but never blocks — say so plainly so the
+         decision word isn't misread as this run's gate outcome (that's the verdict pill above). */
+      .dg-review-advisory { font-size: 10px; color: var(--muted); font-style: italic; }
+      /* Calibration: the reviewer must pass the known-bad<known-good self-test to be trusted.
+         UNTRUSTED → its APPROVE was coerced to REQUEST_CHANGES (fail-closed); warn loudly. */
+      .dg-review-cal { font-size: 11px; line-height: 1.4; margin-bottom: var(--s-2); }
+      .dg-review-cal.trusted { color: var(--success); }
+      .dg-review-cal.untrusted { color: var(--need); font-weight: var(--fw-semibold); }
+      .dg-review-findings { display: flex; flex-direction: column; gap: var(--s-1); }
+      .dg-finding {
+        display: flex; align-items: baseline; gap: var(--s-2); font-size: 11px; line-height: 1.4;
+        border-left: 3px solid var(--line); padding: 2px 0 2px var(--s-2);
+      }
+      .dg-finding.block,  .dg-finding.major { border-left-color: var(--danger); }
+      .dg-finding.minor { border-left-color: var(--need); }
+      .dg-finding.info  { border-left-color: var(--info); }
+      .dg-finding-sev {
+        font-size: 9px; font-weight: var(--fw-semibold); text-transform: uppercase; letter-spacing: 0.04em;
+        border-radius: var(--r-pill, 999px); padding: 0 var(--s-2); white-space: nowrap; flex: 0 0 auto;
+      }
+      .dg-finding-sev.block, .dg-finding-sev.major { background: var(--danger); color: var(--on-attention); }
+      .dg-finding-sev.minor { background: var(--need); color: var(--on-attention); }
+      .dg-finding-sev.info  { background: var(--info); color: var(--on-accent); }
+      .dg-finding-domain { font-family: var(--font-mono); font-size: 10px; color: var(--fg-secondary); flex: 0 0 auto; }
+      .dg-finding-why { color: var(--fg); }
+      .dg-finding-cite { font-family: var(--font-mono); font-size: 10px; color: var(--muted); flex: 0 0 auto; margin-left: auto; }
+      /* CRAP delta (§3.10): deterministic coverage-regression veto, advisory display in P5. */
+      .dg-crap { margin-top: var(--s-2); border-top: 1px solid var(--line); padding-top: var(--s-2); }
+      .dg-crap-head { font-size: 11px; line-height: 1.4; margin-bottom: var(--s-1); }
+      .dg-crap-head.block { color: var(--danger); font-weight: var(--fw-semibold); }
+      .dg-crap-head.clear { color: var(--success); }
+      .dg-crap-list { font-family: var(--font-mono); font-size: 10px; line-height: 1.5; color: var(--fg-secondary); margin: 0 0 var(--s-1) var(--s-3); padding: 0; list-style: none; }
+      .dg-crap-list li::before { content: "· "; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <!-- a11y: skip-link — first tabbable element; jumps keyboard/SR users past the rail nav
+         straight to the main content region. Visually hidden until focused (see .skip-link). -->
+    <a href="#main" class="skip-link">Skip to content</a>
+    <svg id="icon-sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="i-zap" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+      <symbol id="i-radio" viewBox="0 0 24 24"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></symbol>
+      <symbol id="i-crosshair" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/></symbol>
+      <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+      <symbol id="i-reload" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.74L21 8"/><path d="M21 3v5h-5"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+      <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2Z"/></symbol>
+      <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" x2="9" y1="4" y2="20"/></symbol>
+      <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></symbol>
+      <symbol id="i-split-v" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="12" x2="12" y1="4" y2="20"/></symbol>
+      <symbol id="i-split-h" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" x2="21" y1="12" y2="12"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+    </svg>
+    <div id="app">
+      <nav id="rail" aria-label="Who needs you and workspaces">
+        <div class="rail-brand">
+          <svg class="brand-logo" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z" opacity=".92"/><path d="M12 7.5 7 10v4l5 2.5 5-2.5v-4z" fill="#000000" opacity=".55"/></svg>
+          <span class="brand-mark">Agent Teams</span>
+        </div>
+        <div id="rail-head">
+          <span id="queue-head">WHO NEEDS YOU</span>
+        </div>
+        <ul id="queue" aria-labelledby="queue-head"></ul>
+        <!-- a11y: SR-only live region — announces "N agents need you" only when a row newly
+             gains needs_human (the visible amber pulse is silent to screen readers). -->
+        <div id="queue-sr-status" class="sr-only" role="status" aria-live="polite"></div>
+        <div id="sched-head">
+          <span id="sched-label">Scheduler · 0/3</span>
+          <span class="sched-head-actions">
+            <button id="sched-dec" title="Fewer agents working at once" aria-label="Decrease max concurrent"><svg class="icon" aria-hidden="true"><use href="#i-minus"/></svg></button>
+            <button id="sched-inc" title="More agents working at once" aria-label="Increase max concurrent"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
+          </span>
+        </div>
+        <ul id="scheduler" style="display:none"></ul>
+        <div id="ws-head">
+          <span id="ws-head-label">WORKSPACES</span>
+          <span class="ws-head-actions">
+            <button id="ws-quick-btn" title="Quick create — repeat last workspace (folder/harness/count)" aria-label="Quick create workspace"><svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg></button>
+            <button id="ws-new-btn" title="New workspace (⌘N)">+ New</button>
+            <button id="ws-collapse" title="Collapse" aria-label="Collapse workspaces">▾</button>
+          </span>
+        </div>
+        <ul id="workspaces" aria-labelledby="ws-head-label"></ul>
+        <button id="update-pill" class="hidden" title="A new build is ready — click to update &amp; relaunch"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg> Update Now</button>
+        <div id="hint">⌘⇧J → jump to top of queue</div>
+      </nav>
+      <main id="main" tabindex="-1">
+        <div id="topbar">
+          <button id="rail-toggle" class="rail-toggle" title="Hide / show the sidebar (⌘\)" aria-label="Toggle sidebar" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-sidebar"/></svg></button>
+          <span id="active-label">no session</span>
+          <span class="topbar-actions">
+            <!-- LAYOUT — flexible split-tree tiling (#6): maximize the active pane, or split it -->
+            <span id="arrange-seg" class="arrange-seg" role="group" aria-label="Layout">
+              <button id="grid-btn" class="arr-btn" title="Focus — maximize the active pane (⌘G)" aria-label="Focus / maximize"><svg class="icon" aria-hidden="true"><use href="#i-maximize"/></svg></button>
+              <button id="auto-tile-btn" class="arr-btn" title="Auto-tile — evenly arrange all panes (⌘⌥G)" aria-label="Auto-tile"><svg class="icon" aria-hidden="true"><use href="#i-grid"/></svg></button>
+              <button id="split-v-btn" class="arr-btn" title="Split right — new pane beside this one (⌘D)" aria-label="Split right"><svg class="icon" aria-hidden="true"><use href="#i-split-v"/></svg></button>
+              <button id="split-h-btn" class="arr-btn" title="Split down — new pane below this one (⌘⇧D)" aria-label="Split down"><svg class="icon" aria-hidden="true"><use href="#i-split-h"/></svg></button>
+            </span>
+            <span class="tb-sep" aria-hidden="true"></span>
+            <!-- ORCHESTRATE — one goal → agents work -->
+            <button id="bridge-btn" class="tbtn tbtn-primary" title="Orchestrate — one goal → a tailored task per open pane (⌘⇧O)"><svg class="icon" aria-hidden="true"><use href="#i-crosshair"/></svg> Orchestrate <kbd class="lc-kbd">⌘⇧O</kbd></button>
+            <button id="delegate-btn" class="tbtn" title="Delegate — spawn throwaway workers for a goal; one merged result returns"><svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg> Delegate</button>
+            <button id="flywheel-btn" class="tbtn" title="Flywheel — one goal → audit → fix → verify → PR, one press per cycle"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg> Flywheel</button>
+            <span class="tb-sep" aria-hidden="true"></span>
+            <!-- LIVE OPS + RUN HISTORY -->
+            <button id="broadcast-btn" class="tbtn" title="Broadcast typing to all panes (⌘⇧I)"><svg class="icon" aria-hidden="true"><use href="#i-radio"/></svg> Broadcast <kbd class="lc-kbd">⌘⇧I</kbd></button>
+            <button id="runs-btn" class="tbtn" title="Runs — your past Delegate / Flywheel runs for this workspace"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg> Runs<span id="dg-badge" class="dg-badge hidden"></span></button>
+            <button id="loops-btn" class="tbtn" title="Loops — saved goals that re-run until they pass"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg> Loops</button>
+            <span class="tb-sep" aria-hidden="true"></span>
+            <!-- OVERFLOW -->
+            <button id="topbar-more-btn" class="tbtn" title="More" aria-haspopup="true" aria-expanded="false" aria-controls="topbar-more-menu">⋯ More</button>
+            <div id="topbar-more-menu" class="ph-menu hidden" role="menu">
+              <button class="ph-menu-item" data-more="speak" role="menuitem"><span class="ph-menu-ico"><svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg></span><span class="ph-menu-label">Speak — reply to top of queue</span></button>
+              <button class="ph-menu-item" data-more="live" role="menuitem"><span class="ph-menu-ico"><svg class="icon" aria-hidden="true"><use href="#i-radio"/></svg></span><span class="ph-menu-label">Live workers</span></button>
+              <button class="ph-menu-item" data-more="browser" role="menuitem"><span class="ph-menu-ico"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg></span><span class="ph-menu-label">Browser (⌘B)</span></button>
+              <div class="ph-menu-sep"></div>
+              <button class="ph-menu-item" data-more="settings" role="menuitem"><span class="ph-menu-ico">⚙</span><span class="ph-menu-label">Settings</span></button>
+            </div>
+          </span>
+        </div>
+        <div id="terminal">
+          <div id="placeholder">Click “+ New” (⌘N) to start an agent · ⌘⇧J jumps to who needs you</div>
+          <div id="launcher" class="hidden" role="region" aria-label="Get started">
+            <div class="lc-card">
+              <div class="lc-brand">
+                <svg class="lc-logo" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z" opacity=".92"/><path d="M12 7.5 7 10v4l5 2.5 5-2.5v-4z" fill="#000000" opacity=".55"/></svg>
+                <span class="lc-wordmark">Agent Teams</span>
+              </div>
+              <h1 class="lc-headline">Build the future.</h1>
+              <p class="lc-sub">Choose how you want to work.</p>
+              <div class="lc-modes">
+                <button type="button" class="lc-mode lc-mode-primary" data-lc="workspace">
+                  <span class="lc-mode-icon"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg></span>
+                  <span class="lc-mode-body">
+                    <span class="lc-mode-row"><span class="lc-mode-name">New Workspace</span><kbd class="lc-kbd">⌘N</kbd></span>
+                    <span class="lc-mode-tag">A folder, split panes, and an agent in every shell</span>
+                    <span class="lc-mode-desc">Open a repo with one or more terminals — pick a harness per pane.</span>
+                    <span class="lc-mode-open">OPEN →</span>
+                  </span>
+                </button>
+                <button type="button" class="lc-mode" data-lc="swarm">
+                  <span class="lc-mode-icon"><svg class="icon" aria-hidden="true"><use href="#i-crosshair"/></svg></span>
+                  <span class="lc-mode-body"><span class="lc-mode-row"><span class="lc-mode-name">Orchestrate</span><kbd class="lc-kbd">⌘⇧O</kbd></span></span>
+                </button>
+                <button type="button" class="lc-mode" data-lc="board">
+                  <span class="lc-mode-icon"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg></span>
+                  <span class="lc-mode-body"><span class="lc-mode-row"><span class="lc-mode-name">Board</span><kbd class="lc-kbd">Board</kbd></span></span>
+                </button>
+                <button type="button" class="lc-mode" data-lc="memory">
+                  <span class="lc-mode-icon"><svg class="icon" aria-hidden="true"><use href="#i-radio"/></svg></span>
+                  <span class="lc-mode-body"><span class="lc-mode-row"><span class="lc-mode-name">Delegations</span><kbd class="lc-kbd">Delegations</kbd></span></span>
+                </button>
+              </div>
+              <div class="lc-hints"><span><kbd class="lc-kbd">⌘N</kbd> NEW TERMINAL</span><span><kbd class="lc-kbd">⌘G</kbd> SPLIT / GRID</span><span><kbd class="lc-kbd">⌘⇧J</kbd> WHO NEEDS YOU</span></div>
+            </div>
+          </div>
+        </div>
+      </main>
+      <aside id="bridge-dock" class="hidden">
+        <div id="bc-head">
+          <span class="bc-title"><span class="bc-dot"></span> Orchestrate</span>
+          <button id="bc-close" class="ph-btn" title="Hide dock (the run keeps going)" aria-label="Hide Orchestrate dock">✕</button>
+        </div>
+        <div id="bc-thread"></div>
+        <div id="bc-composer">
+          <button id="bc-action" class="primary hidden"></button>
+          <form id="bc-form" autocomplete="off">
+            <textarea id="bc-input" rows="2" placeholder="Tell Orchestrate what to build…" aria-label="Tell Orchestrate what to build"></textarea>
+            <button type="submit" id="bc-send" class="primary" aria-label="Send"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg></button>
+          </form>
+          <label class="modal-sub bc-toggles"><input type="checkbox" id="bc-unify" /> Ship mode — PRD → Flywheel → one PR</label>
+        </div>
+      </aside>
+      <aside id="browser" class="hidden">
+        <div id="browser-head">
+          <span class="browser-title"><svg class="icon" aria-hidden="true"><use href="#i-globe"/></svg> Browser</span>
+          <span class="browser-actions">
+            <button id="b-capture" title="Capture a region → annotate in Preview"><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg> Capture</button>
+            <button id="b-external" title="Open current URL in your browser" aria-label="Open in external browser"><svg class="icon" aria-hidden="true"><use href="#i-external"/></svg></button>
+            <button id="b-close" title="Close (⌘B)" aria-label="Close browser"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+          </span>
+        </div>
+        <div id="browser-urlbar">
+          <input id="b-url" placeholder="enter a url to open" aria-label="URL to open" spellcheck="false" />
+          <button id="b-go">Go</button>
+          <button id="b-reload" title="Reload" aria-label="Reload"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg></button>
+        </div>
+        <div id="browser-tabs"><button id="b-newtab" title="New tab">+ New tab</button></div>
+        <div id="browser-recents-wrap">
+          <div class="browser-section-label">Recently opened</div>
+          <div id="b-recents"></div>
+        </div>
+        <iframe id="b-frame" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"></iframe>
+      </aside>
+    </div>
+
+    <div id="modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-card">
+        <h2 id="modal-title">Set up your workspace</h2>
+        <p class="modal-sub" id="modal-sub">Name it, pick a folder, and how many agents to spawn.</p>
+        <label id="row-name">Name<input id="f-name" placeholder="defaults to folder name" /></label>
+        <label id="row-folder">Working folder<input id="f-repo" placeholder="/path/to/folder" /></label>
+        <div id="f-recents"></div>
+        <label>Harness <span class="modal-sub f-chip-hint">tap to choose — mixed teams in the wizard</span></label>
+        <div id="f-harness" class="chip-row">
+          <button type="button" class="count-tile active" data-h="claude">claude</button>
+          <button type="button" class="count-tile" data-h="codex">codex</button>
+          <button type="button" class="count-tile" data-h="commandcode">commandcode</button>
+          <button type="button" class="count-tile" data-h="cursor">cursor</button>
+          <button type="button" class="count-tile" data-h="opencode">opencode</button>
+          <button type="button" class="count-tile" data-h="cline">cline</button>
+          <button type="button" class="count-tile" data-h="bash">bash</button>
+        </div>
+        <p id="f-harness-preview" class="modal-sub"></p>
+        <label>Model <span class="modal-sub f-chip-hint">optional — blank = account default; autocompletes for the chosen harness</span><input id="f-model" type="text" class="fw-model-text" list="dl-models-claude" placeholder="model id" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+        <label>Role</label>
+        <div id="f-role" class="chip-row">
+          <button type="button" class="count-tile active" data-r="">none</button>
+          <button type="button" class="count-tile" data-r="coordinator">coordinator</button>
+          <button type="button" class="count-tile" data-r="builder">builder</button>
+          <button type="button" class="count-tile" data-r="scout">scout</button>
+          <button type="button" class="count-tile" data-r="reviewer">reviewer</button>
+          <button type="button" class="count-tile" data-r="tester">tester</button>
+          <button type="button" class="count-tile" data-r="performance">performance</button>
+          <button type="button" class="count-tile" data-r="security">security</button>
+          <button type="button" class="count-tile" data-r="db-migration">db-migration</button>
+        </div>
+        <label>How many terminals?</label>
+        <!-- shared role-library autocomplete for free-text role/focus inputs (Bridge spawn pane rows).
+             Option labels mirror build_plan_prompt's ROLE LIBRARY so the spelling + meaning are pickable. -->
+        <datalist id="dl-roles">
+          <option value="coordinator">decompose the goal into lanes; no production code</option>
+          <option value="scout">map the repo, surface conventions + risks; no code</option>
+          <option value="tester">write goal/contract-level tests (the spec, RED-first)</option>
+          <option value="builder">implement scoped files to satisfy the tests</option>
+          <option value="reviewer">check correctness / security / cross-file consistency on the diff</option>
+          <option value="performance">profile hot paths, flag N+1 / allocations (advisory)</option>
+          <option value="security">SAST-style review of injection / authz / secrets (advisory)</option>
+          <option value="db-migration">draft a schema/migration change as a proposal</option>
+        </datalist>
+        <div id="f-count">
+          <button type="button" class="count-tile active" data-n="1">1</button>
+          <button type="button" class="count-tile" data-n="2">2</button>
+          <button type="button" class="count-tile" data-n="4">4</button>
+          <button type="button" class="count-tile" data-n="6">6</button>
+          <button type="button" class="count-tile" data-n="9">9</button>
+          <button type="button" class="count-tile" data-n="10">10</button>
+          <button type="button" class="count-tile" data-n="12">12</button>
+        </div>
+        <label>Initial prompt (optional, sent to every agent)<textarea id="f-prompt" rows="2"></textarea></label>
+        <div class="modal-actions">
+          <button id="f-cancel">Cancel</button>
+          <button id="f-create" class="primary">Create</button>
+        </div>
+        <p id="f-error" role="alert"></p>
+      </div>
+    </div>
+
+    <div id="bridge" class="hidden" role="dialog" aria-modal="true" aria-labelledby="bridge-title">
+      <div class="modal-card">
+        <h2 id="bridge-title">⌖ Orchestrate the team</h2>
+        <p class="modal-sub">One goal → a tailored task per open pane. Broadcast sends the same keystrokes; Orchestrate splits the work.</p>
+        <label>Goal<textarea id="br-goal" rows="3" placeholder="e.g. add a /health endpoint returning {status:ok}, wire it up, and test it"></textarea></label>
+        <div class="br-section-label">Runner</div>
+        <div id="br-runner" class="chip-row" role="group" aria-label="Runner">
+          <button type="button" class="count-tile active" data-runner="panes">Live panes</button>
+          <button type="button" class="count-tile" data-runner="headless">Headless</button>
+        </div>
+        <div id="br-panes-wrap">
+          <div class="br-section-label">Panes (give each a focus — optional)</div>
+          <div id="br-panes"></div>
+          <div id="br-spawn" class="hidden">
+            <p class="modal-sub">No agents open — spawn a team to ideate with. Pick a repo and the harnesses to fan the idea across.</p>
+            <label>Repo folder<input id="br-repo" type="text" class="fw-model-text" placeholder="/path/to/your/repo" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+            <label>Team size</label>
+            <div id="br-count" class="chip-row">
+              <button type="button" class="count-tile" data-n="2">2</button>
+              <button type="button" class="count-tile active" data-n="3">3</button>
+              <button type="button" class="count-tile" data-n="4">4</button>
+              <button type="button" class="count-tile" data-n="5">5</button>
+              <button type="button" class="count-tile" data-n="6">6</button>
+              <button type="button" class="count-tile" data-n="8">8</button>
+              <button type="button" class="count-tile" data-n="10">10</button>
+            </div>
+            <label>Harnesses <span class="fw-note">— tap to combine; round-robin across the team</span></label>
+            <div id="br-harness" class="chip-row" role="group" aria-label="Team harnesses"></div>
+            <div id="br-models"></div>
+            <label class="modal-sub br-fresh-row"><input type="checkbox" id="br-fresh-toggle" /> Fresh from main <span class="fw-note">— reset each pane's worktree to current main before spawning (discards uncommitted prior-run work; off = keep worktrees as-is)</span></label>
+            <button id="br-spawn-go" class="primary">Spawn team &amp; plan →</button>
+          </div>
+        </div>
+        <div id="br-headless" class="hidden">
+          <p class="modal-sub">Headless — spawn throwaway workers in isolated git worktrees (no panes). One merged result returns. Ship off = report only; Ship on = Flywheel (opens one PR).</p>
+          <label>Workers</label>
+          <div id="br-hl-count" class="chip-row">
+            <button type="button" class="count-tile" data-n="2">2</button>
+            <button type="button" class="count-tile active" data-n="3">3</button>
+            <button type="button" class="count-tile" data-n="4">4</button>
+            <button type="button" class="count-tile" data-n="5">5</button>
+            <button type="button" class="count-tile" data-n="6">6</button>
+            <button type="button" class="count-tile" data-n="8">8</button>
+            <button type="button" class="count-tile" data-n="10">10</button>
+          </div>
+          <label>Worker harness <span id="br-hl-harness-note" class="fw-note"></span></label>
+          <div id="br-hl-harness" class="chip-row" role="group" aria-label="Worker harness"></div>
+          <label>Model <span class="fw-note">— quick-pick, or type any model below (blank = harness default)</span> <span id="br-hl-model-src" class="fw-note"></span></label>
+          <div id="br-hl-model" class="chip-row" role="group" aria-label="Model quick-pick"></div>
+          <input id="br-hl-model-text" type="text" class="fw-model-text" list="br-hl-model-list" placeholder="model id (blank = the harness's account default)" aria-label="Worker model id" autocomplete="off" autocapitalize="off" spellcheck="false" />
+          <datalist id="br-hl-model-list"></datalist>
+          <label id="br-hl-repo-row" class="hidden">Repo folder <span class="fw-note">— no agent open; the cycle will auto-create a 1-pane workspace here</span><input id="br-hl-repo" type="text" class="fw-model-text" placeholder="/path/to/your/repo" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+          <p class="modal-sub dl-trust">⚠ Workers run your repo's build/tests in throwaway worktrees, swept when done. Not a sandbox — only run in a repo you trust.</p>
+        </div>
+        <div id="br-preview" class="hidden">
+          <div class="br-section-label">Synthesized tasks (read-only)</div>
+          <div id="br-preview-list"></div>
+        </div>
+        <p id="br-note" class="modal-sub hidden"></p>
+        <div id="br-synth-progress" class="br-synth hidden">
+          <div class="br-synth-head"><span id="br-synth-phase">Building the PRD…</span><span id="br-synth-elapsed">0:00</span></div>
+          <div class="br-synth-track"><div id="br-synth-bar"></div></div>
+        </div>
+        <label class="modal-sub"><input type="checkbox" id="br-autoplan" /> Eve mode — auto-plan the team's roles + agents cross-examine the merged diff on ship (off = normal orchestration)</label>
+        <label id="br-auto-wrap" class="modal-sub br-auto hidden"><input type="checkbox" id="br-auto" checked /> Auto-synthesize when the agents finish</label>
+        <label class="modal-sub br-auto"><input type="checkbox" id="br-unify" /> Ship — open a PR (off = report only)</label>
+        <label class="modal-sub br-auto"><input type="checkbox" id="br-loop" /> Loop — save this as a loop and re-run it until it passes (manual trigger this phase)</label>
+        <div id="br-loop-config" class="hidden">
+          <p class="modal-sub br-loop-note">On primary, this SAVES a loop from the fields above and fires one immediate manual iteration. Manage saved loops from the topbar “Loops” panel.</p>
+          <label>Stop after
+            <select id="br-loop-stop" class="topbar-sel">
+              <option value="until_pass" selected>passes (Until Pass)</option>
+              <option value="max_iters">a fixed number (Max Iters)</option>
+              <option value="goal_met">the goal check passes (Goal Met)</option>
+            </select>
+          </label>
+          <label>Max iterations<input id="br-loop-maxiters" type="number" min="1" max="20" value="3" class="fw-model-text" /></label>
+          <label>Concurrency
+            <select id="br-loop-concurrency" class="topbar-sel">
+              <option value="serialized" selected>Serialized — one iteration at a time</option>
+              <option value="parallel">Parallel</option>
+            </select>
+          </label>
+        </div>
+        <div id="br-hl-gate" class="dl-gate hidden"></div>
+        <div class="modal-actions">
+          <button id="br-cancel">Cancel</button>
+          <button id="br-primary" class="primary">Plan tasks →</button>
+        </div>
+        <p id="br-error" role="alert"></p>
+      </div>
+    </div>
+
+    <div id="delegate" class="hidden" role="dialog" aria-modal="true" aria-labelledby="dl-title">
+      <div class="modal-card">
+        <h2 id="dl-title"><svg class="icon" aria-hidden="true"><use href="#i-zap"/></svg> Delegate — spawn throwaway workers</h2>
+        <p class="modal-sub">Your agent's move, fired by you: one goal is split across <em>new ephemeral workers</em> in isolated git worktrees. They never appear in the rail; one merged result returns. <strong>Not Orchestrate</strong> — Orchestrate tasks the panes you already opened.</p>
+        <label>Goal<textarea id="dl-goal" rows="3" placeholder="e.g. spike LRU vs TTL vs write-through caching, each in its own worktree; report which compiles + passes tests + tradeoffs"></textarea></label>
+        <label>Workers</label>
+        <div id="dl-count" class="chip-row">
+          <button type="button" class="count-tile" data-n="2">2</button>
+          <button type="button" class="count-tile active" data-n="3">3</button>
+          <button type="button" class="count-tile" data-n="4">4</button>
+          <button type="button" class="count-tile" data-n="5">5</button>
+          <button type="button" class="count-tile" data-n="6">6</button>
+          <button type="button" class="count-tile" data-n="8">8</button>
+          <button type="button" class="count-tile" data-n="10">10</button>
+        </div>
+        <p class="modal-sub dl-trust">⚠ Workers run your repo's build/tests in throwaway worktrees, swept when done. Not a sandbox — only delegate in a repo you trust.</p>
+        <div id="dl-gate" class="dl-gate"></div>
+        <div class="modal-actions">
+          <button id="dl-cancel">Cancel</button>
+          <button id="dl-fire" class="primary">Delegate →</button>
+        </div>
+        <p id="dl-error" role="alert"></p>
+      </div>
+    </div>
+
+    <div id="delegations" class="hidden" role="dialog" aria-modal="true" aria-labelledby="dg-title">
+      <div class="modal-card">
+        <h2 id="dg-title"><svg class="icon" aria-hidden="true"><use href="#i-radio"/></svg> Delegations — live workers</h2>
+        <p class="modal-sub">Workers from the active run stream here live. Your past runs live in <strong>History</strong>.</p>
+        <div class="dg-scroll">
+          <div id="dg-workers"></div>
+          <p id="dg-empty" class="modal-sub">No delegate workers yet. When you fire a delegation, each worker shows up here live.</p>
+        </div>
+        <div class="modal-actions">
+          <button id="dg-stop" class="dg-stop-btn" disabled>Stop all workers</button>
+          <button id="dg-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="history" class="hidden" role="dialog" aria-modal="true" aria-labelledby="hist-title">
+      <div class="modal-card">
+        <h2 id="hist-title"><svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg> Run history</h2>
+        <p class="modal-sub">Your past flywheel/delegate runs (prompt · verdict · cost · report/PR), <strong>scoped to a workspace</strong> and persisted across restarts. The autonomous agent's own runs aren't shown.</p>
+        <label class="hist-ws-row">Workspace
+          <select id="hist-ws" class="topbar-sel"></select>
+        </label>
+        <div id="hist-bench" class="hist-bench hidden"></div>
+        <div class="dg-scroll">
+          <div id="hist-list"></div>
+          <p id="hist-empty" class="modal-sub">No runs in this workspace yet. Fire a Flywheel or Delegate run and it'll show up here.</p>
+        </div>
+        <div class="modal-actions">
+          <button id="hist-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="loops" class="hidden" role="dialog" aria-modal="true" aria-labelledby="loops-title">
+      <div class="modal-card">
+        <h2 id="loops-title"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg> Loops</h2>
+        <p class="modal-sub">Saved goals that re-run until they pass. Edit, pause, delete, or fire one manual iteration. Each loop's iterations land in <strong>Runs</strong>.</p>
+        <div class="dg-scroll">
+          <div id="loops-list"></div>
+          <p id="loops-empty" class="modal-sub">No loops yet. Turn on “Loop” in Orchestrate and press the primary to save one.</p>
+        </div>
+        <div id="loops-error" class="dl-gate hidden"></div>
+        <div class="modal-actions">
+          <button id="loops-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="flywheel" class="hidden" role="dialog" aria-modal="true" aria-labelledby="fw-title">
+      <div class="modal-card">
+        <h2 id="fw-title"><svg class="icon" aria-hidden="true"><use href="#i-reload"/></svg> Flywheel — goal → audit → fix → verify → PR</h2>
+        <p class="modal-sub">One press runs <em>one full cycle</em>: ephemeral workers investigate your goal, a synthesizer grounds-truths their reports, the merged tree is tested, and — when that's wired and armed — a PR is opened for your review. Each cycle <strong>stops at a PR</strong>; you merge, then press again. The loop is yours to turn, not a daemon.</p>
+        <label>Goal<textarea id="fw-goal" rows="3" placeholder="e.g. find &amp; fix the error-handling gaps in core/task — each fix in a model-free crate; one merged, tested result"></textarea></label>
+        <label id="fw-repo-row" class="hidden">Repo folder <span class="fw-note">— no agent open; the cycle will auto-create a 1-pane workspace here</span><input id="fw-repo" type="text" class="fw-model-text" placeholder="/path/to/your/repo" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+        <label>Workers</label>
+        <div id="fw-count" class="chip-row">
+          <button type="button" class="count-tile" data-n="2">2</button>
+          <button type="button" class="count-tile active" data-n="3">3</button>
+          <button type="button" class="count-tile" data-n="4">4</button>
+          <button type="button" class="count-tile" data-n="5">5</button>
+          <button type="button" class="count-tile" data-n="6">6</button>
+          <button type="button" class="count-tile" data-n="8">8</button>
+          <button type="button" class="count-tile" data-n="10">10</button>
+        </div>
+        <label>Worker harness <span id="fw-harness-note" class="fw-note"></span></label>
+        <div id="fw-harness" class="chip-row" role="group" aria-label="Worker harness"></div>
+        <label>Model <span class="fw-note">— quick-pick, or type any model below (blank = harness default)</span> <span id="fw-model-src" class="fw-note"></span></label>
+        <div id="fw-model" class="chip-row" role="group" aria-label="Model quick-pick"></div>
+        <input id="fw-model-text" type="text" class="fw-model-text" list="fw-model-list" placeholder="model id (blank = the harness's account default)" aria-label="Worker model id" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <datalist id="fw-model-list"></datalist>
+        <p class="modal-sub dl-trust">⚠ Workers run your repo's build/tests in throwaway worktrees, swept when done. Not a sandbox — only run in a repo you trust.</p>
+        <p id="fw-phase" class="modal-sub fw-phase"></p>
+        <div id="fw-gate" class="dl-gate"></div>
+        <div class="modal-actions">
+          <button id="fw-cancel">Cancel</button>
+          <button id="fw-fire" class="primary">Start cycle →</button>
+        </div>
+        <p id="fw-error" role="alert"></p>
+      </div>
+    </div>
+
+    <div id="speak" class="hidden" role="dialog" aria-modal="true" aria-labelledby="speak-title">
+      <div class="modal-card">
+        <h2 id="speak-title"><svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg> Speak &amp; Send</h2>
+        <p class="modal-sub">Reply to the agent at the top of “who needs you”. You author and send every reply — nothing is auto-generated or auto-sent.</p>
+        <div class="sp-target">
+          <span class="sp-target-label">Replying to</span>
+          <span id="sp-target-id" class="sp-target-id">—</span>
+          <span id="sp-target-meta" class="sp-target-meta"></span>
+        </div>
+        <label>Your reply<textarea id="sp-text" rows="4" placeholder="type your reply… (⌘↵ to Speak &amp; Send)"></textarea></label>
+        <div class="sp-dictate">
+          <button id="sp-mic" type="button" title="Push to talk — hold to dictate, release to transcribe into the reply" aria-label="Push to talk — hold to dictate">
+            <svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg>
+            <span id="sp-mic-label">Hold to talk</span>
+          </button>
+          <span id="sp-dictate-hint" class="sp-dictate-hint">Hold and speak — your words fill the reply above. You still review &amp; send.</span>
+        </div>
+        <div class="modal-actions">
+          <button id="sp-cancel">Cancel</button>
+          <button id="sp-send" class="primary"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg> Speak &amp; Send</button>
+        </div>
+        <p id="sp-error" role="alert"></p>
+      </div>
+    </div>
+
+    <div id="wizard" class="hidden" role="dialog" aria-modal="true" aria-labelledby="wiz-title">
+      <div class="modal-card wiz-card">
+        <h2 id="wiz-title">Set up your workspace</h2>
+        <p class="modal-sub" id="wiz-sub">Pick a folder to start.</p>
+        <nav id="wiz-steps">
+          <span class="wiz-step-dot" data-step="1">Start</span>
+          <span class="wiz-step-dot" data-step="2">Layout</span>
+          <span class="wiz-step-dot" data-step="3">Agents</span>
+        </nav>
+        <section class="wiz-step" id="wiz-s1">
+          <label>Name<input id="wiz-name" placeholder="defaults to folder name" /></label>
+          <label>Working folder<input id="wiz-folder" placeholder="/path/to/folder" /></label>
+          <div id="wiz-recents"></div>
+        </section>
+        <section class="wiz-step hidden" id="wiz-s2">
+          <label>How many terminals? <span id="wiz-count-label"></span></label>
+          <div id="wiz-count">
+            <button type="button" class="count-tile active" data-n="1">1</button>
+            <button type="button" class="count-tile" data-n="2">2</button>
+            <button type="button" class="count-tile" data-n="4">4</button>
+            <button type="button" class="count-tile" data-n="6">6</button>
+            <button type="button" class="count-tile" data-n="9">9</button>
+            <button type="button" class="count-tile" data-n="10">10</button>
+            <button type="button" class="count-tile" data-n="12">12</button>
+          </div>
+          <div id="wiz-grid-preview"></div>
+          <p id="wiz-cap-hint" class="wiz-cap-hint hidden" role="status"></p>
+          <div class="wiz-presets-label">⌗ PRESETS</div>
+          <div id="wiz-presets">
+            <button type="button" id="wiz-preset-new">+ NEW</button>
+          </div>
+        </section>
+        <section class="wiz-step hidden" id="wiz-s3">
+          <div id="wiz-harness-grid"></div>
+          <label>Initial prompt (optional, sent to every agent)<textarea id="wiz-prompt" rows="2"></textarea></label>
+          <button type="button" id="wiz-save-preset">＋ Save as preset</button>
+        </section>
+        <p id="wiz-error" role="alert"></p>
+        <div class="modal-actions">
+          <button type="button" id="wiz-cancel">Cancel</button>
+          <button type="button" id="wiz-back">‹ Back</button>
+          <button type="button" id="wiz-noai">Open without AI</button>
+          <button type="button" id="wiz-next" class="primary">Next</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="update-card" class="hidden" role="dialog" aria-label="Update available">
+      <button id="up-x" class="up-x" title="Dismiss" aria-label="Dismiss"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+      <div class="up-head">
+        <span class="up-icon"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg></span>
+        <span class="up-titles">
+          <strong class="up-title">Update Available</strong>
+          <span class="up-sub" id="up-sub">Agent Teams</span>
+        </span>
+      </div>
+      <p class="up-body">A new build of Agent Teams is ready. Update now? Applying relaunches the app — your agents’ terminals restart and conversations resume.</p>
+      <div class="up-actions">
+        <button id="up-later" class="up-btn-ghost">Later</button>
+        <button id="up-now" class="up-btn-accent"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg> Update Now</button>
+      </div>
+    </div>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

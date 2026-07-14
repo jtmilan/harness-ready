@@ -1,0 +1,12 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — PURE worker/harness logic (Harness descriptor + worker_spawn/args) extracted from the supervisor so the supervisor and the agent-teams-cli share ONE dep-light source"
+
+# Dep-light by design: only state-adapter (for InjectHarness in the harness descriptor) + std.
+# NO portable-pty / roles / ringbuf here — those PTY/persona/scrollback concerns stay in the supervisor.
+[dependencies]
+state-adapter = { path = "../state-adapter" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

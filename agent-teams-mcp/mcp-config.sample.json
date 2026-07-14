@@ -1,0 +1,53 @@
+{
+  "_README": "MCP runtime config for Agent Teams. SAFE DEFAULTS: every gate below is OFF (false / 0) — this file, copied as-is, changes NOTHING. To enable a capability, copy this file (WITHOUT the underscore-prefixed keys, which are documentation only) to the SIBLING of the state dir and flip the specific gate you need. Every key maps 1:1 to `McpConfig` in core/mcp/src/lib.rs; keys are re-read FRESH per request/iteration, so flipping one off takes effect at the next boundary without a restart. All gates are file-only (operator-edited) — never LLM-settable — except send_input_enabled, which also has a confirm-gated Settings UI toggle.",
+  "_LOCATION": "Sibling of state_root: $AGENT_TEAMS_STATE_DIR/../mcp-config.json, else ~/Library/Application Support/mcp-config.json (next to agent-teams-live.json). It is read by BOTH the app socket handler (authoritative) and the MCP sidecar tools. Absent OR malformed => every gate OFF (fail safe, never fail open).",
+  "_SECURITY": "Mutations flow over a same-user Unix-domain socket (peer euid check). This config is the capability gate only; it carries NO secrets. The gates are ADDITIVE layers, never bypasses: e.g. flywheel_ship requires the whole stack under it (delegate-live build + allow_mutations + autonomy_ceiling>=1 + flywheel_apply) to matter at all.",
+
+  "_allow_mutations_doc": "Master capability gate for MUTATING socket ops (send_input / focus / broadcast / orchestrate / delegate / spawn ...). false => the socket surface is read-only. Checked inside handle_socket_request regardless of transport.",
+  "allow_mutations": false,
+
+  "_http_enabled_doc": "Transport gate: bind the opt-in loopback-HTTP listener (127.0.0.1 only, ephemeral port, Bearer + Origin/Host gated)? false => no TCP listener at all. Independent of allow_mutations — even with HTTP bound, mutating ops still pass the allow_mutations gate.",
+  "http_enabled": false,
+
+  "_autonomy_ceiling_doc": "Autonomy ladder ceiling: 0 = L0 (team_delegate refused / suggest-only, DEFAULT); >= 1 permits team_delegate. A fresh install fails closed on autonomy even when allow_mutations is on.",
+  "autonomy_ceiling": 0,
+
+  "_send_input_enabled_doc": "Agent->agent send-input gate: permit a COORDINATOR pane's team_send_input (route one line into another live pane's PTY). Deliberately NARROWER than and DECOUPLED from allow_mutations — arming agent->agent prompting must not blanket-enable the rest of the mutation surface. Also requires the caller to be a Coordinator (peer-pid hard gate) and the target pane to be alive. The one gate with a Settings UI toggle (confirm-gated).",
+  "send_input_enabled": false,
+
+  "_daemon_spawn_enabled_doc": "Q4 daemon accept-side gate: permit the daemon's handle_spawn to spawn a pane on behalf of the GUI over the Spawn wire op. Separate axis from allow_mutations; a Spawn needs BOTH (plus the compiled-in daemon-spawn feature).",
+  "daemon_spawn_enabled": false,
+
+  "_daemon_spawn_doc": "Q4 GUI routing flag (dial side): the APP dials the daemon's Spawn/Close ops over the UDS instead of spawning the PTY in-process. Separate axis from daemon_spawn_enabled (the daemon's own gate). false => do_spawn is byte-identical to the app-resident path.",
+  "daemon_spawn": false,
+
+  "_flywheel_apply_doc": "Flywheel WRITE-mode gate: delegate/flywheel workers may FIX + COMMIT code (local only — git push stays denied) and the controller folds their branches into an integration tree + tests it. Additive to the triple-gate (delegate-live build + allow_mutations + autonomy_ceiling>=1), never a bypass.",
+  "flywheel_apply": false,
+
+  "_flywheel_ship_doc": "Flywheel SHIP gate: on a CLEAN Pass verdict of a write-mode run, PUSH the integration branch + open a PR (never merges). Deliberately separate from flywheel_apply — the outward push/PR is the highest-consequence action, so it gets its own opt-in for a staged live-verify.",
+  "flywheel_ship": false,
+
+  "_flywheel_remediate_doc": "Flywheel autonomous-remediation gate: on a FIXABLE Hold (stale base / recoverable unverified suite) run ONE bounded remediation wave (re-base onto fresh origin/main, re-fold, re-run the SAME authoritative gate, re-compute the deterministic verdict). Never weakens the verdict — a real test failure (Reject) and security-sensitive diffs are hard-excluded; the PR remains the sole human review/merge boundary. Highest-consequence opt-in; additive to the WHOLE stack.",
+  "flywheel_remediate": false,
+
+  "_flywheel_critique_doc": "Cross-examination critique gate: run a fresh-context cross-domain critique pass (security/perf/tests/contract) over the folded diff; a blocking finding the test gate missed DOWNGRADES Pass -> Hold. Stricter-only by construction — can only ADD caution, never forge a pass. Costs an extra Opus pass.",
+  "flywheel_critique": false,
+
+  "_flywheel_review_doc": "P5 smart-PR-review gate: run an adversarial PR-level reviewer over the folded diff; a REQUEST_CHANGES verdict with a major/block finding DOWNGRADES Pass -> Hold. Stricter-only. false => the reviewer still runs ADVISORY (verdict logged + rendered, unchanged).",
+  "flywheel_review": false,
+
+  "_flywheel_crap_doc": "P5 CRAP-delta gate: a CRAP regression on a touched method (or a NEW method with CRAP > 30), measured DELTA vs the captured origin/main base, DOWNGRADES Pass -> Hold. Stricter-only veto downstream of the test gate; fail-soft (no coverage artifact => no veto). false => the delta is logged + fed to the reviewer as evidence only.",
+  "flywheel_crap": false,
+
+  "_serena_doc": "P5 serena pre-flight: register ONE project-pinned serena LSP-MCP server (stdio, dies with the session) per worker worktree for symbol-accurate edits + reviewer reference truth. Opt-in (rust-analyzer is RAM-hungry). Fail-soft: missing uvx / index failure is logged + skipped, never fatal.",
+  "serena": false,
+
+  "_flywheel_prd_fast_doc": "TIMING knob, NOT a capability gate (grants no new power): use a much shorter per-worker settle deadline (~90s/180s instead of the ~15/45-min budget) for PRD-build passes of deliberately small tasks. Progress-aware extension still applies — a worker actively streaming at the deadline is not killed.",
+  "flywheel_prd_fast": false,
+
+  "_flywheel_require_repo_pin_doc": "Expected-repo pin enforcement: when true, EVERY autonomous delegate/flywheel run MUST declare its repo with a leading @repo:<name> directive in the goal, hard-refused on mismatch OR absence. false => a pin, when present, is still enforced; absence is allowed. Prevents fired-the-goal-on-the-wrong-repo accidents.",
+  "flywheel_require_repo_pin": false,
+
+  "_loop_autonomy_doc": "LOOP scheduler autonomy gate: may the schedulable saved-LOOP system AUTO-FIRE an iteration (re-trigger the unified controller without a human pressing the button)? Gates the SCHEDULER's re-trigger authority ONLY — every in-controller capability (write/ship/remediate) stays behind its own gate. The durable (unattended) tier additionally requires a non-empty repo pin.",
+  "loop_autonomy": false
+}

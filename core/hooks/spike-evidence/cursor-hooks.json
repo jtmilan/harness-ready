@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{"command": "./hooks/state.sh sessionStart"}],
+    "beforeShellExecution": [{"command": "./hooks/state.sh beforeShell"}],
+    "afterShellExecution": [{"command": "./hooks/state.sh afterShell"}],
+    "stop": [{"command": "./hooks/state.sh stop"}]
+  }
+}

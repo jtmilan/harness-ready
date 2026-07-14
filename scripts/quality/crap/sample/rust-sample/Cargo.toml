@@ -1,0 +1,10 @@
+[package]
+name = "rust-sample"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+# Standalone — do NOT join the parent agent-teams-tooling workspace.
+[workspace]

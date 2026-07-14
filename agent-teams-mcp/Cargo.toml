@@ -1,0 +1,61 @@
+[package]
+name = "agent-teams-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — read-only MCP sidecar (rmcp, stdio): exposes the ranked queue + workspaces to your own MCP clients (PRD §14 Phase A)"
+
+[[bin]]
+name = "agent-teams-mcp"
+path = "src/main.rs"
+
+# Phase A is read-only + stdio only. tokio + serde + rmcp land here (never in
+# state-adapter). Mutation tools, the Unix-domain socket, HTTP, and auth are
+# Phase B — deliberately absent. rmcp pinned to current 1.x (see PRD §14).
+[dependencies]
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Must match the schemars rmcp 1.7 resolves (1.x) so the JsonSchema trait
+# unifies — the derive macro emits `schemars::` paths needing the crate linked.
+schemars = "1"
+anyhow = "1"
+agent-teams-core = { path = "../core/mcp", features = ["schema"] }
+# Phase 12 / D51: fresh CSPRNG nonce for the verify-before-send HTTP dial challenge.
+# Only used under `--features phase-b-mutations` (the http dial module). Optional so a
+# default (read-only) build never pulls it.
+getrandom = { version = "0.2", optional = true }
+# Phase 10 / Mem-1: OFF by default (inert-first). Enabled by `memory-notes`.
+agent-teams-memory = { path = "../core/memory", features = ["schema"], optional = true }
+# Phase 14 / item 4b: OFF by default (inert-first). Enabled by `task-tools`. No
+# schema feature — core/task carries no schemars dep; task.rs projects to local
+# JsonSchema view types.
+agent-teams-task = { path = "../core/task", optional = true }
+# task-tools only: flock(2) around task_transition's read-fold-validate-append so
+# two sidecar processes can't both validate against the same fold and double-append
+# (cross-process critical section; the append itself was already O_APPEND-atomic).
+libc = { version = "0.2", optional = true }
+
+[features]
+# PHASE B — LIVE-WIRED, capability-by-role. Compiles `src/phase_b/` (`socket` —
+# Unix seam + wire protocol, `mutations` — team_send_input/team_focus_workspace +
+# the 06-03 Context Router tools) and MERGES the separate mutation_tool_router
+# into the main router in `TeamServer::new`, dialing the running app's Unix socket
+# for real. The DEFAULT `agent-teams-mcp` build keeps this feature OFF (read-only —
+# the sidecar every ordinary pane gets); the SHIPPED `agent-teams-mcp-coordinator`
+# binary is built WITH it and handed ONLY to Coordinator-role panes (app/daemon
+# select the sidecar by role), so mutation capability is scoped by ABSENCE. The app
+# boundary remains the load-bearing enforcement: allow_mutations (or
+# send_input_enabled for team_send_input) + the coordinator peer-pid gate.
+phase-b-mutations = ["dep:getrandom"]
+
+# PHASE 10 / Mem-1 — BridgeMemory note tools. Inert-first: pulls core/memory + a
+# SEPARATE memory_tool_router merged in new() only under this feature, so default
+# builds do not advertise the tools. Ungated (pure file I/O, no allow_mutations).
+memory-notes = ["dep:agent-teams-memory"]
+
+# PHASE 14 / item 4b — task_* lifecycle tools. Inert-first: pulls core/task + a
+# SEPARATE task_tool_router merged in new() only under this feature. Ungated (pure
+# file I/O, no allow_mutations); creation is append-only (C4), writes carry
+# provenance (C2), advances are scope-gated (4c), and quotas are capped (C6).
+task-tools = ["dep:agent-teams-task", "dep:libc"]

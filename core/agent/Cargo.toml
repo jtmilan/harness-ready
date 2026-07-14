@@ -1,0 +1,19 @@
+[package]
+name = "agent-teams-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — persisted Agent/persona record store (Phase 14-T4). A sibling-of-state_root per-record file store, independent of the state machine. Survives the D7 startup wipe."
+
+[lib]
+name = "agent_teams_agent"
+path = "src/lib.rs"
+
+# DEPENDENCY DISCIPLINE (load-bearing): serde + serde_json ONLY.
+#  · NO state-adapter — an Agent record is independent of the agent state machine;
+#    a dep would re-couple it to pane/RunRecord lifecycle (mirrors core/task discipline).
+#  · NO schemars — there is no MCP wire need for the Agent type yet.
+#  · ZERO Tauri — the store is unit-testable offline (mirrors core/task / core/mcp).
+#  · NO tempfile — tests hand-roll a `Scratch` tempdir (mirrors core/task).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

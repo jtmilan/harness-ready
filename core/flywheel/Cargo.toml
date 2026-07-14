@@ -1,0 +1,14 @@
+[package]
+name = "flywheel"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — pure, headless goal→PR pipeline core (orchestrate · synthesize · flywheel PR · RunContext + apply spine), de-Tauri'd. Seeded from the agent-teams-cli crates/core; the SSOT pipeline for GUI + MCP + CLI (vendor→upstream Phase 2)."
+
+# Tauri-free by invariant: the GUI provides a thin TauriEmitter adapter; this crate never imports tauri.
+# CI asserts `grep -rE 'use tauri|tauri::' core/flywheel/src` = 0 (same boundary the CLI holds).
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+harness = { path = "../harness" }
+# role→model matrix SSOT (governance P7): the split/adjudicator pins read matrix rows.
+roles = { path = "../roles" }

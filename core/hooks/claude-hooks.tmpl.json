@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude SessionStart {{WSID}}" }] }],
+    "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude UserPromptSubmit {{WSID}}" }] }],
+    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude PreToolUse {{WSID}}" }] }],
+    "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude PostToolUse {{WSID}}" }] }],
+    "PermissionRequest":[{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude PermissionRequest {{WSID}}" }] }],
+    "Notification":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude Notification {{WSID}}" }] }],
+    "Stop":             [{ "matcher": "", "hooks": [{ "type": "command", "command": "\"{{WRITER}}\" claude Stop {{WSID}}" }] }]
+  }{{ENV_BLOCK}}
+}

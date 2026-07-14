@@ -1,0 +1,28 @@
+[package]
+name = "supervisor"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Teams — PTY session supervisor + git-worktree isolation (Phase 02)"
+
+[dependencies]
+portable-pty = "0.8"
+state-adapter = { path = "../state-adapter" }
+# PURE worker/harness logic (Harness/HarnessDescriptor/worker_spawn/worker_args/effective_write_mode/
+# worker_git_deny_env) extracted to this dep-light crate; re-exported from lib.rs so callers are unchanged.
+harness = { path = "../harness" }
+# 08-T4: the bounded recent-scrollback substrate behind `Supervisor::snapshot` (a
+# whole-window `ByteRing::recent` read). The delta byte-cursor protocol stays on
+# `PaneBuffer::delta` (this crate); `ByteRing` is the simple tail-bounded snapshot a
+# daemon-side cold re-attach repaints from.
+agent-teams-ringbuf = { path = "../ringbuf" }
+# 17-01: typed agent-role personas — injected as a system prompt at spawn
+# (claude --append-system-prompt; cursor .cursor/rules/agent-role.mdc).
+roles = { path = "../roles" }
+# GLOBAL_SCOPE: the single memory scope-key injected as AGENT_TEAMS_MEMORY_REPO_KEY
+# so a spawned pane's sidecar resolves the SAME `<memory_root>/global` store the app
+# and standalone MCP fall back to (drift-free — the literal constant, not a copy).
+agent-teams-memory = { path = "../memory" }
+# preseed_claude_trust: read-modify-write ~/.claude.json (set per-project trust keys so
+# a fresh worktree's claude pane doesn't block on the first-launch trust dialog). Needs a
+# real JSON parse to preserve the operator's existing config losslessly.
+serde_json = "1"
