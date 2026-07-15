@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -14,9 +14,13 @@ import PaneMenu from "@/components/command/PaneMenu";
 // OLDEST context gets context-lost when exceeded), so attach ONLY to visible panes and dispose on
 // hide. Hidden panes fall back to the DOM renderer (xterm 6 render-pauses them). Kill-switch:
 // localStorage at_no_webgl="1" → never attach (field rollback without a rebuild).
+//
+// Slot tracking is a Set of per-pane state objects (not a bare counter). A counter can only be
+// +1/−1'd correctly on every path forever; a Set is membership-idempotent — detach/context-loss
+// races cannot permanently inflate the live count, and size is the source of truth for the cap.
 const MAX_WEBGL = 8;
 let webglDisabled = (() => { try { return localStorage.getItem("at_no_webgl") === "1"; } catch { return false; } })();
-let webglLive = 0; // live attached contexts (visible panes only) — kept ≤ MAX_WEBGL
+const webglAttached = new Set(); // pane state objects currently holding a live WebGL context
 let _WebglCtor = null;
 let _WebglLoad = null;
 function loadWebglCtor() {
@@ -31,7 +35,7 @@ function loadWebglCtor() {
 // s = { term, webgl, webglBlocked } per-pane renderer state (a ref's .current in the component).
 // Guards are RE-CHECKED after the await: the pane may have hidden/disposed while loading.
 async function attachWebgl(s) {
-  if (webglDisabled || !s || s.webgl || s.webglBlocked || !s.term || webglLive >= MAX_WEBGL) return;
+  if (webglDisabled || !s || s.webgl || s.webglBlocked || !s.term || webglAttached.size >= MAX_WEBGL) return;
   let WebglAddon;
   try {
     WebglAddon = await loadWebglCtor();
@@ -39,19 +43,28 @@ async function attachWebgl(s) {
     s.webglBlocked = true; // module load failed — DOM renderer stays; a later pane can retry the import
     return;
   }
-  if (webglDisabled || s.webgl || s.webglBlocked || !s.term || webglLive >= MAX_WEBGL) return;
+  if (webglDisabled || s.webgl || s.webglBlocked || !s.term || webglAttached.size >= MAX_WEBGL) return;
   try {
     const addon = new WebglAddon();
     addon.onContextLoss(() => {
       // GPU context lost (OOM / suspend / cap eviction): dispose restores the DOM renderer.
       // PERMANENT fallback for THIS pane — re-attaching on a pressured GPU just flaps.
       try { addon.dispose(); } catch { /* already disposed */ }
-      if (s.webgl) { s.webgl = null; webglLive = Math.max(0, webglLive - 1); }
+      // Identity check: only release if THIS addon is still the registered one (detachWebgl may
+      // have already cleared the slot — Set.delete is idempotent either way).
+      if (s.webgl === addon) s.webgl = null;
+      webglAttached.delete(s);
       s.webglBlocked = true;
     });
     s.term.loadAddon(addon); // throws when WebGL2 is unavailable in this webview
+    // Re-check after loadAddon: unmount/hide may have raced the async ctor path and already
+    // run detachWebgl (s.term null). Never claim a slot for a dead pane.
+    if (!s.term || s.webgl || s.webglBlocked) {
+      try { addon.dispose(); } catch { /* */ }
+      return;
+    }
     s.webgl = addon;
-    webglLive += 1;
+    webglAttached.add(s);
   } catch {
     // Per-pane block first: webgl2 getContext can fail TRANSIENTLY under GPU pressure — one
     // flaky pane must not downgrade every pane. Latch globally only when a bare capability
@@ -63,10 +76,14 @@ async function attachWebgl(s) {
   }
 }
 function detachWebgl(s) {
-  if (!s || !s.webgl) return;
-  try { s.webgl.dispose(); } catch { /* already disposed */ }
-  s.webgl = null;
-  webglLive = Math.max(0, webglLive - 1);
+  if (!s) return;
+  if (s.webgl) {
+    try { s.webgl.dispose(); } catch { /* already disposed */ }
+    s.webgl = null;
+  }
+  // Always drop membership (idempotent). A bare counter would under/over-count when context-loss
+  // and unmount both fire; Set.delete cannot permanently inflate the live size.
+  webglAttached.delete(s);
 }
 
 // Terminal theme sourced to match the pane's CRT look (cyan-on-near-black).
@@ -126,7 +143,14 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     clearTimeout(renameOpenRef.current);
     renameOpenRef.current = setTimeout(() => setRenaming(true), 0);
   };
-  useEffect(() => () => clearTimeout(renameOpenRef.current), []);
+  // Layout cleanup runs before the focused input is removed from the DOM, so renameDoneRef is
+  // latched BEFORE the synthetic unmount blur. That blur would otherwise call finishRename →
+  // setRenaming(false) (setState on unmount) and setPaneLabel (localStorage write during teardown).
+  // Discard mid-rename on close; a real Enter/blur while mounted still commits normally.
+  useLayoutEffect(() => () => {
+    renameDoneRef.current = true;
+    clearTimeout(renameOpenRef.current);
+  }, []);
 
   const finishRename = (value, commit) => {
     if (renameDoneRef.current) return;
