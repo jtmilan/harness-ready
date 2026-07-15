@@ -3,7 +3,7 @@ import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace } from "@/lib/work
 import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
-import { isReplyTraffic } from "@/lib/tauriAgentBridge";
+import { isReplyTraffic, isTauri } from "@/lib/tauriAgentBridge";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import TopBar from "@/components/command/TopBar";
 import LayoutToolbar from "@/components/command/LayoutToolbar";
@@ -231,6 +231,38 @@ export default function Home() {
     onBroadcastToggle: () => setBroadcast((b) => !b),
     onMaximizeToggle: handleMaximizeToggle,
   });
+
+  // T3: native app-menu "Toggle Pane Zoom" (Cmd+Shift+G) emits "maximize-pane" from
+  // lib.rs. Same consumer as the JS keydown arm. Latest-ref so the once-bound listen
+  // closure never freezes the first render's selectedId/zoomId (BUG-2 class trap).
+  // Browser preview has no Tauri inject → no-op; the keydown arm still serves Chrome.
+  // No @tauri-apps/api npm dep in this app — withGlobalTauri exposes window.__TAURI__.
+  const maximizeToggleRef = useRef(handleMaximizeToggle);
+  useEffect(() => {
+    maximizeToggleRef.current = handleMaximizeToggle;
+  });
+  useEffect(() => {
+    if (!isTauri()) return undefined;
+    const listen = window.__TAURI__?.event?.listen;
+    if (typeof listen !== "function") return undefined;
+    let unlisten = null;
+    let cancelled = false;
+    listen("maximize-pane", () => {
+      maximizeToggleRef.current?.();
+    }).then((fn) => {
+      if (cancelled) {
+        try { fn(); } catch { /* ignore */ }
+        return;
+      }
+      unlisten = fn;
+    }).catch(() => { /* event API absent / reject — browser-safe */ });
+    return () => {
+      cancelled = true;
+      if (typeof unlisten === "function") {
+        try { unlisten(); } catch { /* ignore */ }
+      }
+    };
+  }, []);
 
   // Cross-workspace drop: reassign the pane, then re-render so the grid re-buckets.
   const handleDropOnWorkspace = (paneId, wsId) => {
