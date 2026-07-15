@@ -68,6 +68,7 @@ export default function PaneMenu({ hasBranch = false, workspaces = [], onAction 
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button
+          type="button"
           // The pane head starts a drag on pointerdown (AgentPane) and selects the pane on click.
           // Stop both from reaching it. stopPropagation ONLY — preventDefault would leave Radix's
           // own composed pointerdown unable to open the menu.
@@ -77,7 +78,8 @@ export default function PaneMenu({ hasBranch = false, workspaces = [], onAction 
           aria-label="Pane menu"
           className="flex h-5 w-4 shrink-0 items-center justify-center text-sm leading-none text-cyan-600 transition-colors hover:bg-cyan-300/10 hover:text-cyan-300 data-[state=open]:bg-cyan-300/10 data-[state=open]:text-cyan-300"
         >
-          ⋮
+          {/* Decorative glyph — aria-label names the control; without aria-hidden SRs announce both. */}
+          <span aria-hidden="true">⋮</span>
         </button>
       </DropdownMenuTrigger>
 
@@ -111,7 +113,7 @@ export default function PaneMenu({ hasBranch = false, workspaces = [], onAction 
         </DropdownMenuItem>
 
         {/* Disabled, not hidden, when the pane has no branch yet: `agent.branch` is "" until the
-            backend resolves the worktree (tauriAgentBridge.js:184), and copying "" is a no-op the
+            backend resolves the worktree (tauriAgentBridge.js:211), and copying "" is a no-op the
             user can't tell from a broken menu. Prod omits the item entirely (main.js:330); a
             stable six-item menu that greys one row reads better than one that reflows. */}
         <DropdownMenuItem className={ITEM_CLS} disabled={!hasBranch} onSelect={() => fire("copy-branch")}>
