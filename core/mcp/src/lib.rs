@@ -33,6 +33,7 @@
 use serde::{Deserialize, Serialize};
 use state_adapter::watch::{current_states, discover};
 use state_adapter::{AgentState, Harness, State, WaitingReason};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -140,6 +141,60 @@ fn project(id: String, harness: Harness, st: AgentState) -> QueueRow {
     }
 }
 
+/// Digit-aware ("natural") id ordering: the runs of ASCII digits inside an id
+/// compare as NUMBERS, everything else byte-wise. `ws29184x2-p2` therefore sorts
+/// before `ws29184x2-p10`, where a plain `str` compare puts `p10` first (`'1'` <
+/// `'2'`) — the subtler form of the same nondeterminism bug, invisible in any
+/// fixture with fewer than 10 panes.
+///
+/// Numeric runs are compared by (zero-stripped length, then bytes) rather than by
+/// parsing, so an id with a digit run longer than `u64` can never overflow or
+/// panic. Digits are matched as ASCII bytes: every byte of a multi-byte UTF-8
+/// sequence is `>= 0x80`, so a non-ASCII id can never be mistaken for a numeric
+/// run and just falls through to the byte compare.
+///
+/// TOTAL, not merely deterministic: numerically-equal-but-textually-different runs
+/// (`p01` vs `p1`) are settled by a final whole-string compare, so the only pair
+/// that compares `Equal` is a pair of identical ids. That is what makes this a
+/// sound tie-break for the stable sort in [`compute_queue`].
+fn natural_id_cmp(a: &str, b: &str) -> Ordering {
+    /// Split a leading run of ASCII digits: `(run, rest)`.
+    fn digits(s: &[u8]) -> (&[u8], &[u8]) {
+        let end = s
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(s.len());
+        s.split_at(end)
+    }
+
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (x.first(), y.first()) {
+            (None, None) => break,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) if p.is_ascii_digit() && q.is_ascii_digit() => {
+                let ((xn, xr), (yn, yr)) = (digits(x), digits(y));
+                // Strip leading zeros, then: more digits = bigger number; same
+                // width = plain byte compare is already numeric order.
+                let xt = &xn[xn.iter().take_while(|b| **b == b'0').count()..];
+                let yt = &yn[yn.iter().take_while(|b| **b == b'0').count()..];
+                match xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt)) {
+                    Ordering::Equal => (x, y) = (xr, yr),
+                    ord => return ord,
+                }
+            }
+            (Some(p), Some(q)) => match p.cmp(q) {
+                Ordering::Equal => (x, y) = (&x[1..], &y[1..]),
+                ord => return ord,
+            },
+        }
+    }
+    // Numerically equal but textually different (`p01` vs `p1`) ⇒ settle on the
+    // raw text so the order is total and never depends on `read_dir`.
+    a.cmp(b)
+}
+
 /// The ranked queue across all workspaces under `state_dir`, in wire form.
 ///
 /// Ranking is the canonical single-source [`state_adapter::rank`] (via
@@ -147,8 +202,29 @@ fn project(id: String, harness: Harness, st: AgentState) -> QueueRow {
 /// `Some`, only workspaces whose id is in the set are kept (app-up exact match);
 /// when `None`, every discovered workspace is returned (app-down superset, FR-7).
 /// Filtering after ranking is order-preserving — `rank` is stable.
+///
+/// ## Why the input is pre-sorted (the "arrangement is random" fix)
+///
+/// [`discover`] builds its `Vec` straight from `fs::read_dir`, which guarantees
+/// NO order. `rank` orders by `(needs_human, reason_priority, since)` — a
+/// PARTIAL order: two panes that agree on all three (the common case — a fleet
+/// spawned together sits at identical `needs_human=false` / `reason=None` /
+/// `since`) are left tied, and `rank`'s `sort_by` is STABLE, so a tie resolves
+/// to whatever order `read_dir` happened to yield. That churn is what reaches
+/// the frontend, whose pane list is built in this exact order
+/// (`tauriAgentBridge.js` `_pollOnce` → `agents` → `buildBalancedTree`).
+///
+/// Sorting the workspaces by id BEFORE ranking makes `rank`'s stability do the
+/// work: equal-rank rows keep their input order, which is now the deterministic
+/// id order. So this is a TIE-BREAK WITHIN equal rank, never a replacement for
+/// it — `needs_human` still leads the queue regardless of id, and no second
+/// comparator is introduced (`rank` stays the single source, per this module's
+/// contract). Sorting the projected rows afterwards would instead OVERWRITE the
+/// ranking and silently break `team_get_queue`'s "who needs me" contract.
 pub fn compute_queue(state_dir: &Path, live: Option<&HashSet<String>>) -> Vec<QueueRow> {
-    current_states(&discover(state_dir))
+    let mut workspaces = discover(state_dir);
+    workspaces.sort_by(|a, b| natural_id_cmp(&a.id, &b.id));
+    current_states(&workspaces)
         .into_iter()
         .filter(|(id, _, _)| live.is_none_or(|set| set.contains(id)))
         .map(|(id, h, st)| project(id, h, st))
@@ -2121,6 +2197,125 @@ mod tests {
         assert_eq!(rows[0].id, "needsme");
         assert!(rows[0].needs_human);
         assert!(!rows[1].needs_human);
+    }
+
+    /// THE TRAP: a naive `str` sort puts `p10` before `p2` (`'1'` < `'2'`), which
+    /// ships a subtler version of the very bug the ordering exists to fix — and it
+    /// looks green in any fixture with fewer than 10 panes. Pinned explicitly.
+    #[test]
+    fn natural_id_cmp_orders_p2_before_p10_where_lexicographic_does_not() {
+        assert_eq!(
+            natural_id_cmp("ws29184x2-p2", "ws29184x2-p10"),
+            Ordering::Less,
+            "p2 must sort before p10"
+        );
+        // The naive sort this replaces gets it backwards — proving the test bites.
+        assert_eq!("ws29184x2-p2".cmp("ws29184x2-p10"), Ordering::Greater);
+
+        // Numeric runs elsewhere in the id are natural too (the ws counter).
+        assert_eq!(natural_id_cmp("ws2x0-p0", "ws10x0-p0"), Ordering::Less);
+        // …and the run AFTER a numeric tie still decides.
+        assert_eq!(natural_id_cmp("ws1x0-p3", "ws1x0-p20"), Ordering::Less);
+        assert_eq!(natural_id_cmp("ws1x0-p9", "ws1x0-p9"), Ordering::Equal);
+    }
+
+    /// Total order: identical ids are the ONLY `Equal` pair, and the relation is
+    /// antisymmetric. `p01`/`p1` tie numerically, so the whole-string fallback is
+    /// what keeps the sort from falling back to `read_dir` order.
+    #[test]
+    fn natural_id_cmp_is_a_total_order_including_leading_zeros() {
+        assert_eq!(natural_id_cmp("ws1x0-p01", "ws1x0-p1"), Ordering::Less);
+        assert_eq!(natural_id_cmp("ws1x0-p1", "ws1x0-p01"), Ordering::Greater);
+        // A digit run far wider than u64 must order, not overflow/panic.
+        let wide_a = format!("p{}", "9".repeat(40));
+        let wide_b = format!("p1{}", "0".repeat(40));
+        assert_eq!(natural_id_cmp(&wide_a, &wide_b), Ordering::Less);
+        // Prefix / empty / non-ASCII fall through to the byte compare.
+        assert_eq!(natural_id_cmp("ws1x0-p1", "ws1x0-p1a"), Ordering::Less);
+        assert_eq!(natural_id_cmp("", "p0"), Ordering::Less);
+        assert_eq!(natural_id_cmp("pé", "pé"), Ordering::Equal);
+    }
+
+    /// The lane's actual fix: equal-rank rows come back in deterministic id order
+    /// (natural, so p2 precedes p10) instead of `fs::read_dir` order. All six panes
+    /// share `harness`/`event`/`ts`, so `(needs_human, reason_priority, since)` ties
+    /// for every pair and ONLY the id tie-break can decide.
+    #[test]
+    fn equal_rank_rows_are_ordered_by_natural_id_not_read_dir() {
+        let s = Scratch::new("order");
+        for idx in [10, 2, 0, 1, 20, 3] {
+            s.workspace(
+                &format!("ws4242x0-p{idx}"),
+                r#"{"harness":"claude","event":"SessionStart","ts":1}"#,
+            );
+        }
+        let ids: Vec<String> = compute_queue(s.path(), None)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ws4242x0-p0",
+                "ws4242x0-p1",
+                "ws4242x0-p2",
+                "ws4242x0-p3",
+                "ws4242x0-p10",
+                "ws4242x0-p20",
+            ],
+            "equal-rank rows must be in natural id order (p2 before p10)"
+        );
+    }
+
+    /// The guardrail on the fix: the id order is a tie-break WITHIN equal rank, so
+    /// it must NEVER outrank `needs_human`. `p10` is blocked on a human and `p2` is
+    /// merely done, so `p10` leads despite sorting last by id. If someone "fixes"
+    /// the ordering by sorting the projected rows instead, this test fails — which
+    /// is exactly the `team_get_queue` contract break we must not ship.
+    #[test]
+    fn rank_still_outranks_id_order() {
+        let s = Scratch::new("rankwins");
+        s.workspace(
+            "ws77x0-p2",
+            r#"{"harness":"cursor","event":"stop","ts":1}"#,
+        );
+        s.workspace(
+            "ws77x0-p10",
+            r#"{"harness":"claude","event":"PermissionRequest","ts":2}"#,
+        );
+        let rows = compute_queue(s.path(), None);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].id, "ws77x0-p10",
+            "needs_human must lead the queue even though its id sorts last"
+        );
+        assert!(rows[0].needs_human);
+        assert_eq!(rows[1].id, "ws77x0-p2");
+    }
+
+    /// Repeated reads of an UNCHANGED state dir must yield a byte-identical order.
+    /// This is the property the frontend depends on across a workspace switch — the
+    /// user-visible "arrangement is random" symptom is this invariant failing.
+    #[test]
+    fn compute_queue_order_is_stable_across_repeated_reads() {
+        let s = Scratch::new("stable");
+        for idx in 0..8 {
+            s.workspace(
+                &format!("ws9x0-p{idx}"),
+                r#"{"harness":"claude","event":"SessionStart","ts":1}"#,
+            );
+        }
+        let first: Vec<String> = compute_queue(s.path(), None)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        for _ in 0..5 {
+            let again: Vec<String> = compute_queue(s.path(), None)
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(again, first, "order must not vary between reads");
+        }
     }
 
     #[test]
