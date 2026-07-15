@@ -24,6 +24,7 @@
 import { createAgents, randomLine, ATTENTION_REASONS } from "@/lib/agentData";
 import { TauriAgentBridge, isTauri } from "@/lib/tauriAgentBridge";
 import { randomAgentName } from "@/lib/agentNames";
+import { assignMany, unassign } from "@/lib/workspaceAssign";
 
 // Closed UI-kind set. Local copy of tauriAgentBridge.js `HARNESS_WIRE` keys (SSOT lives
 // there). Deliberate duplication — do not import the constant from the Tauri module
@@ -167,42 +168,59 @@ class MockAgentBridge {
   // --- lifecycle (git worktree add + PTY spawn in the real backend) ---
   //
   // K1: returns Promise<string[]> of minted ids whose spawn "resolved", in config
-  // order. Failed/refused configs are excluded so Home can assignMany the survivors.
+  // order. Failed/refused configs are excluded from the returned list.
+  //
+  // opts.assignTo: same semantics as TauriAgentBridge — assignMany mappable ids
+  // before any agents.push so a non-default active workspace never briefly shows
+  // the new panes in the default bucket (or vice-versa).
   //
   // Mock "failure" definition (no real PTY): the only refuse path is K4 unmapped
-  // kind. Mapped kinds always mint — there is no backend reject to simulate.
-  async spawnAgents(configs, templateName) {
+  // kind. Mapped kinds always mint — there is no backend reject to simulate; the
+  // unassign-on-failure branch is still written for parity with the Tauri bridge.
+  async spawnAgents(configs, templateName, { assignTo } = {}) {
     const base = this.agents.length;
+    const plan = configs.map((cfg, i) => {
+      const num = String(base + i + 1).padStart(3, "0");
+      return { id: `AGENT-${num}`, num, cfg, mapped: isMappedKind(cfg.kind) };
+    });
+    if (assignTo) {
+      const assignable = plan.filter((p) => p.mapped).map((p) => p.id);
+      if (assignable.length) assignMany(assignable, assignTo);
+    }
     /** @type {string[]} */
     const minted = [];
-    for (const [i, cfg] of configs.entries()) {
-      const num = String(base + i + 1).padStart(3, "0");
-      const id = `AGENT-${num}`;
+    for (const { id, num, cfg, mapped } of plan) {
       // K4: unmapped kind = REFUSED loudly. Never `cfg.kind || "bash"`.
       // Match tauriAgentBridge spawn-refused tone: red buffer + console.error,
       // no agents.push (no ghost), excluded from returned ids.
-      if (!isMappedKind(cfg.kind)) {
+      if (!mapped) {
         const msg = "[spawn refused] unmapped kind " + String(cfg.kind) + " for " + id;
         console.error("[MockAgentBridge]", msg);
         this.raw[id] = "\r\n\x1b[31m" + msg + "\x1b[0m\r\n";
         continue;
       }
-      minted.push(id);
-      this.agents.push({
-        id,
-        name: randomAgentName(),
-        kind: cfg.kind,
-        role: cfg.role,
-        branch: `feat/${(cfg.role || cfg.kind || "task").toLowerCase().replace(/\s+/g, "-")}-${num}`,
-        worktree: `~/worktrees/agent-${num}`,
-        status: "starting",
-        attention: null,
-        output: [
-          `>> LAUNCHED FROM TEMPLATE: ${templateName}`,
-          `>> ROLE: ${(cfg.role || "").toUpperCase()} | AGENT: ${cfg.kind.toUpperCase()} | PRIORITY: ${(cfg.priority || "normal").toUpperCase()} | AUTONOMY: ${(cfg.autonomy || "semi").toUpperCase()}`,
-          "$ git worktree add ... && agent init",
-        ],
-      });
+      try {
+        minted.push(id);
+        this.agents.push({
+          id,
+          name: randomAgentName(),
+          kind: cfg.kind,
+          role: cfg.role,
+          branch: `feat/${(cfg.role || cfg.kind || "task").toLowerCase().replace(/\s+/g, "-")}-${num}`,
+          worktree: `~/worktrees/agent-${num}`,
+          status: "starting",
+          attention: null,
+          output: [
+            `>> LAUNCHED FROM TEMPLATE: ${templateName}`,
+            `>> ROLE: ${(cfg.role || "").toUpperCase()} | AGENT: ${cfg.kind.toUpperCase()} | PRIORITY: ${(cfg.priority || "normal").toUpperCase()} | AUTONOMY: ${(cfg.autonomy || "semi").toUpperCase()}`,
+            "$ git worktree add ... && agent init",
+          ],
+        });
+      } catch (e) {
+        // Parity with Tauri ghost cleanup — mock push almost never throws.
+        if (assignTo) unassign(id);
+        console.error("[MockAgentBridge] spawn failed:", id, e);
+      }
     }
     this._emit();
     setTimeout(() => this._patch((a) => minted.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);

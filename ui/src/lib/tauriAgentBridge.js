@@ -17,6 +17,7 @@
 
 import { randomAgentName } from "@/lib/agentNames";
 import { reconcilePaneLabels } from "@/lib/paneLabels";
+import { assignMany, unassign } from "@/lib/workspaceAssign";
 
 // Prod parity: POLL_TICK_MS = 120 in agent-teams app/src/poll-core.js:7 — 500ms reads a beat
 // behind a streaming TUI. Guarded against overlap in _poll (120ms can undercut a slow invoke).
@@ -248,22 +249,39 @@ export class TauriAgentBridge {
 
   // Returns minted pane ids whose spawn_workspace RESOLVED, in config order.
   // Failed / refused spawns are excluded (they surface via red raw line + console.error).
-  async spawnAgents(configs, _name) {
+  //
+  // opts.assignTo (optional ws id): pin every mappable id into that workspace BEFORE the
+  // first optimistic registration / poll tick can render them. Sequential spawn_workspace
+  // takes seconds; without early assign, unassigned panes land in the default bucket and
+  // squeeze the active grid to 1–2-col PTYs (claude scrollback garbage; opencode blank).
+  // Home passes activeWorkspace when it is not the default bucket. K1 return value unchanged.
+  async spawnAgents(configs, _name, { assignTo } = {}) {
     // Backend groups panes into a workspace by right-splitting the id on "-p"
     // (wsNNNNNxK-pN shape) — one workspace id per spawnAgents call.
     const ws = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    // Mint ALL ids up front (same wsNNNNNx0-pN scheme as before) so assignMany can pin
+    // the whole batch before any per-config invoke.
+    const plan = configs.map((cfg, index) => {
+      const id = `${ws}-p${index}`;
+      return {
+        id,
+        cfg,
+        repo: cfg.repo || DEFAULT_REPO,
+        harness: harnessWireOf(cfg.kind),
+      };
+    });
+    // Assign only mappable kinds — refused configs never register and must not orphan.
+    if (assignTo) {
+      const assignable = plan.filter((p) => p.harness).map((p) => p.id);
+      if (assignable.length) assignMany(assignable, assignTo);
+    }
     /** @type {string[]} */
     const minted = [];
-    for (const [index, cfg] of configs.entries()) {
-      const id = `${ws}-p${index}`;
-      // Persist `repo` so restartAgents can recover the same folder (agent objects
-      // never carry it — only kind/role reach the UI agent shape).
-      const repo = cfg.repo || DEFAULT_REPO;
-      const harness = harnessWireOf(cfg.kind);
+    for (const { id, cfg, repo, harness } of plan) {
       if (!harness) {
         // K4: unmapped kind = REFUSED loudly. Never HARNESS_WIRE[kind] || "bash".
         // Match restartAgents refused-harness tone: red raw + console.error, no ghost
-        // registration, excluded from returned ids.
+        // registration, excluded from returned ids. (Not in assignable → no unassign.)
         const msg = "[spawn refused] unmapped kind " + String(cfg.kind) + " for " + id;
         console.error("[TauriAgentBridge]", msg);
         this.raw[id] = "\r\n\x1b[31m" + msg + "\x1b[0m\r\n";
@@ -284,7 +302,9 @@ export class TauriAgentBridge {
         minted.push(id);
       } catch (e) {
         // A failed spawn must be visible, not a silent unhandled rejection.
+        // Drop ghost registration AND any pre-assign so the id does not stick on a ws.
         delete this.spawned[id];
+        if (assignTo) unassign(id);
         this.raw[id] = "\r\n\x1b[31m[spawn failed] " + String(e && e.message ? e.message : e) + "\x1b[0m\r\n";
         console.error("[TauriAgentBridge] spawn_workspace failed:", id, e);
       }
