@@ -141,25 +141,31 @@ function pruneDead(node, live) {
   return a || b || null; // one child gone → sibling promoted; both gone → null
 }
 
-// Persistence: serialize with the pane INDEX (the -pN suffix) so the tree is keyed in the same
-// idx-space as idxList/harnesses/roles and survives the id-rebuild on reopen. paneIdxOf maps a
-// paneId → integer index (or null/undefined to drop the leaf).
-export function serializeTree(node, paneIdxOf) {
+// Persistence v2: leaves store the FULL pane id (`{t:"leaf", id}`), not a `-pN` index.
+// This fork's pane ids are spawn-group scoped (`ws48213x0-p0`) and never equal the UI
+// workspace-store id (`ws-1`); the old index scheme rebuilt leaves as `${wsId}-p${i}` and
+// every restore pruned-to-empty. Panes here also do not survive app restart as a reopen
+// idx-list (that prod flow is absent), so index-keying had no benefit — only breakage.
+// The storage *envelope* (`{v:2, tree}`) lives at the useTiling layer; these pure helpers
+// only transform the tree node. Unknown / index-era leaves (`{i:N}`) → null (caller discards).
+export function serializeTree(node) {
   if (!node) return null;
   if (node.t === "leaf") {
-    const idx = paneIdxOf(node.pane);
-    return typeof idx === "number" ? { t: "leaf", i: idx } : null;
+    return typeof node.pane === "string" && node.pane ? { t: "leaf", id: node.pane } : null;
   }
-  const a = serializeTree(node.a, paneIdxOf);
-  const b = serializeTree(node.b, paneIdxOf);
+  const a = serializeTree(node.a);
+  const b = serializeTree(node.b);
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };
   return a || b || null;
 }
-export function deserializeTree(node, wsId) {
-  if (!node) return null;
-  if (node.t === "leaf") return typeof node.i === "number" ? leaf(`${wsId}-p${node.i}`) : null;
-  const a = deserializeTree(node.a, wsId);
-  const b = deserializeTree(node.b, wsId);
+export function deserializeTree(node) {
+  if (!node || typeof node !== "object") return null;
+  if (node.t === "leaf") {
+    return typeof node.id === "string" && node.id ? leaf(node.id) : null;
+  }
+  if (node.t !== "split") return null;
+  const a = deserializeTree(node.a);
+  const b = deserializeTree(node.b);
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };
   return a || b || null;
 }
