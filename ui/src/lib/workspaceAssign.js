@@ -118,18 +118,22 @@ export function unassign(paneId) {
 /**
  * Drop every pane assignment pointing at `wsId` (used when a workspace is
  * deleted so the map holds no stale entries for a tab that no longer exists).
+ * Mutates module state the same way as `unassign` (replace map + persist + notify).
  * @param {string} wsId
  */
 export function unassignWorkspace(wsId) {
-  const map = getAssignment();
   let changed = false;
+  const map = { ...assignment };
   for (const paneId of Object.keys(map)) {
     if (map[paneId] === wsId) {
       delete map[paneId];
       changed = true;
     }
   }
-  if (changed) persist(map);
+  if (!changed) return;
+  assignment = map;
+  persist();
+  notify();
 }
 
 /**

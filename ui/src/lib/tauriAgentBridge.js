@@ -277,11 +277,17 @@ export class TauriAgentBridge {
   // first optimistic registration / poll tick can render them. Sequential spawn_workspace
   // takes seconds; without early assign, unassigned panes land in the default bucket and
   // squeeze the active grid to 1–2-col PTYs (claude scrollback garbage; opencode blank).
-  // Home passes activeWorkspace when it is not the default bucket. K1 return value unchanged.
-  async spawnAgents(configs, _name, { assignTo } = {}) {
+  // Home template path pre-mints a tab + passes assignTo + wsId so both match.
+  //
+  // opts.wsId (optional): reuse a caller-minted backend workspace prefix instead of
+  // minting a new one (template path creates the UI tab first with this id).
+  async spawnAgents(configs, _name, { assignTo, wsId: wsIdOpt } = {}) {
     // Backend groups panes into a workspace by right-splitting the id on "-p"
     // (wsNNNNNxK-pN shape) — one workspace id per spawnAgents call.
-    const ws = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    const ws =
+      typeof wsIdOpt === "string" && wsIdOpt
+        ? wsIdOpt
+        : "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
     // Mint ALL ids up front (same wsNNNNNx0-pN scheme as before) so assignMany can pin
     // the whole batch before any per-config invoke.
     const plan = configs.map((cfg, index) => {
@@ -529,7 +535,8 @@ export class TauriAgentBridge {
   // a trap. Resume is per-pane now.
 
   // Kill the given panes for good (PTY + worktree via close_workspace) — no respawn.
-  // Distinct from restartAgents (close + re-spawn same id). Used by workspace delete.
+  // Distinct from restartAgents (close + re-spawn same id). Used by workspace delete
+  // and single-pane Close. Clears assignment map so deleted tabs leave no orphans.
   async closeAgents(ids) {
     for (const id of ids) {
       try {
@@ -538,6 +545,7 @@ export class TauriAgentBridge {
         console.error("[TauriAgentBridge] close_workspace failed:", id, e);
       }
       this._forget(id);
+      unassign(id);
     }
     this.agents = this.agents.filter((a) => !ids.includes(a.id));
     this._emit();

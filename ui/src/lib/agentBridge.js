@@ -5,10 +5,10 @@
  * as a native macOS app (Tauri / Electron), replace MockAgentBridge with an
  * implementation that drives real PTYs and git worktrees:
  *
- *   - spawnAgents(configs): for each config, `git worktree add <path> -b <branch>`
- *     then spawn AGENT_KINDS[kind].cmd in a PTY (portable-pty / node-pty) cwd'd there.
- *     Returns Promise<string[]> of minted ids whose spawn resolved (K1). Unmapped
- *     kinds are refused (K4), never silently rewritten to bash.
+ *   - spawnAgents(configs, name, { assignTo?, wsId? }): for each config, `git worktree
+ *     add <path> -b <branch>` then spawn AGENT_KINDS[kind].cmd in a PTY cwd'd there.
+ *     Returns Promise<{ wsId, paneIds }> of minted ids whose spawn resolved (K1).
+ *     Unmapped kinds are refused (K4), never silently rewritten to bash.
  *   - subscribe(cb): push a full agent-state snapshot on every PTY output chunk
  *     or status change. cb receives the agents array.
  *   - sendInput(id, text): write `text + "\n"` to that agent's PTY stdin.
@@ -148,6 +148,7 @@ class MockAgentBridge {
 
   // Real backend: kill each PTY child + `git worktree remove`, then drop the panes.
   closeAgents(ids) {
+    for (const id of ids) unassign(id);
     this.agents = this.agents.filter((a) => !ids.includes(a.id));
     this._emit();
   }
@@ -177,17 +178,18 @@ class MockAgentBridge {
   // K1: paneIds = minted ids whose spawn "resolved", in config order. Failed/refused
   // configs are excluded.
   //
-  // opts.assignTo: same semantics as TauriAgentBridge — assignMany mappable ids
-  // before any agents.push so a non-default active workspace never briefly shows
-  // the new panes in the default bucket (or vice-versa).
+  // opts.assignTo / opts.wsId: same semantics as TauriAgentBridge.
   //
   // Mock "failure" definition (no real PTY): the only refuse path is K4 unmapped
   // kind. Mapped kinds always mint — there is no backend reject to simulate; the
   // unassign-on-failure branch is still written for parity with the Tauri bridge.
-  async spawnAgents(configs, templateName, { assignTo } = {}) {
+  async spawnAgents(configs, templateName, { assignTo, wsId: wsIdOpt } = {}) {
     const base = this.agents.length;
     // Mint a backend-shaped workspace id so mock + real share the same call contract.
-    const wsId = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    const wsId =
+      typeof wsIdOpt === "string" && wsIdOpt
+        ? wsIdOpt
+        : "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
     const plan = configs.map((cfg, i) => {
       const num = String(base + i + 1).padStart(3, "0");
       return { id: `AGENT-${num}`, num, cfg, mapped: isMappedKind(cfg.kind) };

@@ -1988,6 +1988,11 @@ fn mcp_http_reveal_token(state: tauri::State<AppState>) -> Result<String, String
 /// (async): `remove_worktree` is a git subprocess + `remove_dir_all` is disk I/O.
 #[tauri::command(async)]
 fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), String> {
+    // Same id contract as spawn_workspace: reject empty / traversal / separators so
+    // `state_root.join(&id)` can never resolve to state_root itself (wipe) or escape it.
+    if !validate_spawn_id(&id) {
+        return Err(format!("invalid pane id for close_workspace: {id:?}"));
+    }
     // Drop the one-shot claude priming flag for this pane id up front, on EVERY close path
     // (local or daemon-owned). It is inserted on a local claude spawn (see `claude_primed`)
     // but was previously never removed on close, so the set grew one id per closed claude
@@ -2030,19 +2035,27 @@ fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), Stri
     // registry_remove AFTER — a crash mid-cleanup leaves the registry entry, and the next
     // startup's `sweep_orphan_worktrees` finishes the job (never a silently leaked worktree).
     let wt_meta = state.meta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
-    let cleanup_lock = state
-        .pending_cleanups
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(id.clone())
-        .or_default()
-        .clone();
+    // Publish a FRESH cleanup lock (never or_default on a leftover entry) so do_spawn's
+    // wait cannot race an unlocked Arc: the cleanup thread must HOLD the lock before we
+    // return Ok(()) — handshake via sync_channel(0). Otherwise spawn could lock-and-drop
+    // a free mutex and add_worktree while remove_worktree still runs.
+    let cleanup_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    {
+        let mut map = state
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(id.clone(), cleanup_lock.clone());
+    }
     let cleanups = std::sync::Arc::clone(&state.pending_cleanups);
     let reg_lock = std::sync::Arc::clone(&state.worktree_registry_lock);
     let registry = state.worktree_registry.clone();
     let state_dir = state.state_root.join(&id);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
     std::thread::spawn(move || {
         let _busy = cleanup_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Signal that the barrier is held — close_workspace may return; do_spawn will block.
+        let _ = ready_tx.send(());
         if let Some(Some((git_root, wt_root))) = wt_meta {
             let _ = remove_worktree(&git_root, &id, &wt_root);
         }
@@ -2058,6 +2071,8 @@ fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), Stri
             map.remove(&id);
         }
     });
+    // Block until the cleanup thread holds the per-id lock (or the thread died).
+    let _ = ready_rx.recv();
     Ok(())
 }
 

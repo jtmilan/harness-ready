@@ -117,20 +117,22 @@ export default function Home() {
   const handleBulkResume = () => bridge.resumeAgents(checkedIds);
   const handleBulkRestart = () => bridge.restartAgents(checkedIds);
   const handleBulkBroadcast = (msg) => bridge.broadcastTo(checkedIds, msg);
-// Template launch: spawn under a NEW backend-minted ws id, create matching UI tab,
-  // assign every pane (no default-bucket pooling). Manual spawn uses assignTo when
-  // the operator is on a non-default workspace so optimistic panes never squeeze the
-  // default grid (spawn-window squeeze).
+// Template launch: pre-mint backend-shaped ws id, create UI tab + activate FIRST, then
+  // spawn with assignTo so optimistic panes never land in the default bucket mid-sequence
+  // (spawn-window squeeze → 1–2 col PTYs). Manual spawn uses assignTo when the operator
+  // is on a non-default workspace for the same reason.
   const defaultWsId = workspaces[0]?.id;
   const spawnAssignOpts =
     activeWorkspace && activeWorkspace !== defaultWsId
       ? { assignTo: activeWorkspace }
       : {};
   const handleLaunchTemplate = async (template) => {
-    const { wsId, paneIds } = await bridge.spawnAgents(template.agents, template.name);
+    // Same id scheme as TauriAgentBridge.spawnAgents — bridge accepts optional wsId.
+    const wsId = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
     setWorkspaces((prev) => [...prev, { id: wsId, name: template.name }]);
-    for (const paneId of paneIds) assign(paneId, wsId);
     setActiveWorkspace(wsId);
+    await bridge.spawnAgents(template.agents, template.name, { assignTo: wsId, wsId });
+    forceRerender();
   };
   const handleSpawnAgent = async (cfg) => {
     const { paneIds } = await bridge.spawnAgents([cfg], "MANUAL LAUNCH", spawnAssignOpts);
@@ -190,14 +192,11 @@ export default function Home() {
     }
   };
 
-  // Close a single pane. The bridge exposes only whole-fleet closeWorkspace(); the per-pane
-  // primitive is the `close_workspace` tauri invoke (BRIEF C4 / PaneMenu comment assign it to the
-  // container). Adding a bridge method is out of this lane, so call the invoke directly. In the
-  // web-preview mock (no window.__TAURI__) this is a no-op — the real kill happens in the Tauri shell.
+  // Close a single pane via the bridge contract (closeAgents → close_workspace + _forget).
+  // Never raw-invoke: mock path must drop the agent, and Tauri must clear spawned/offsets.
   const handleClosePane = (id) => {
-    if (typeof window !== "undefined" && window.__TAURI__?.core) {
-      window.__TAURI__.core.invoke("close_workspace", { id });
-    }
+    void bridge.closeAgents([id]);
+    setCheckedIds((prev) => prev.filter((x) => x !== id));
     if (selectedId === id) setSelectedId(null);
   };
 

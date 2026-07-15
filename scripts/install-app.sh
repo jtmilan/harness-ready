@@ -58,15 +58,17 @@ fi
 
 # --testing installs a SEPARATE "Harness Ready Dev" app: a distinct bundle id (so it coexists with
 # AND runs alongside the stable app) + an isolated AGENT_TEAMS_STATE_DIR baked via Info.plist
-# LSEnvironment. Every sibling dir (runs, events, hooks, MCP socket, ephemeral HTTP port,
-# dev-source) derives from state_root, so this one var sandboxes the whole thing. Shared with the
-# stable app: ONLY mcp-config.json (arming lives at the Application-Support root, keyed off
-# state_root's PARENT — both resolve to the same file).
+# LSEnvironment.
+#
+# CRITICAL: fixed-name siblings (agent-teams-mcp.sock, agent-teams-live.json, mcp-config.json)
+# land in the PARENT of state_root. Nest under harness-ready-dev/ (same as scripts/dev.sh) so
+# Dev never shares sock/registry/config with stable HR (…/harness-ready/agent-teams). A flat
+# …/harness-ready/agent-teams-dev leaf was wrong — both parents were harness-ready/.
 DEST_NAME="$APP_NAME"
 if [[ "$TESTING" == "1" ]]; then
   DEST_NAME="Harness Ready Dev"
   DEV_BUNDLE_ID="com.jeffrymilan.harnessready.dev"
-  DEV_STATE_DIR="$HOME/Library/Application Support/harness-ready/agent-teams-dev"
+  DEV_STATE_DIR="$HOME/Library/Application Support/harness-ready-dev/state"
 fi
 DEST="/Applications/$DEST_NAME.app"
 
