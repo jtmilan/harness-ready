@@ -149,6 +149,44 @@ export default function Home() {
     onDragFrame: applyDragFrame,
   });
 
+  // Global shortcuts (React Command Center). Live state via refs so a long-lived
+  // window listener never sees a stale overlay/mode/selection. p1's AgentPane
+  // attachCustomKeyEventHandler RELEASES ⌘G/⌘⇧I (returns false) so these still
+  // fire when a terminal holds focus — do not re-implement terminal release here.
+  const overlayRef = useRef(overlay);
+  overlayRef.current = overlay;
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const visibleIdsRef = useRef(visibleIds);
+  visibleIdsRef.current = visibleIds;
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (overlayRef.current != null) return; // never steal keys over open modals
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey) return;
+      const k = e.key.toLowerCase();
+      // ⌘G / Ctrl+G — maximize (single) / restore (tile)
+      if (!e.shiftKey && k === "g") {
+        e.preventDefault();
+        if (!selectedIdRef.current) {
+          const first = visibleIdsRef.current[0];
+          if (first) setSelectedId(first);
+        }
+        setMode(modeRef.current === "single" ? "tile" : "single");
+        return;
+      }
+      // ⌘⇧I / Ctrl+Shift+I — open broadcast overlay
+      if (e.shiftKey && k === "i") {
+        e.preventDefault();
+        setOverlay("broadcast");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [setMode]);
+
   // Cross-workspace drop: reassign the pane, then re-render so the grid re-buckets.
   const handleDropOnWorkspace = (paneId, wsId) => {
     if (!paneId || !wsId) return;
