@@ -5674,16 +5674,19 @@ let fwWorkers = 3;
 const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline", "grok"];
 const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline", grok: "Grok Build" };
 // Curated quick-pick models per harness. NOT exhaustive + ACCOUNT-SCOPED (ids rot + depend on your
-// auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "default"
-// chip) = the harness account default (no --model), the SAFEST pick (a stale/unauthed id 400s).
+// auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "(default)"
+// chip) = the harness account default (no --model / no -m), the SAFEST pick (a stale/unauthed id 400s).
 // Deep-verified live on this machine: codex/cursor = plain slug, opencode = provider/model. codex
 // `-codex` slugs are API-key-only → omitted (400 on a ChatGPT-auth account).
+// opencode: leading "" is the resilient default (NO -m → opencode uses its own authed config;
+// e.g. openrouter/… when that is what auth.json has). Explicit provider/model ids below are
+// OPT-IN only — github-copilot/* 400s when that provider is not authenticated.
 const FW_MODELS = {
   claude: ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
   codex: ["gpt-5.5", "gpt-5.4-mini"],
   cursor: ["composer-2.5-fast", "composer-2.5", "gpt-5.5-high", "auto"],
   commandcode: ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"],
-  opencode: ["github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
+  opencode: ["", "github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
   cline: ["anthropic/claude-sonnet-4", "anthropic/claude-opus-4", "openai/gpt-5"],
   grok: ["grok-4.5"],
 };
@@ -5740,7 +5743,13 @@ function fillHarnessDatalist(h) {
   const entry = fwModelCache[h];
   const full = (entry && entry.models.length) ? entry.models : (FW_MODELS[h] || []);
   dl.replaceChildren();
-  for (const m of full) { const o = document.createElement("option"); o.value = m; dl.appendChild(o); }
+  // Skip "" — blank field already means account default (no -m); empty datalist options are useless.
+  for (const m of full) {
+    if (!m) continue;
+    const o = document.createElement("option");
+    o.value = m;
+    dl.appendChild(o);
+  }
 }
 
 // ── Shared harness/model picker factory (#E4) ─────────────────────────────────────────────
@@ -5768,8 +5777,14 @@ function makeHarnessPicker({ prefix, getHarness, setHarness, modelTextEl }) {
       b.onclick = () => { if (txt) txt.value = id; renderModels(); };
       return b;
     };
-    row.appendChild(mk("", "default")); // clears the override → harness account default
-    for (const m of (FW_MODELS[getHarness()] || [])) row.appendChild(mk(m, m));
+    // "(default)" → empty model string → supervisor model_args omits -m/--model (account default).
+    // FW_MODELS may include "" (opencode) as a documented resilient entry; skip it here so we
+    // don't paint two identical default chips.
+    row.appendChild(mk("", "(default)"));
+    for (const m of (FW_MODELS[getHarness()] || [])) {
+      if (!m) continue;
+      row.appendChild(mk(m, m));
+    }
     // Back the free-text field with a <datalist> of the FULL live list (autocomplete over all real
     // ids without exploding the tile row). Falls back to the curated set when there's no live list.
     const entry = fwModelCache[getHarness()];
@@ -5777,7 +5792,12 @@ function makeHarnessPicker({ prefix, getHarness, setHarness, modelTextEl }) {
     if (dl) {
       dl.replaceChildren();
       const full = (entry && entry.models.length) ? entry.models : (FW_MODELS[getHarness()] || []);
-      for (const m of full) { const o = document.createElement("option"); o.value = m; dl.appendChild(o); }
+      for (const m of full) {
+        if (!m) continue;
+        const o = document.createElement("option");
+        o.value = m;
+        dl.appendChild(o);
+      }
     }
     // Honest source badge: live (dynamic enumeration) vs curated (this harness can't list).
     const src = $("model-src");
