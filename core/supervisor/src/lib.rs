@@ -215,8 +215,20 @@ fn model_args(harness: Harness, model: Option<&str>) -> Vec<String> {
     }
     match harness {
         Harness::Claude | Harness::Cursor => vec!["--model".into(), m.into()],
+        // cline local auth is provider `cline` ONLY. A `provider/model` flag for any other
+        // provider (e.g. anthropic/...) forces an unauthed provider path → Unauthorized.
+        // Omit `-m` for empty (above) and for non-`cline` provider-prefixed ids; bare ids
+        // and `cline/...` still pass through. Account default when omitted.
+        Harness::Cline => {
+            if let Some((provider, _)) = m.split_once('/') {
+                if provider != "cline" {
+                    return vec![];
+                }
+            }
+            vec!["-m".into(), m.into()]
+        }
         // grok CLI exposes `-m, --model <MODEL>` (v0.2.101) — short form matches this arm.
-        Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline | Harness::Grok => {
+        Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Grok => {
             vec!["-m".into(), m.into()]
         }
         Harness::Bash => vec![],
@@ -1032,6 +1044,8 @@ impl Supervisor {
         // every other harness or if inject fails). When Some, the spawn argv prepends
         // `--config <root>` so cline reads the injected `cline_mcp_settings.json`.
         let mut cline_home: Option<PathBuf> = None;
+        // Visible pane-buffer notice when inject fails (fallback: no --config → plain ~/.cline).
+        let mut cline_inject_warn: Option<String> = None;
         if let Some(ih) = spec.harness.inject_harness() {
             let cfg = InjectConfig {
                 workspace_id: spec.id.clone(),
@@ -1143,8 +1157,10 @@ impl Supervisor {
         // `<config-root>/data/settings/cline_mcp_settings.json`), so we materialize a PER-PANE config
         // root (a state SIBLING — survives the startup state_root wipe) and the argv block below
         // prepends `cline --config <root>`. Auth (`providers.json`) is seeded from the user's
-        // ~/.cline by inject_cline_mcp. Gated `!is_worker` (cline workers are headless one-shots that
-        // don't need the coordination MCP). Best-effort — a failure never fails the spawn.
+        // ~/.cline by inject_cline_mcp (hard-gated: seed must produce a non-empty providers.json).
+        // Gated `!is_worker` (cline workers are headless one-shots that don't need the coordination
+        // MCP). Soft spawn: on inject failure we leave cline_home=None → NO `--config` (plain
+        // ~/.cline auth works) and surface a warning into the pane output buffer + stderr.
         if !spec.is_worker && matches!(spec.harness, Harness::Cline) {
             let home = state_sibling(state_root, "cline-homes").join(&spec.id);
             let user_home = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cline");
@@ -1158,9 +1174,16 @@ impl Supervisor {
                 &mem_key,
             ) {
                 Ok(_) => cline_home = Some(home),
-                Err(e) => eprintln!(
-                    "[agent-teams] inject_cline_mcp failed (cline pane will have no MCP): {e}"
-                ),
+                Err(e) => {
+                    // Fallback: no --config (cline uses real ~/.cline). Never fail the spawn —
+                    // but the pane must SEE why agent-teams MCP / per-pane config was skipped.
+                    let msg = format!(
+                        "[agent-teams] inject_cline_mcp failed — falling back to ~/.cline \
+                         (no --config, no agent-teams MCP): {e}"
+                    );
+                    eprintln!("{msg}");
+                    cline_inject_warn = Some(msg);
+                }
             }
         }
 
@@ -1312,6 +1335,14 @@ impl Supervisor {
         let writer = pair.master.take_writer().map_err(io_err)?;
 
         let output = Arc::new(Mutex::new(PaneBuffer::new(RETAIN_CAP)));
+        // Surface cline inject-failure into the pane output channel (PaneBuffer is the only
+        // retained notice surface available at spawn). Prepend before the reader thread so the
+        // warning is visible even if the TUI later repaints over early PTY bytes.
+        if let Some(warn) = cline_inject_warn {
+            if let Ok(mut buf) = output.lock() {
+                buf.push(format!("{warn}\r\n").as_bytes());
+            }
+        }
         // 08 Sub-build 3 / slice 3: per-pane subscriber registry. The reader thread holds
         // its OWN clone so it can fan out WITHOUT the daemon map lock (design §4 crux).
         let subs: subscribers::SubscriberHandle =
@@ -1902,9 +1933,22 @@ mod tests {
             model_args(Harness::OpenCode, Some("openai/gpt-5.4-mini")),
             vec!["-m", "openai/gpt-5.4-mini"]
         );
+        // cline: local auth is provider `cline` only — omit -m for other provider prefixes.
         assert_eq!(
             model_args(Harness::Cline, Some("anthropic/claude-sonnet-4")),
-            vec!["-m", "anthropic/claude-sonnet-4"]
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            model_args(Harness::Cline, Some("openai/gpt-4o")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            model_args(Harness::Cline, Some("cline/claude-sonnet-4")),
+            vec!["-m", "cline/claude-sonnet-4"]
+        );
+        assert_eq!(
+            model_args(Harness::Cline, Some("sonnet")),
+            vec!["-m", "sonnet"]
         );
         assert_eq!(
             model_args(Harness::Grok, Some("grok-4")),
