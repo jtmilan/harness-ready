@@ -231,8 +231,11 @@ export class TauriAgentBridge {
     // Backend groups panes into a workspace by right-splitting the id on "-p"
     // (wsNNNNNxK-pN shape) — one workspace id per spawnAgents call.
     const ws = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    // Ordered pane ids for the caller (Home) to create a UI tab + assign panes.
+    const paneIds = [];
     for (const [index, cfg] of configs.entries()) {
       const id = `${ws}-p${index}`;
+      paneIds.push(id);
       // Register the id up front so its output is read from the next tick (before the
       // pane ever enters list_queue) and an optimistic "starting" pane renders now.
       this.spawned[id] = { kind: cfg.kind, role: cfg.role };
@@ -254,6 +257,7 @@ export class TauriAgentBridge {
     }
     this._saveSpawned();
     this._poll();
+    return { wsId: ws, paneIds };
   }
 
   _forget(id) {

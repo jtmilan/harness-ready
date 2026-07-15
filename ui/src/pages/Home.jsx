@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace } from "@/lib/workspaceStore";
-import { paneIdsForWorkspace } from "@/lib/workspaceAssign";
+import { assign, paneIdsForWorkspace } from "@/lib/workspaceAssign";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
 import TopBar from "@/components/command/TopBar";
@@ -86,8 +86,23 @@ export default function Home() {
   const handleBulkPause = () => bridge.pauseAgents(checkedIds);
   const handleBulkRestart = () => bridge.restartAgents(checkedIds);
   const handleBulkBroadcast = (msg) => bridge.broadcastTo(checkedIds, msg);
-  const handleLaunchTemplate = (template) => bridge.spawnAgents(template.agents, template.name);
-  const handleSpawnAgent = (cfg) => bridge.spawnAgents([cfg], "MANUAL LAUNCH");
+  // Template launch: spawn under a NEW backend-minted ws id, then create a matching UI tab
+  // and explicitly assign every pane so launches no longer pool into MY WORKSPACE.
+  const handleLaunchTemplate = async (template) => {
+    const { wsId, paneIds } = await bridge.spawnAgents(template.agents, template.name);
+    // handleAddWorkspace pattern — but tab id = backend ws id, name = template name.
+    setWorkspaces((prev) => [...prev, { id: wsId, name: template.name }]);
+    for (const paneId of paneIds) assign(paneId, wsId);
+    setActiveWorkspace(wsId);
+  };
+  // Single-agent spawn: assign returned pane(s) to the CURRENT active workspace (explicit;
+  // do not rely on the default-bucket rule alone).
+  const handleSpawnAgent = async (cfg) => {
+    const { paneIds } = await bridge.spawnAgents([cfg], "MANUAL LAUNCH");
+    const wsId = activeWorkspace;
+    for (const paneId of paneIds) assign(paneId, wsId);
+    forceRerender(); // assignment is localStorage-only; re-bucket without a tab switch
+  };
   const handleCloseWorkspace = () => {
     bridge.closeWorkspace();
     setCheckedIds([]);

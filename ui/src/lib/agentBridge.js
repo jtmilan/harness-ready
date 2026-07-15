@@ -126,14 +126,19 @@ class MockAgentBridge {
   }
 
   // --- lifecycle (git worktree add + PTY spawn in the real backend) ---
+  // Returns `{ wsId, paneIds }` — same shape as TauriAgentBridge.spawnAgents so Home can
+  // create a UI workspace tab and assign panes without default-bucket pooling.
   spawnAgents(configs, templateName) {
     const base = this.agents.length;
-    const newIds = [];
+    const paneIds = [];
+    // Mint a backend-shaped workspace id so mock + real share the same call contract.
+    const wsId = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
     configs.forEach((cfg, i) => {
       const num = String(base + i + 1).padStart(3, "0");
-      newIds.push(`AGENT-${num}`);
+      const id = `AGENT-${num}`;
+      paneIds.push(id);
       this.agents.push({
-        id: `AGENT-${num}`,
+        id,
         name: randomAgentName(),
         kind: cfg.kind || "bash",
         role: cfg.role,
@@ -149,7 +154,8 @@ class MockAgentBridge {
       });
     });
     this._emit();
-    setTimeout(() => this._patch((a) => newIds.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);
+    setTimeout(() => this._patch((a) => paneIds.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);
+    return { wsId, paneIds };
   }
 }
 
