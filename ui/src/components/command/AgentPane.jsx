@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -95,6 +95,11 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   const pushResizeRef = useRef(null);
   // Per-pane renderer state for the WebGL policy (term set at mount; webgl managed by visibility).
   const glRef = useRef({ term: null, webgl: null, webglBlocked: false });
+  // First VALID fit landed (cols≥20/rows≥5 against a real box). Gates backlog replay:
+  // writing full-width TUI bytes into the 80×24 default (or a transient tiny fit while
+  // useTiling's size is still null) hard-wraps the whole history into a 1-word-per-line
+  // column that no later resize/reflow can undo — TUI repaints are absolute-positioned.
+  const [sized, setSized] = useState(false);
 
   // Mount a single xterm per pane (created once, kept for the pane's lifetime — the raw
   // PTY bytes are fed to it verbatim, exactly like the prod frontend's per-pane Terminal).
@@ -111,7 +116,9 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     let fit = null;
     try { fit = new FitAddon(); term.loadAddon(fit); } catch { fit = null; }
     term.open(mountRef.current);
-    try { fit && fit.fit(); } catch { /* mount not laid out yet */ }
+    // NO mount-time fit: the tiling host measures via ResizeObserver, so on first mount
+    // (and workspace switch) this box is 0×0/tiny — an unguarded fit here commits FitAddon's
+    // ~2-col floor into xterm. syncNow below owns fitting, with full dimension guards.
     termRef.current = term;
     // Release ⌘G / ⌘⇧I to the window listener (Home.jsx / p3) — xterm would otherwise
     // swallow them while the pane textarea is focused. return false = do not handle.
@@ -152,9 +159,15 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     let debTimer = 0;
     let retryTimer = 0;
     let disposed = false;
+    let sizedLatched = false; // setSized(true) fired once for this mount
     const MAX_BACKOFF_MS = 5000;
 
     const termHasContent = () => {
+      // Bytes already replayed into this terminal = content, full stop. The buffer scan
+      // below misses TUI alt-screen replays whose first rows are blank (clear-screen
+      // opens the frame), which skipped the first-ack jiggle and left a 30×100-painted
+      // TUI un-repainted at the true size.
+      if (writtenRef.current > 0) return true;
       try {
         const buf = term.buffer && term.buffer.active;
         if (!buf) return false;
@@ -189,6 +202,9 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       if (!rows || !cols) return;
       // Belt-and-braces: never send a degenerate winsize to resize_pty.
       if (cols < 20 || rows < 5) return;
+      // First valid geometry: release the backlog replay (write effect below) BEFORE the
+      // change-guard — on a remount the PTY may already match, but the replay still waits.
+      if (!sizedLatched) { sizedLatched = true; setSized(true); }
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
@@ -285,6 +301,10 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
+    // Hold ALL writes until the first valid fit (see `sized`). Replaying the accumulated
+    // PTY history into a not-yet-sized terminal wraps it permanently; once sized flips,
+    // this effect re-runs and writes the full backlog into a correctly-sized grid.
+    if (!sized) return;
     // Web-preview fallback: the mock bridge has no raw byte stream, so render its line
     // array as terminal text instead.
     const raw = agent.raw !== undefined ? agent.raw : (agent.output || []).join("\r\n");
@@ -302,7 +322,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       term.write(raw);
       writtenRef.current = raw.length;
     }
-  }, [agent.raw, agent.gen, agent.output]);
+  }, [agent.raw, agent.gen, agent.output, sized]);
 
   const border = selected
     ? "border-cyan-300 shadow-[0_0_16px_rgba(0,229,255,0.45)]"
