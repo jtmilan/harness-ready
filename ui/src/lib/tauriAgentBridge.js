@@ -37,6 +37,19 @@ const HARNESS_WIRE = {
   bash: "bash",
 };
 
+// UI kind keys AND queue-row wire strings both appear on agent.kind (poll prefers
+// row.harness once list_queue surfaces the pane). Map either form to the wire
+// string spawn_workspace expects; refuse unknown values rather than defaulting
+// to "bash" (a wrong harness is worse than a refused restart).
+function harnessWireOf(kind) {
+  if (!kind || typeof kind !== "string") return null;
+  if (Object.prototype.hasOwnProperty.call(HARNESS_WIRE, kind)) return HARNESS_WIRE[kind];
+  for (const wire of Object.values(HARNESS_WIRE)) {
+    if (wire === kind) return wire;
+  }
+  return null;
+}
+
 // This UI collects no repo/folder in the spawn form, and the backend's
 // default_folder() returns $HOME — which is not a git repo, so add_worktree
 // degrades every pane to the bare home dir (no worktree isolation). Default
@@ -230,13 +243,16 @@ export class TauriAgentBridge {
       const id = `${ws}-p${index}`;
       // Register the id up front so its output is read from the next tick (before the
       // pane ever enters list_queue) and an optimistic "starting" pane renders now.
-      this.spawned[id] = { kind: cfg.kind, role: cfg.role };
+      // Persist `repo` so restartAgents can recover the same folder (agent objects
+      // never carry it — only kind/role reach the UI agent shape).
+      const repo = cfg.repo || DEFAULT_REPO;
+      this.spawned[id] = { kind: cfg.kind, role: cfg.role, repo };
       this.offsets[id] = 0;
       try {
         await invoke("spawn_workspace", {
           id,
           harness: HARNESS_WIRE[cfg.kind] || "bash",
-          repo: cfg.repo || DEFAULT_REPO,
+          repo,
           role: cfg.role,
         });
         if (cfg.role) await invoke("set_pane_roles", { roles: [[id, cfg.role]] });
@@ -319,9 +335,92 @@ export class TauriAgentBridge {
   }
 
   pauseAgents(ids) { return Promise.all(ids.map((id) => invoke("pause_pane", { id }))); }
+
+  // close_workspace then spawn_workspace with the SAME id. Capture harness/repo/role
+  // BEFORE close — `_forget` and the agent-list rebuild wipe them. There is no
+  // backend `restart_workspace` command (verified: only spawn_workspace / close_workspace
+  // exist on the Tauri surface this bridge uses).
   async restartAgents(ids) {
-    for (const id of ids) { await invoke("close_workspace", { id }); this._forget(id); }
+    for (const id of ids) {
+      const agent = this.agents.find((a) => a.id === id);
+      const sp = this.spawned[id];
+      // Capture identity before any destructive step.
+      const kind = (sp && sp.kind) || (agent && agent.kind) || null;
+      const role = sp && "role" in sp ? sp.role : agent && agent.role;
+      // Repo never lives on the UI agent object. Prefer the value spawnAgents
+      // persisted; else DEFAULT_REPO — this UI collects no folder in the spawn
+      // form, so that is the historical spawn path for every bridge-owned pane.
+      const repo = (sp && sp.repo) || DEFAULT_REPO;
+      const harness = harnessWireOf(kind);
+
+      if (!harness) {
+        // Wrong harness is worse than a refused restart — surface and skip.
+        const msg = "[restart refused] cannot recover harness for " + id
+          + " (kind=" + String(kind) + ")";
+        console.error("[TauriAgentBridge]", msg);
+        this.raw[id] = (this.raw[id] || "") + "\r\n\x1b[31m" + msg + "\x1b[0m\r\n";
+        const ri = this.agents.findIndex((a) => a.id === id);
+        if (ri !== -1) {
+          this.agents[ri] = { ...this.agents[ri], status: "error", raw: this.raw[id] };
+          this._emit();
+        }
+        continue;
+      }
+
+      try {
+        await invoke("close_workspace", { id });
+      } catch (e) {
+        // Surface — do not swallow. Still attempt re-spawn: a "no longer alive" /
+        // "no such workspace" close is the common case for a dead pane the user is
+        // trying to bring back; spawn_workspace will fail loudly if the id is still
+        // live (CLOSE_PENDING / ALREADY_LIVE).
+        console.error("[TauriAgentBridge] close_workspace failed on restart:", id, e);
+      }
+
+      // Fresh local state for the new PTY (same id). Do NOT call _forget — that
+      // drops the id from the poll union before re-spawn registers it again.
+      this.offsets[id] = 0;
+      this.raw[id] = "";
+      this.gen[id] = (this.gen[id] || 0) + 1;
+      this.dead.delete(id);
+      this.deadLocal.delete(id);
+      this.spawned[id] = { kind, role, repo };
+      this._saveSpawned();
+
+      const si = this.agents.findIndex((a) => a.id === id);
+      if (si !== -1) {
+        this.agents[si] = {
+          ...this.agents[si],
+          kind,
+          role,
+          status: "starting",
+          attention: null,
+          raw: "",
+          gen: this.gen[id],
+        };
+        this._emit();
+      }
+
+      try {
+        await invoke("spawn_workspace", { id, harness, repo, role });
+        if (role) await invoke("set_pane_roles", { roles: [[id, role]] });
+      } catch (e) {
+        // Pane is gone if close succeeded — must be visible, not a silent reject.
+        delete this.spawned[id];
+        this._saveSpawned();
+        const detail = String(e && e.message ? e.message : e);
+        this.raw[id] = "\r\n\x1b[31m[restart failed] " + detail + "\x1b[0m\r\n";
+        console.error("[TauriAgentBridge] restart spawn_workspace failed:", id, e);
+        const ei = this.agents.findIndex((a) => a.id === id);
+        if (ei !== -1) {
+          this.agents[ei] = { ...this.agents[ei], status: "error", raw: this.raw[id] };
+          this._emit();
+        }
+      }
+    }
+    this._poll();
   }
+
   resumeAll() { return Promise.all(this.agents.map((a) => invoke("resume_pane", { id: a.id }))); }
   stopAll() { return this.closeWorkspace(); }
   advanceStarting() {}
