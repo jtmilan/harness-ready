@@ -93,23 +93,20 @@ export default function Home() {
   const handleBulkRestart = () => bridge.restartAgents(checkedIds);
   const handleBulkBroadcast = (msg) => bridge.broadcastTo(checkedIds, msg);
   // Default bucket = first workspace id (same arg as paneIdsForWorkspace below). Unassigned
-  // panes already land there — only assign when the operator is looking at a non-default ws
-  // (BUG-3 / K3). K1: spawnAgents resolves to minted ids (failed spawns excluded).
-  // K5 assignMany is not on this base; loop assign() (one write each) + single forceRerender.
+  // panes already land there. When the operator is on a non-default ws, pass assignTo so the
+  // bridge pins ids BEFORE the first optimistic poll render (spawn-window squeeze: sequential
+  // spawn_workspace + late Home assign let new panes paint in the default grid at 1–2 cols).
+  // K1 return value still available; after-await assignment is no longer needed.
   const defaultWsId = workspaces[0]?.id;
-  const assignSpawnedToActive = (ids) => {
-    if (!ids || !ids.length) return;
-    if (!activeWorkspace || activeWorkspace === defaultWsId) return;
-    for (const id of ids) assign(id, activeWorkspace);
-    forceRerender();
-  };
+  const spawnAssignOpts =
+    activeWorkspace && activeWorkspace !== defaultWsId
+      ? { assignTo: activeWorkspace }
+      : {};
   const handleLaunchTemplate = async (template) => {
-    const ids = await bridge.spawnAgents(template.agents, template.name);
-    assignSpawnedToActive(ids);
+    await bridge.spawnAgents(template.agents, template.name, spawnAssignOpts);
   };
   const handleSpawnAgent = async (cfg) => {
-    const ids = await bridge.spawnAgents([cfg], "MANUAL LAUNCH");
-    assignSpawnedToActive(ids);
+    await bridge.spawnAgents([cfg], "MANUAL LAUNCH", spawnAssignOpts);
   };
   const handleCloseWorkspace = () => {
     bridge.closeWorkspace();

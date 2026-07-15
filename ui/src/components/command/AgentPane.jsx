@@ -263,6 +263,15 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       const rows = term.rows;
       const cols = term.cols;
       if (!rows || !cols) return;
+      // PTY dim floor (spawn-window squeeze): the >2px box guard only blocks near-zero
+      // rects. During sequential multi-pane spawn, 9+ optimistic panes can share one
+      // grid → fit() yields single-digit cols. Claude paints early transcript at that
+      // width (scrollback never heals); opencode TUIs can go blank forever after a
+      // near-zero SIGWINCH. Keep the local xterm fit; do NOT ship those dims to the
+      // child. When the rect normalizes, the [styleW, styleH, visible] re-fit effect
+      // (and ResizeObserver) re-run syncNow at a sane size. ACK/retry machinery below
+      // is unchanged (870dacf).
+      if (cols < 20 || rows < 6) return;
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
