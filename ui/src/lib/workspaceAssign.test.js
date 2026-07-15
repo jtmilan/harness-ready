@@ -1,6 +1,10 @@
 // K5 contract + default-bucket regression. Node env; localStorage stubbed.
+// Module has a top-level `let assignment = load()` cache, so each test gets a
+// FRESH module instance: vi.resetModules() + dynamic import in beforeEach.
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import * as workspaceAssign from "@/lib/workspaceAssign";
+
+/** @type {typeof import("@/lib/workspaceAssign")} re-imported fresh per test */
+let workspaceAssign;
 
 function installLocalStorage() {
   const store = new Map();
@@ -20,8 +24,12 @@ function installLocalStorage() {
   return { store, api };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   installLocalStorage();
+  vi.resetModules();
+  // Fresh instance: load() runs against the stub above via getItem only, so
+  // setItem call-count assertions below start at zero regardless.
+  workspaceAssign = await import("@/lib/workspaceAssign");
 });
 
 describe("paneIdsForWorkspace — default-bucket fallback (unchanged)", () => {
@@ -59,7 +67,10 @@ describe("paneIdsForWorkspace — default-bucket fallback (unchanged)", () => {
 
 // K5 — assignMany. p5 owns the implementation. Activate bodies when export lands
 // (typeof check); otherwise it.todo keeps the gate green without soft asserts.
-const assignManyReady = typeof workspaceAssign.assignMany === "function";
+// Probe import at collection time (export presence is static); beforeEach's
+// resetModules still gives each test its own fresh instance.
+const assignManyReady =
+  typeof (await import("@/lib/workspaceAssign")).assignMany === "function";
 
 describe("assignMany (K5)", () => {
   (assignManyReady ? it : it.todo)(
