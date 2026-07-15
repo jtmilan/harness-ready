@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace } from "@/lib/workspaceStore";
-import { paneIdsForWorkspace } from "@/lib/workspaceAssign";
+import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
+import { isReplyTraffic } from "@/lib/tauriAgentBridge";
+import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import TopBar from "@/components/command/TopBar";
 import LayoutToolbar from "@/components/command/LayoutToolbar";
 import AgentPane from "@/components/command/AgentPane";
@@ -30,6 +32,9 @@ export default function Home() {
   const [checkedIds, setCheckedIds] = useState([]);
   const [running, setRunning] = useState(true);
   const [trend, setTrend] = useState([]);
+  // Broadcast-toggle mode (⌘⇧I): every keystroke mirrors live into all panes, except terminal
+  // reply traffic (isReplyTraffic). State lives here, not in TopBar/AgentPane.
+  const [broadcast, setBroadcast] = useState(false);
   // Pane-drag controller state (Lane 3): which pane is mid-drag + the ws tab under the pointer.
   const [dragPaneId, setDragPaneId] = useState(null);
   const [dragDropTargetWs, setDragDropTargetWs] = useState(null);
@@ -73,9 +78,14 @@ export default function Home() {
   const handleBroadcast = (msg) => bridge.broadcast(msg);
   const handleDelegate = (msg, agentId) => bridge.delegate(agentId, msg);
   const handleRespond = (agentId, text) => bridge.sendInput(agentId, text);
-  const handleInput = (agentId, data) => bridge.sendRaw(agentId, data);
+  // The broadcast seam (L4/BRIEF C4): when broadcast mode is on, fan keystrokes to every live
+  // pane via broadcastRaw — but keep terminal reply traffic (mouse reports, focus, OSC replies)
+  // on the focused pane only, or it gets typed as garbage into every sibling.
+  const handleInput = (agentId, data) =>
+    broadcast && !isReplyTraffic(data)
+      ? bridge.broadcastRaw(data)
+      : bridge.sendRaw(agentId, data);
   const handleResize = (agentId, rows, cols) => bridge.resizePane(agentId, rows, cols);
-  const handlePlay = () => { setRunning(true); bridge.resumeAll(); };
   const handlePause = () => setRunning(false);
   const handleStop = () => { setRunning(false); bridge.stopAll(); };
   const handleSkip = () => bridge.advanceStarting();
@@ -98,6 +108,51 @@ export default function Home() {
   const handleSelect = (id) => {
     setSelectedId(id);
     document.getElementById(`pane-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  // Pane-head kebab actions (L2/BRIEF C2). AgentPane stays presentational: it emits the action and
+  // Home performs the side effect (clipboard, re-assign, close, zoom). Rename is the one action
+  // AgentPane persists itself (paneLabels.setPaneLabel) before notifying us — here it's a no-op.
+  const handleMenuAction = (action, id, payload) => {
+    switch (action) {
+      case "rename":
+        break; // label already committed by AgentPane via paneLabels.setPaneLabel
+      case "maximize":
+        toggleZoom(id);
+        break;
+      case "copy-id":
+        navigator.clipboard?.writeText(id);
+        break;
+      case "copy-branch": {
+        const a = agents.find((x) => x.id === id);
+        if (a?.branch) navigator.clipboard?.writeText(a.branch);
+        break;
+      }
+      case "move-to-ws":
+        if (payload?.wsId) {
+          assign(id, payload.wsId);
+          // Re-bucket the grid now that the assignment changed (mirrors handleDropOnWorkspace).
+          forceRerender();
+          if (selectedId === id && payload.wsId !== activeWorkspace) setSelectedId(null);
+        }
+        break;
+      case "close":
+        handleClosePane(id);
+        break;
+      default:
+        break;
+    }
+  };
+
+  // Close a single pane. The bridge exposes only whole-fleet closeWorkspace(); the per-pane
+  // primitive is the `close_workspace` tauri invoke (BRIEF C4 / PaneMenu comment assign it to the
+  // container). Adding a bridge method is out of this lane, so call the invoke directly. In the
+  // web-preview mock (no window.__TAURI__) this is a no-op — the real kill happens in the Tauri shell.
+  const handleClosePane = (id) => {
+    if (typeof window !== "undefined" && window.__TAURI__?.core) {
+      window.__TAURI__.core.invoke("close_workspace", { id });
+    }
+    if (selectedId === id) setSelectedId(null);
   };
 
   // Only the active workspace's panes are visible. Unassigned panes fall into the first workspace
@@ -141,12 +196,20 @@ export default function Home() {
     });
   }, []);
 
-  const { rects, mode, setMode, seams, onSeamPointerDown, movePane } = useTiling({
+  const { rects, mode, setMode, seams, onSeamPointerDown, movePane, zoomId, toggleZoom } = useTiling({
     paneIds: visibleIds,
     focusedId: selectedId,
     containerRef: tilingHostRef,
     wsId: activeWorkspace,
     onDragFrame: applyDragFrame,
+  });
+
+  // Global shortcuts (L3/BRIEF C3): ⌘⇧I toggles broadcast mode, ⌘⇧G maximizes the highlighted pane.
+  // onMaximizeToggle acts on the currently selected pane only; if none is selected, it does nothing.
+  const handleMaximizeToggle = () => { if (selectedId) toggleZoom(selectedId); };
+  useKeyboardShortcuts({
+    onBroadcastToggle: () => setBroadcast((b) => !b),
+    onMaximizeToggle: handleMaximizeToggle,
   });
 
   // Cross-workspace drop: reassign the pane, then re-render so the grid re-buckets.
@@ -275,12 +338,13 @@ export default function Home() {
       <TopBar
         activeCount={activeCount}
         running={running}
+        broadcastActive={broadcast}
+        onBroadcastToggle={() => setBroadcast((b) => !b)}
         onNewAgent={() => setOverlay("new-agent")}
         onBroadcast={() => setOverlay("broadcast")}
         onDelegate={() => setOverlay("delegate")}
         onTemplates={() => setOverlay("templates")}
         onCloseWorkspace={() => setOverlay("close-workspace")}
-        onPlay={handlePlay}
         onPause={handlePause}
         onStop={handleStop}
         onSkip={handleSkip}
@@ -313,28 +377,42 @@ export default function Home() {
           {visibleAgents.map((agent) => {
             const r = rects[agent.id];
             return (
-              <AgentPane
-                key={agent.id}
-                agent={agent}
-                style={{
-                  position: "absolute",
-                  left: r ? r.x : 0,
-                  top: r ? r.y : 0,
-                  width: r ? r.w : 0,
-                  height: r ? r.h : 0,
-                  display: r ? "flex" : "none", // KEEP MOUNTED when hidden — unmount kills the xterm/PTY
-                  opacity: dragPaneId === agent.id ? 0.6 : 1,
-                }}
-                onDragStart={handlePaneDragStart}
-                visible={!!r}
-                selected={selectedId === agent.id}
-                checked={checkedIds.includes(agent.id)}
-                onToggleCheck={toggleCheck}
-                onSelect={handleSelect}
-                onRespond={handleRespond}
-                onInput={handleInput}
-                onResize={handleResize}
-              />
+              <React.Fragment key={agent.id}>
+                <AgentPane
+                  agent={agent}
+                  style={{
+                    position: "absolute",
+                    left: r ? r.x : 0,
+                    top: r ? r.y : 0,
+                    width: r ? r.w : 0,
+                    height: r ? r.h : 0,
+                    display: r ? "flex" : "none", // KEEP MOUNTED when hidden — unmount kills the xterm/PTY
+                    opacity: dragPaneId === agent.id ? 0.6 : 1,
+                  }}
+                  onDragStart={handlePaneDragStart}
+                  visible={!!r}
+                  selected={selectedId === agent.id}
+                  checked={checkedIds.includes(agent.id)}
+                  onToggleCheck={toggleCheck}
+                  onSelect={handleSelect}
+                  onRespond={handleRespond}
+                  onInput={handleInput}
+                  onResize={handleResize}
+                  zoomed={zoomId === agent.id}
+                  onMaximize={toggleZoom}
+                  onMenuAction={handleMenuAction}
+                  workspaces={workspaces.filter((w) => w.id !== activeWorkspace)}
+                />
+                {/* Broadcast-on cue: a cyan ring matched to the repo's selected-pane glow idiom,
+                    overlaying every live pane border while broadcast mode is active. Non-interactive. */}
+                {broadcast && r && (
+                  <div
+                    aria-hidden="true"
+                    className="pointer-events-none absolute z-10 rounded-[1px] ring-2 ring-cyan-300/80 shadow-[0_0_16px_rgba(0,229,255,0.45)]"
+                    style={{ left: r.x, top: r.y, width: r.w, height: r.h }}
+                  />
+                )}
+              </React.Fragment>
             );
           })}
           {seams.map((seam, i) => (
