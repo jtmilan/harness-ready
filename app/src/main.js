@@ -618,9 +618,13 @@ function ensureSession(id) {
         // ⌘G maximize/restore — handle HERE so WKWebView "Find Next" (native) can't steal it
         // when the xterm helper <textarea> is focused. Use maximizePane(this id) so we never
         // depend on the activeId guard that toggleGrid() used to hit on a silent no-op.
+        // stopPropagation: xterm only skips its own input when we return false — the DOM
+        // event still bubbles, and the document keydown handler would toggleGrid() again
+        // (double-toggle → no visible change). Stop bubble so only this path runs.
         if (e.type === "keydown" && e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey
             && (e.key === "g" || e.key === "G")) {
           e.preventDefault();
+          e.stopPropagation();
           maximizePane(id);
           return false;
         }
