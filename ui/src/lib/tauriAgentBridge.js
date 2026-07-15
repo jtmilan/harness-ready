@@ -177,27 +177,18 @@ export class TauriAgentBridge {
       // was replayed from a later base, so the accumulated scrollback is stale. Reset
       // this pane's buffer and bump its generation so the terminal does a full RIS.
       if (d.truncated) {
-        // Cap a huge replay too (backend retains 4MB) — the gen bump below already
-        // resets the terminal. trimAtSafeBoundary avoids starting mid-CSI/SGR.
+        // Genuine backend ring-buffer eviction: replay from a later base, so the
+        // accumulated scrollback is stale. Cap the window, land on a safe boundary,
+        // and bump gen so the terminal does a full RIS + rewrite.
         this.raw[d.id] = trimAtSafeBoundary(d.data.slice(-160000));
         this.gen[d.id] = (this.gen[d.id] || 0) + 1;
       } else {
-        // The pane writes raw.slice(writtenRef) — an ABSOLUTE cursor into this
-        // string. The old silent `.slice(-200000)` front-trim shifted the string
-        // under that cursor: the first crossing dropped delta bytes mid-escape
-        // (literal "245;48;5;233m" fragments on grok panes), and once pinned at
-        // exactly the cap, raw.length === writtenRef → the pane FROZE (no new
-        // bytes ever written; backend truncation at 4MB never fires because our
-        // `since` cursor keeps advancing). Trim in big hysteresis steps WITH a
-        // gen bump instead, so the pane does reset + full rewrite of the window.
-        // Always trim at a safe line/ESC boundary so replay never starts mid-SGR.
-        const grown = (this.raw[d.id] || "") + d.data;
-        if (grown.length > 240000) {
-          this.raw[d.id] = trimAtSafeBoundary(grown.slice(-120000));
-          this.gen[d.id] = (this.gen[d.id] || 0) + 1;
-        } else {
-          this.raw[d.id] = grown;
-        }
+        // Append-only. Do NOT front-trim + gen-bump here: term.reset() is RIS and
+        // wipes alt-screen / DECAWM / DECSTBM the TUI set up (ESC[?1049h, ESC[?7l,
+        // …), so replaying a full-width UI into a mode-reset terminal garbles into
+        // a single column. Memory is bounded by the backend RETAIN_CAP (4MB) and
+        // xterm scrollback:4000 — genuine eviction arrives as d.truncated above.
+        this.raw[d.id] = (this.raw[d.id] || "") + d.data;
       }
       if (typeof d.next === "number") this.offsets[d.id] = d.next;
     }

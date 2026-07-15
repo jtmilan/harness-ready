@@ -113,6 +113,20 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     term.open(mountRef.current);
     try { fit && fit.fit(); } catch { /* mount not laid out yet */ }
     termRef.current = term;
+    // Release ⌘G / ⌘⇧I to the window listener (Home.jsx / p3) — xterm would otherwise
+    // swallow them while the pane textarea is focused. return false = do not handle.
+    term.attachCustomKeyEventHandler((e) => {
+      if (
+        e.type === "keydown" &&
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        ((!e.shiftKey && (e.key === "g" || e.key === "G")) ||
+          (e.shiftKey && (e.key === "i" || e.key === "I")))
+      ) {
+        return false;
+      }
+      return true;
+    });
     fitRef.current = fit;
     glRef.current.term = term;
 
@@ -128,18 +142,30 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // resize_pty races the multi-second spawn_workspace (the optimistic pane mounts
     // before the PTY registers → "no such workspace"), and the old code cached the
     // dims on a swallowed failure — leaving the PTY at its 30×100 spawn size FOREVER
-    // (the change-guard blocked every later sync). On failure we now keep the guard
-    // stale and retry on a timer until the PTY acks, so a pane that finishes spawning
-    // gets its winsize without needing another geometry change.
+    // (the change-guard blocked every later sync). On failure we leave the guard
+    // stale and retry with capped exponential backoff until the PTY acks (or unmount).
     let lastRows = 0;   // last dims acked by resize_pty (0 = never synced)
     let lastCols = 0;
     let syncing = false;  // resize_pty in flight
     let pending = false;  // geometry changed while an invoke was in flight
-    let retries = 0;      // autonomous retry budget (reset by fresh geometry events)
+    let backoffMs = 500;  // retry delay after a rejected resize; capped below
     let debTimer = 0;
     let retryTimer = 0;
     let disposed = false;
-    const MAX_RETRIES = 40; // × 500ms ≈ 20s — covers a slow worktree-backed spawn
+    const MAX_BACKOFF_MS = 5000;
+
+    const termHasContent = () => {
+      try {
+        const buf = term.buffer && term.buffer.active;
+        if (!buf) return false;
+        const n = Math.min(buf.length, 8);
+        for (let i = 0; i < n; i++) {
+          const line = buf.getLine(i);
+          if (line && line.translateToString(true).trim()) return true;
+        }
+      } catch { /* buffer not ready */ }
+      return false;
+    };
 
     const syncNow = () => {
       if (disposed || !term.element) return; // never fit() before term.open()
@@ -166,15 +192,36 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
+      const firstAttempt = lastRows === 0 && lastCols === 0;
       Promise.resolve(onResize && onResize(agent.id, rows, cols))
-        .then(() => { lastRows = rows; lastCols = cols; })
+        .then(async () => {
+          // Rejected promise = NOT acked (honest resize_pty errors from backend).
+          // Only latch on success.
+          const wasFirstAck = firstAttempt;
+          lastRows = rows;
+          lastCols = cols;
+          backoffMs = 500; // reset backoff after a real ack
+          // Late convergence after boot race: TUI may already have painted at the
+          // spawn 30×100. Jiggle winsize so SIGWINCH forces a full repaint at true size.
+          if (wasFirstAck && termHasContent() && onResize) {
+            const jiggleRows = Math.max(5, rows - 1);
+            try {
+              await Promise.resolve(onResize(agent.id, jiggleRows, cols));
+              await Promise.resolve(onResize(agent.id, rows, cols));
+            } catch {
+              // Main ack already landed; jiggle is best-effort repaint.
+            }
+          }
+        })
         .catch(() => {
           // Backend can't resize yet (pane still spawning / transient) — leave the
-          // acked dims stale so the guard stays open, and retry until it lands.
-          if (!disposed && retries < MAX_RETRIES) {
-            retries += 1;
+          // acked dims stale so the guard stays open. Retry with capped exponential
+          // backoff until success or unmount (no hard MAX_RETRIES give-up).
+          if (!disposed) {
             clearTimeout(retryTimer);
-            retryTimer = setTimeout(syncNow, 500);
+            const delay = backoffMs;
+            backoffMs = Math.min(MAX_BACKOFF_MS, Math.floor(backoffMs * 1.5));
+            retryTimer = setTimeout(syncNow, delay);
           }
         })
         .finally(() => {
@@ -186,7 +233,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // per frame; one fit + at most one resize_pty lands after the burst settles.
     const pushResize = () => {
       if (disposed) return;
-      retries = 0; // a fresh geometry event re-arms the retry budget
+      backoffMs = 500; // fresh geometry re-arms a snappy retry cadence
       clearTimeout(debTimer);
       debTimer = setTimeout(syncNow, 80);
     };
