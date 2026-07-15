@@ -88,6 +88,8 @@ export default function Home() {
     setCheckedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
 
   const handleBulkPause = () => bridge.pauseAgents(checkedIds);
+  // The only way out of handleBulkPause's SIGSTOP. Always available — see BulkActionBar.
+  const handleBulkResume = () => bridge.resumeAgents(checkedIds);
   const handleBulkRestart = () => bridge.restartAgents(checkedIds);
   const handleBulkBroadcast = (msg) => bridge.broadcastTo(checkedIds, msg);
   const handleLaunchTemplate = (template) => bridge.spawnAgents(template.agents, template.name);
@@ -429,6 +431,7 @@ export default function Home() {
         <BulkActionBar
           count={checkedIds.length}
           onPause={handleBulkPause}
+          onResume={handleBulkResume}
           onRestart={handleBulkRestart}
           onBroadcast={() => setOverlay("bulk-broadcast")}
           onClear={() => setCheckedIds([])}

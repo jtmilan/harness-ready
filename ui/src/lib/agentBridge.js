@@ -98,12 +98,16 @@ class MockAgentBridge {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> PAUSED BY OPERATOR", { status: "idle", attention: null }));
   }
 
-  restartAgents(ids) {
-    this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> AGENT RESTARTED", { status: "working", attention: null }));
+  // Mirrors TauriAgentBridge.resumeAgents (per-pane SIGCONT). Required for interface
+  // parity: `bridge` is whichever impl isTauri() picks, so a method present on only one
+  // of them is a TypeError in the hosted web preview the moment RESUME is pressed.
+  // Replaces the old resumeAll() — see the rationale in tauriAgentBridge.js.
+  resumeAgents(ids) {
+    this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> RESUMED BY OPERATOR", { status: "working", attention: null }));
   }
 
-  resumeAll() {
-    this._patch((a) => a.status === "idle", (a) => ({ ...a, status: "working" }));
+  restartAgents(ids) {
+    this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> AGENT RESTARTED", { status: "working", attention: null }));
   }
 
   stopAll() {

@@ -347,6 +347,37 @@ export class TauriAgentBridge {
 
   pauseAgents(ids) { return Promise.all(ids.map((id) => invoke("pause_pane", { id }))); }
 
+  // Per-pane SIGCONT — the counterpart to pauseAgents, and the ONLY way out of a
+  // SIGSTOP'd pane.
+  //
+  // STATELESS BY DESIGN. Nothing records that a pane is paused: `pause_pane`/
+  // `resume_pane` are bare fire-and-forget signals, and no `paused` field exists on
+  // QueueRow or anywhere in core/mcp (verified). So the UI *cannot* ask whether a pane
+  // is stopped — and it does not need to. SIGCONT on an already-RUNNING child is
+  // harmless (verified on darwin: the child keeps running; a child that installs a
+  // SIGCONT handler merely runs it — e.g. a TUI repaint — and survives). RESUME is
+  // therefore offered unconditionally and is always safe to press.
+  //
+  // This is precisely what keeps a pane paused BEFORE a page reload resumable: there is
+  // no client-side paused-set to lose on remount, so no state can drift out of sync
+  // with the real process.
+  //
+  // allSettled, not all: a selection that mixes live and exited panes is ordinary
+  // (dead panes linger in the list as status "error"), and signal_pane Errs on an
+  // exited child. One such expected failure must not surface as an unhandled rejection
+  // — the live panes still resume regardless.
+  resumeAgents(ids) {
+    return Promise.allSettled(ids.map((id) => invoke("resume_pane", { id }))).then((rs) => {
+      const failed = rs.filter((r) => r.status === "rejected");
+      if (failed.length) {
+        console.warn(
+          `[TauriAgentBridge] resume: ${failed.length}/${ids.length} pane(s) could not be signaled`,
+          failed.map((r) => String(r.reason && r.reason.message ? r.reason.message : r.reason)),
+        );
+      }
+    });
+  }
+
   // close_workspace then spawn_workspace with the SAME id. Capture harness/repo/role
   // BEFORE close — `_forget` and the agent-list rebuild wipe them. There is no
   // backend `restart_workspace` command (verified: only spawn_workspace / close_workspace
@@ -432,7 +463,11 @@ export class TauriAgentBridge {
     this._poll();
   }
 
-  resumeAll() { return Promise.all(this.agents.map((a) => invoke("resume_pane", { id: a.id }))); }
+  // resumeAll() removed: superseded by resumeAgents(ids) — resumeAll was exactly
+  // resumeAgents(every id) — and it had no call site anywhere in the repo. Its only
+  // plausible consumer was the fleet-wide Play button the operator deliberately
+  // deleted; keeping it would leave that rejected global-resume model lying around as
+  // a trap. Resume is per-pane now.
   stopAll() { return this.closeWorkspace(); }
 
   async closeWorkspace() {

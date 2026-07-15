@@ -19,8 +19,8 @@ UI needs to change.
 | `sendInput(id, text)` | Write `text + "\n"` to the agent's PTY stdin |
 | `delegate(id, task)` | Send a task prompt to the agent's PTY |
 | `broadcast(text)` / `broadcastTo(ids, text)` | Write to many PTYs |
-| `pauseAgents(ids)` / `restartAgents(ids)` | SIGSTOP / respawn PTY child |
-| `resumeAll()` / `stopAll()` / `advanceStarting()` | Fleet-wide process control |
+| `pauseAgents(ids)` / `resumeAgents(ids)` / `restartAgents(ids)` | SIGSTOP / SIGCONT / respawn PTY child (per pane) |
+| `stopAll()` / `advanceStarting()` | Fleet-wide process control |
 | `closeWorkspace()` | Kill all PTY children, `git worktree remove` each, emit empty fleet (UI returns to launch pad) |
 | `spawnAgents(configs, name)` | `git worktree add <path> -b <branch>` then spawn `AGENT_KINDS[kind].cmd` (see `src/lib/agentTypes.js`) in a PTY cwd'd to the worktree |
 
@@ -72,13 +72,20 @@ these Tauri commands from `app/src-tauri/src/lib.rs`:
 | `sendInput` / `delegate` | `send_input(id, data)` |
 | `broadcast` / `broadcastTo` | `send_input` per pane |
 | `restartAgents` / `closeWorkspace` | `close_workspace(id)` per pane |
+| `pauseAgents` / `resumeAgents` | `pause_pane(id)` / `resume_pane(id)` per pane — real SIGSTOP / SIGCONT |
 
 To embed this UI in the agent-teams app: build it (`vite build`) and point
 `tauri.conf.json` `frontendDist` at the output (replacing `app/src/`). Verify
 the `QueueRow` field names in `_poll()` (harness/role/branch/worktree/
 waiting_on_you/reason/since) against `core/daemon` — adjust the projection
-there if they differ. `pauseAgents`/`resumeAll` are no-ops until the backend
-exposes SIGSTOP/SIGCONT commands.
+there if they differ.
+
+`pauseAgents`/`resumeAgents` are NOT no-ops: the backend exposes `pause_pane`/
+`resume_pane`, which are real `SIGSTOP`/`SIGCONT` sent to the pane's PTY child.
+Note that nothing records that a pane is paused — there is no `paused` field on
+`QueueRow` or anywhere in `core/mcp` — so the UI cannot query pause state and
+must not pretend to. RESUME is therefore always offered rather than toggled;
+re-sending either signal is harmless.
 
 ## Simulation to strip
 
