@@ -39,7 +39,7 @@ fn main() {
                 .join("../../app/src-tauri/binaries/agent-teams-mcp-aarch64-apple-darwin")
         });
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).expect("spawn");
-    sup.resize(40, 120);
+    sup.resize(40, 120).expect("resize");
     if matches!(harness, Harness::Bash) {
         let _ = sup.write(b"echo PROBE_OK; ls\n");
     }

@@ -2336,17 +2336,21 @@ fn set_pane_roles(state: tauri::State<AppState>, roles: Vec<(String, String)>) -
 #[tauri::command]
 fn resize_pty(state: tauri::State<AppState>, id: String, rows: u16, cols: u16) -> Result<(), String> {
     // F1 (Q4 Stage-4): resize-over-wire for a Daemon-owned pane is DEFERRED (there is NO
-    // `ResizePty` wire op; a daemon pane renders via `Attach` streaming, also deferred). No-op
-    // OK so the frontend's per-render resize never errors on a daemon pane.
+    // `ResizePty` wire op; a daemon pane renders via `Attach` streaming, also deferred).
+    // Honest Err — not a silent Ok false-ACK. Callers: legacy `app/src/main.js` swallows via
+    // `.catch(() => {})`; live `ui/.../tauriAgentBridge.js` `resizePane` returns the promise
+    // (p1 treats reject as not-acked and retries). Silent Ok was worse for both.
     if pane_owner_is_daemon(&state, &id) {
-        return Ok(());
+        return Err(
+            "resize_pty: daemon-owned pane has no ResizePty wire op yet (resize deferred)".into(),
+        );
     }
     // resize takes &self → an immutable snapshot borrow suffices; absent id → error.
+    // Propagate master.resize failures so the frontend promise rejects (no false ACK).
     state
         .sups
         .with_snapshot(&id, |sup| sup.resize(rows, cols))
-        .ok_or("no such workspace")?;
-    Ok(())
+        .ok_or_else(|| "no such workspace".to_string())?
 }
 
 /// One poll's worth of new pane output (perf-2026-06-10 seam 1). `base` is the
