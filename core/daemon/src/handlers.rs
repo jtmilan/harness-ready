@@ -286,10 +286,12 @@ pub fn handle_read_output(sups: &DaemonSups, id: &str) -> SocketResponse {
 }
 
 /// Handle a resize-pty request (rows/cols → SIGWINCH). `resize` takes `&self`, so an
-/// immutable snapshot borrow suffices.
+/// immutable snapshot borrow suffices. Propagates `Supervisor::resize` failures as
+/// `BAD_REQUEST` (honest path — no false ACK when the kernel rejects the winsize).
 pub fn handle_resize_pty(sups: &DaemonSups, id: &str, rows: u16, cols: u16) -> SocketResponse {
     match sups.with_snapshot(id, |sup| sup.resize(rows, cols)) {
-        Some(()) => SocketResponse::ok("resized"),
+        Some(Ok(())) => SocketResponse::ok("resized"),
+        Some(Err(e)) => SocketResponse::err(response_code::BAD_REQUEST, e),
         None => SocketResponse::err(response_code::UNKNOWN_WORKSPACE, "no such workspace"),
     }
 }

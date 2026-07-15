@@ -17,6 +17,7 @@ export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle
       </button>
       <button
         onClick={onBroadcast}
+        title="Broadcast (⌘⇧I)"
         className="flex items-center gap-2 px-5 py-2.5 border border-cyan-800 text-cyan-500 font-heading tracking-[0.2em] text-sm font-bold hover:border-cyan-400 hover:text-cyan-300 transition-colors"
       >
         <Megaphone className="w-4 h-4" /> BROADCAST

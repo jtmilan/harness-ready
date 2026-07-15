@@ -146,6 +146,12 @@ class MockAgentBridge {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> AGENT RESTARTED", { status: "working", attention: null }));
   }
 
+  // Real backend: kill each PTY child + `git worktree remove`, then drop the panes.
+  closeAgents(ids) {
+    this.agents = this.agents.filter((a) => !ids.includes(a.id));
+    this._emit();
+  }
+
   stopAll() {
     this._patch(() => true, (a) => this._append(a, ">> STOPPED BY OPERATOR", { status: "idle", attention: null }));
   }
@@ -166,9 +172,10 @@ class MockAgentBridge {
   }
 
   // --- lifecycle (git worktree add + PTY spawn in the real backend) ---
-  //
-  // K1: returns Promise<string[]> of minted ids whose spawn "resolved", in config
-  // order. Failed/refused configs are excluded from the returned list.
+//
+  // Returns `{ wsId, paneIds }` so Home can create a UI workspace tab + assign panes.
+  // K1: paneIds = minted ids whose spawn "resolved", in config order. Failed/refused
+  // configs are excluded.
   //
   // opts.assignTo: same semantics as TauriAgentBridge — assignMany mappable ids
   // before any agents.push so a non-default active workspace never briefly shows
@@ -179,6 +186,8 @@ class MockAgentBridge {
   // unassign-on-failure branch is still written for parity with the Tauri bridge.
   async spawnAgents(configs, templateName, { assignTo } = {}) {
     const base = this.agents.length;
+    // Mint a backend-shaped workspace id so mock + real share the same call contract.
+    const wsId = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
     const plan = configs.map((cfg, i) => {
       const num = String(base + i + 1).padStart(3, "0");
       return { id: `AGENT-${num}`, num, cfg, mapped: isMappedKind(cfg.kind) };
@@ -224,7 +233,7 @@ class MockAgentBridge {
     }
     this._emit();
     setTimeout(() => this._patch((a) => minted.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);
-    return minted;
+    return { wsId, paneIds: minted };
   }
 }
 

@@ -114,6 +114,11 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   const pushResizeRef = useRef(null);
   // Per-pane renderer state for the WebGL policy (term set at mount; webgl managed by visibility).
   const glRef = useRef({ term: null, webgl: null, webglBlocked: false });
+  // First VALID fit landed (cols≥20/rows≥5 against a real box). Gates backlog replay:
+  // writing full-width TUI bytes into the 80×24 default (or a transient tiny fit while
+  // useTiling's size is still null) hard-wraps the whole history into a 1-word-per-line
+  // column that no later resize/reflow can undo — TUI repaints are absolute-positioned.
+  const [sized, setSized] = useState(false);
 
   // Latest-prop refs for callbacks bound once inside the mount-once xterm effect (deps =
   // [agent.id] only — the terminal must never be re-created; resize fix 870dacf depends on
@@ -217,8 +222,24 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     let fit = null;
     try { fit = new FitAddon(); term.loadAddon(fit); } catch { fit = null; }
     term.open(mountRef.current);
-    try { fit && fit.fit(); } catch { /* mount not laid out yet */ }
+    // NO mount-time fit: the tiling host measures via ResizeObserver, so on first mount
+    // (and workspace switch) this box is 0×0/tiny — an unguarded fit here commits FitAddon's
+    // ~2-col floor into xterm. syncNow below owns fitting, with full dimension guards.
     termRef.current = term;
+    // Release ⌘G / ⌘⇧I to the window listener (Home.jsx / p3) — xterm would otherwise
+    // swallow them while the pane textarea is focused. return false = do not handle.
+    term.attachCustomKeyEventHandler((e) => {
+      if (
+        e.type === "keydown" &&
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        ((!e.shiftKey && (e.key === "g" || e.key === "G")) ||
+          (e.shiftKey && (e.key === "i" || e.key === "I")))
+      ) {
+        return false;
+      }
+      return true;
+    });
     fitRef.current = fit;
     glRef.current.term = term;
 
@@ -239,18 +260,36 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // resize_pty races the multi-second spawn_workspace (the optimistic pane mounts
     // before the PTY registers → "no such workspace"), and the old code cached the
     // dims on a swallowed failure — leaving the PTY at its 30×100 spawn size FOREVER
-    // (the change-guard blocked every later sync). On failure we now keep the guard
-    // stale and retry on a timer until the PTY acks, so a pane that finishes spawning
-    // gets its winsize without needing another geometry change.
+    // (the change-guard blocked every later sync). On failure we leave the guard
+    // stale and retry with capped exponential backoff until the PTY acks (or unmount).
     let lastRows = 0;   // last dims acked by resize_pty (0 = never synced)
     let lastCols = 0;
     let syncing = false;  // resize_pty in flight
     let pending = false;  // geometry changed while an invoke was in flight
-    let retries = 0;      // autonomous retry budget (reset by fresh geometry events)
+    let backoffMs = 500;  // retry delay after a rejected resize; capped below
     let debTimer = 0;
     let retryTimer = 0;
     let disposed = false;
-    const MAX_RETRIES = 40; // × 500ms ≈ 20s — covers a slow worktree-backed spawn
+    let sizedLatched = false; // setSized(true) fired once for this mount
+    const MAX_BACKOFF_MS = 5000;
+
+    const termHasContent = () => {
+      // Bytes already replayed into this terminal = content, full stop. The buffer scan
+      // below misses TUI alt-screen replays whose first rows are blank (clear-screen
+      // opens the frame), which skipped the first-ack jiggle and left a 30×100-painted
+      // TUI un-repainted at the true size.
+      if (writtenRef.current > 0) return true;
+      try {
+        const buf = term.buffer && term.buffer.active;
+        if (!buf) return false;
+        const n = Math.min(buf.length, 8);
+        for (let i = 0; i < n; i++) {
+          const line = buf.getLine(i);
+          if (line && line.translateToString(true).trim()) return true;
+        }
+      } catch { /* buffer not ready */ }
+      return false;
+    };
 
     const syncNow = () => {
       if (disposed || !term.element) return; // never fit() before term.open()
@@ -259,32 +298,59 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       // FitAddon can propose its 2×1 minimum and SIGWINCH the TUI into garbage.
       const box = mountRef.current && mountRef.current.getBoundingClientRect();
       if (!box || box.width < 2 || box.height < 2) return;
+      // Degenerate winsize (FitAddon floor is ~2 cols): skip fit + PTY sync.
+      // A transient small box used to push 2-col through resize_pty → 1-col garble.
+      // Prefer proposeDimensions so we never commit a bad fit into xterm either.
+      if (fit && typeof fit.proposeDimensions === "function") {
+        let proposed;
+        try { proposed = fit.proposeDimensions(); } catch { return; }
+        if (!proposed || !proposed.cols || !proposed.rows) return;
+        if (proposed.cols < 20 || proposed.rows < 5) return;
+      }
       try { fit && fit.fit(); } catch { return; }
       const rows = term.rows;
       const cols = term.cols;
       if (!rows || !cols) return;
-      // PTY dim floor (spawn-window squeeze): the >2px box guard only blocks near-zero
-      // rects. During sequential multi-pane spawn, 9+ optimistic panes can share one
-      // grid → fit() yields single-digit cols. Claude paints early transcript at that
-      // width (scrollback never heals); opencode TUIs can go blank forever after a
-      // near-zero SIGWINCH. Keep the local xterm fit; do NOT ship those dims to the
-      // child. When the rect normalizes, the [styleW, styleH, visible] re-fit effect
-      // (and ResizeObserver) re-run syncNow at a sane size. ACK/retry machinery below
-      // is unchanged (870dacf).
+// PTY dim floor (spawn-window squeeze + degenerate FitAddon floors): keep local
+      // xterm fit but do NOT ship single-digit dims to the child. ACK/retry below
+      // is unchanged (870dacf). Floor is rows < 6 (parity) / cols < 20 (both).
       if (cols < 20 || rows < 6) return;
+      // First valid geometry: release backlog replay BEFORE the change-guard —
+      // on a remount the PTY may already match, but the replay still waits.
+      if (!sizedLatched) { sizedLatched = true; setSized(true); }
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
-      // Same latest-ref pattern as onData: onResize is bound once in this mount effect.
+      const firstAttempt = lastRows === 0 && lastCols === 0;
+      // Latest-ref: onResize is bound once in this mount effect.
       Promise.resolve(onResizeRef.current && onResizeRef.current(agent.id, rows, cols))
-        .then(() => { lastRows = rows; lastCols = cols; })
+        .then(async () => {
+          // Only latch on success (honest resize_pty errors reject).
+          const wasFirstAck = firstAttempt;
+          lastRows = rows;
+          lastCols = cols;
+          backoffMs = 500; // reset backoff after a real ack
+          // Late convergence after boot race: TUI may already have painted at the
+          // spawn 30×100. Jiggle winsize so SIGWINCH forces a full repaint.
+          if (wasFirstAck && termHasContent() && onResizeRef.current) {
+            const jiggleRows = Math.max(5, rows - 1);
+            try {
+              await Promise.resolve(onResizeRef.current(agent.id, jiggleRows, cols));
+              await Promise.resolve(onResizeRef.current(agent.id, rows, cols));
+            } catch {
+              // Main ack already landed; jiggle is best-effort repaint.
+            }
+          }
+        })
         .catch(() => {
           // Backend can't resize yet (pane still spawning / transient) — leave the
-          // acked dims stale so the guard stays open, and retry until it lands.
-          if (!disposed && retries < MAX_RETRIES) {
-            retries += 1;
+          // acked dims stale so the guard stays open. Retry with capped exponential
+          // backoff until success or unmount (no hard MAX_RETRIES give-up).
+          if (!disposed) {
             clearTimeout(retryTimer);
-            retryTimer = setTimeout(syncNow, 500);
+            const delay = backoffMs;
+            backoffMs = Math.min(MAX_BACKOFF_MS, Math.floor(backoffMs * 1.5));
+            retryTimer = setTimeout(syncNow, delay);
           }
         })
         .finally(() => {
@@ -296,7 +362,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // per frame; one fit + at most one resize_pty lands after the burst settles.
     const pushResize = () => {
       if (disposed) return;
-      retries = 0; // a fresh geometry event re-arms the retry budget
+      backoffMs = 500; // fresh geometry re-arms a snappy retry cadence
       clearTimeout(debTimer);
       debTimer = setTimeout(syncNow, 80);
     };
@@ -348,6 +414,10 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
+    // Hold ALL writes until the first valid fit (see `sized`). Replaying the accumulated
+    // PTY history into a not-yet-sized terminal wraps it permanently; once sized flips,
+    // this effect re-runs and writes the full backlog into a correctly-sized grid.
+    if (!sized) return;
     // Web-preview fallback: the mock bridge has no raw byte stream, so render its line
     // array as terminal text instead.
     const raw = agent.raw !== undefined ? agent.raw : (agent.output || []).join("\r\n");
@@ -365,7 +435,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       term.write(raw);
       writtenRef.current = raw.length;
     }
-  }, [agent.raw, agent.gen, agent.output]);
+  }, [agent.raw, agent.gen, agent.output, sized]);
 
   const border = selected
     ? "border-cyan-300 shadow-[0_0_16px_rgba(0,229,255,0.45)]"

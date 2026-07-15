@@ -23,6 +23,38 @@ import { assignMany, unassign } from "@/lib/workspaceAssign";
 // behind a streaming TUI. Guarded against overlap in _poll (120ms can undercut a slow invoke).
 const POLL_MS = 120;
 
+/**
+ * After a byte-window slice, advance to a safe replay start so term.reset()+write never
+ * begins mid-CSI/SGR (which leaves the emulator with broken DECAWM/SGR → 1-col wrap).
+ * 1) Drop through the first newline (discard the likely-truncated first line).
+ * 2) If still opening on ESC, skip past a complete CSI/simple ESC or drop a lone incomplete ESC.
+ */
+export function trimAtSafeBoundary(s) {
+  if (!s) return s;
+  const nl = s.indexOf("\n");
+  if (nl !== -1) s = s.slice(nl + 1);
+  // Partial ESC at the head (slice landed inside an escape, or no newline was present).
+  if (s.charCodeAt(0) === 0x1b /* ESC */) {
+    let i = 1;
+    if (i < s.length && s[i] === "[") {
+      // CSI: ESC [ intermediate/params… final byte in 0x40–0x7E
+      i += 1;
+      while (i < s.length) {
+        const c = s.charCodeAt(i);
+        i += 1;
+        if (c >= 0x40 && c <= 0x7e) break;
+      }
+      // Incomplete CSI (no final byte in the window): drop the orphan prefix entirely.
+      s = s.slice(i);
+    } else if (i < s.length) {
+      s = s.slice(2); // ESC + single-char sequence
+    } else {
+      s = ""; // lone ESC with nothing after
+    }
+  }
+  return s;
+}
+
 // UI kind (agentTypes.js key) → backend harness wire string. Wire strings are the
 // `descriptor().wire` values in agent-teams core/harness/src/lib.rs, parsed by
 // `parse_harness` (app/src-tauri/src/lib.rs) — NOT the CLI command name (cursor's
@@ -187,27 +219,18 @@ export class TauriAgentBridge {
       // was replayed from a later base, so the accumulated scrollback is stale. Reset
       // this pane's buffer and bump its generation so the terminal does a full RIS.
       if (d.truncated) {
-        // Cap a huge replay too (backend retains 4MB) — the gen bump below already
-        // resets the terminal, so starting mid-stream costs at most one cosmetic
-        // fragment at the very top of scrollback.
-        this.raw[d.id] = d.data.slice(-160000);
+        // Genuine backend ring-buffer eviction: replay from a later base, so the
+        // accumulated scrollback is stale. Cap the window, land on a safe boundary,
+        // and bump gen so the terminal does a full RIS + rewrite.
+        this.raw[d.id] = trimAtSafeBoundary(d.data.slice(-160000));
         this.gen[d.id] = (this.gen[d.id] || 0) + 1;
       } else {
-        // The pane writes raw.slice(writtenRef) — an ABSOLUTE cursor into this
-        // string. The old silent `.slice(-200000)` front-trim shifted the string
-        // under that cursor: the first crossing dropped delta bytes mid-escape
-        // (literal "245;48;5;233m" fragments on grok panes), and once pinned at
-        // exactly the cap, raw.length === writtenRef → the pane FROZE (no new
-        // bytes ever written; backend truncation at 4MB never fires because our
-        // `since` cursor keeps advancing). Trim in big hysteresis steps WITH a
-        // gen bump instead, so the pane does reset + full rewrite of the window.
-        const grown = (this.raw[d.id] || "") + d.data;
-        if (grown.length > 240000) {
-          this.raw[d.id] = grown.slice(-120000);
-          this.gen[d.id] = (this.gen[d.id] || 0) + 1;
-        } else {
-          this.raw[d.id] = grown;
-        }
+        // Append-only. Do NOT front-trim + gen-bump here: term.reset() is RIS and
+        // wipes alt-screen / DECAWM / DECSTBM the TUI set up (ESC[?1049h, ESC[?7l,
+        // …), so replaying a full-width UI into a mode-reset terminal garbles into
+        // a single column. Memory is bounded by the backend RETAIN_CAP (4MB) and
+        // xterm scrollback:4000 — genuine eviction arrives as d.truncated above.
+        this.raw[d.id] = (this.raw[d.id] || "") + d.data;
       }
       if (typeof d.next === "number") this.offsets[d.id] = d.next;
     }
@@ -247,8 +270,8 @@ export class TauriAgentBridge {
     this._emit();
   }
 
-  // Returns minted pane ids whose spawn_workspace RESOLVED, in config order.
-  // Failed / refused spawns are excluded (they surface via red raw line + console.error).
+  // Returns `{ wsId, paneIds }` — paneIds are minteds whose spawn_workspace RESOLVED,
+  // in config order. Failed / refused spawns are excluded (red raw + console.error).
   //
   // opts.assignTo (optional ws id): pin every mappable id into that workspace BEFORE the
   // first optimistic registration / poll tick can render them. Sequential spawn_workspace
@@ -311,7 +334,7 @@ export class TauriAgentBridge {
     }
     this._saveSpawned();
     this._poll();
-    return minted;
+    return { wsId: ws, paneIds: minted };
   }
 
   _forget(id) {
@@ -504,6 +527,22 @@ export class TauriAgentBridge {
   // plausible consumer was the fleet-wide Play button the operator deliberately
   // deleted; keeping it would leave that rejected global-resume model lying around as
   // a trap. Resume is per-pane now.
+
+  // Kill the given panes for good (PTY + worktree via close_workspace) — no respawn.
+  // Distinct from restartAgents (close + re-spawn same id). Used by workspace delete.
+  async closeAgents(ids) {
+    for (const id of ids) {
+      try {
+        await invoke("close_workspace", { id });
+      } catch (e) {
+        console.error("[TauriAgentBridge] close_workspace failed:", id, e);
+      }
+      this._forget(id);
+    }
+    this.agents = this.agents.filter((a) => !ids.includes(a.id));
+    this._emit();
+  }
+
   stopAll() { return this.closeWorkspace(); }
 
   async closeWorkspace() {

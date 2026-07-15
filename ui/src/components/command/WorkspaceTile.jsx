@@ -1,8 +1,10 @@
 import React, { useState } from "react";
-import { Pencil } from "lucide-react";
+import { Pencil, Trash2 } from "lucide-react";
 
-// Selectable + renameable workspace. `chip` renders the compact landing-page style.
-export default function WorkspaceTile({ ws, active, chip, onSelect, onRename }) {
+// Selectable + renameable + deletable workspace. `chip` renders the compact
+// landing-page style. Delete button only renders when `onDelete` is provided —
+// callers omit it for the last remaining workspace.
+export default function WorkspaceTile({ ws, active, chip, onSelect, onRename, onDelete }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(ws.name);
 
@@ -38,20 +40,31 @@ export default function WorkspaceTile({ ws, active, chip, onSelect, onRename }) 
     );
   }
 
+  const iconCls = active && !chip ? "text-[#0A1219]" : "text-cyan-600 hover:text-cyan-300";
+
   return (
     <div className="relative group">
-      <button onClick={() => onSelect(ws.id)} className={`${base} ${active ? activeCls : idleCls} pr-7 truncate`}>
+      <button onClick={() => onSelect(ws.id)} className={`${base} ${active ? activeCls : idleCls} ${onDelete ? "pr-12" : "pr-7"} truncate`}>
         {ws.name}
       </button>
-      <button
-        onClick={() => { setName(ws.name); setEditing(true); }}
-        title="Rename workspace"
-        className={`absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity ${
-          active && !chip ? "text-[#0A1219]" : "text-cyan-600 hover:text-cyan-300"
-        }`}
-      >
-        <Pencil className="w-3 h-3" />
-      </button>
+      <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button
+          onClick={() => { setName(ws.name); setEditing(true); }}
+          title="Rename workspace"
+          className={iconCls}
+        >
+          <Pencil className="w-3 h-3" />
+        </button>
+        {onDelete && (
+          <button
+            onClick={() => onDelete(ws.id)}
+            title="Delete workspace"
+            className={active && !chip ? "text-[#0A1219] hover:text-red-700" : "text-cyan-600 hover:text-red-400"}
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        )}
+      </div>
     </div>
   );
 }
