@@ -1,5 +1,5 @@
 import React from "react";
-import { Megaphone, Network, Radio, Pause, Square, FastForward, LayoutTemplate, Plus, Power } from "lucide-react";
+import { Megaphone, Network, Radio, Pause, Square, LayoutTemplate, Plus, Power } from "lucide-react";
 
 const PlayBtn = ({ icon: Icon, onClick, active, title }) => (
   <button
@@ -18,7 +18,7 @@ const PlayBtn = ({ icon: Icon, onClick, active, title }) => (
 // `broadcastActive` / `onBroadcastToggle` drive the ⌘⇧I broadcast TOGGLE (every keystroke
 // mirrors live into all panes) — state lives with the caller, not here. Distinct from
 // `onBroadcast`, which opens the one-shot "send this text once" prompt.
-export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace, onPause, onStop, onSkip }) {
+export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace, onPause, onStop }) {
   return (
     <div className="flex items-center gap-6 px-5 py-4 border-b border-cyan-900/60 bg-[#0A0E13]">
       <button
@@ -65,7 +65,6 @@ export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle
         <div className="flex gap-2">
           <PlayBtn icon={Pause} onClick={onPause} title="Pause all" />
           <PlayBtn icon={Square} onClick={onStop} title="Stop all" />
-          <PlayBtn icon={FastForward} onClick={onSkip} title="Advance starting agents" />
         </div>
       </div>
       <div className="ml-auto flex items-center gap-5">

@@ -49,8 +49,6 @@ export default function Home() {
     return unsubscribe;
   }, []);
 
-  useEffect(() => { bridge.setRunning(running); }, [running]);
-
   useEffect(() => { saveWorkspaces(workspaces); }, [workspaces]);
 
   const handleAddWorkspace = () => {
@@ -88,7 +86,6 @@ export default function Home() {
   const handleResize = (agentId, rows, cols) => bridge.resizePane(agentId, rows, cols);
   const handlePause = () => setRunning(false);
   const handleStop = () => { setRunning(false); bridge.stopAll(); };
-  const handleSkip = () => bridge.advanceStarting();
 
   const toggleCheck = (id) =>
     setCheckedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -347,13 +344,11 @@ export default function Home() {
         onCloseWorkspace={() => setOverlay("close-workspace")}
         onPause={handlePause}
         onStop={handleStop}
-        onSkip={handleSkip}
       />
       {agents.length === 0 ? (
         <EmptyState
           onNewAgent={() => setOverlay("new-agent")}
           onTemplates={() => setOverlay("templates")}
-          onLoadDemo={() => bridge.loadDemoFleet()}
           workspaces={workspaces}
           activeId={activeWorkspace}
           onSelectWorkspace={setActiveWorkspace}
