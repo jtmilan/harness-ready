@@ -1,10 +1,12 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { STATUS_META } from "@/lib/agentData";
 import { AGENT_KINDS } from "@/lib/agentTypes";
+import { setPaneLabel, usePaneLabel } from "@/lib/paneLabels";
 import AttentionPrompt from "@/components/command/AttentionPrompt";
+import PaneMenu from "@/components/command/PaneMenu";
 
 // ---- renderer policy: WebGL2 on VISIBLE panes only (ported from agent-teams main.js:677-760).
 // The DOM renderer rebuilds each dirty row's span-DOM per frame — N streaming TUIs ≈ 10-30k node
@@ -83,7 +85,7 @@ const TERM_THEME = {
   white: "#cbd5e1", brightWhite: "#f1f5f9",
 };
 
-export default function AgentPane({ agent, selected, checked, onToggleCheck, onSelect, onRespond, onInput, onResize, style, onDragStart, visible = true }) {
+export default function AgentPane({ agent, selected, checked, onToggleCheck, onSelect, onRespond, onInput, onResize, style, onDragStart, visible = true, zoomed = false, onMaximize, onMenuAction, workspaces = [] }) {
   const meta = STATUS_META[agent.status];
   const mountRef = useRef(null);
   const termRef = useRef(null);
@@ -95,6 +97,76 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   const pushResizeRef = useRef(null);
   // Per-pane renderer state for the WebGL policy (term set at mount; webgl managed by visibility).
   const glRef = useRef({ term: null, webgl: null, webglBlocked: false });
+
+  // ---- Rename (display label).
+  // The label READ lives here because this component renders the header label and nothing else
+  // does; routing it through a prop would need a Home.jsx edit, which belongs to another lane.
+  // `paneLabels` owns the storage and the subscription (BRIEF C2's stated exception), so this
+  // pane never sees localStorage and re-renders when ANY pane's menu commits a rename. The write
+  // sits next to the read on purpose: split across the boundary, the module's storage would drift
+  // from React state and the header would show a stale name until an unrelated re-render.
+  const labelOverride = usePaneLabel(agent.id);
+  const defaultName = agent.name || agent.id; // what the header shows with no override
+  const displayName = labelOverride || defaultName;
+  const [renaming, setRenaming] = useState(false);
+  const renameDoneRef = useRef(false); // one commit per edit — ignores a trailing blur
+  const renameInputRef = useRef(null);
+  const renameOpenRef = useRef(0);
+
+  const beginRename = () => {
+    renameDoneRef.current = false;
+    // Next task, NOT now. Coming from the kebab, Radix is still tearing the menu down and moving
+    // focus when onSelect fires; an editor mounted inside that teardown is immediately blurred BY
+    // the teardown, and blur commits — so it would close the instant it opened. Yielding once
+    // lets the menu finish, and then nothing else is competing for focus.
+    //
+    // A timer, not requestAnimationFrame: rAF is tied to painting and is throttled/parked while
+    // the window is occluded or backgrounded, which would silently strand the editor closed. The
+    // ordering this needs is a task boundary, and paint has nothing to do with it.
+    clearTimeout(renameOpenRef.current);
+    renameOpenRef.current = setTimeout(() => setRenaming(true), 0);
+  };
+  useEffect(() => () => clearTimeout(renameOpenRef.current), []);
+
+  const finishRename = (value, commit) => {
+    if (renameDoneRef.current) return;
+    renameDoneRef.current = true;
+    setRenaming(false);
+    if (!commit) return;
+    const typed = (value || "").trim();
+    // Committing the name the pane already shows CLEARS the override instead of storing a copy of
+    // it. paneLabels applies prod's "same as the id ⇒ clear" rule (main.js:225), but this fork's
+    // default is `agent.name || agent.id`, and only this component knows that. Without this, a
+    // rename dialog opened and confirmed unchanged would pin today's `agent.name` forever — and
+    // silently win over the real one if the backend ever renamed the agent.
+    const label = typed === defaultName ? "" : typed;
+    setPaneLabel(agent.id, label);
+    // Still announced, so the container can react (toast/telemetry) even though the store above
+    // is already authoritative for what the header paints.
+    onMenuAction && onMenuAction("rename", agent.id, { label });
+  };
+
+  // Focus the editor explicitly rather than via `autoFocus`: the rename is normally triggered
+  // FROM the kebab menu, and the menu's closing focus-restore lands after mount. PaneMenu
+  // suppresses that restore for this one item; taking the focus here as well means the editor
+  // still lands focused when it is opened by double-click, with no menu involved at all.
+  useEffect(() => {
+    if (!renaming) return;
+    const el = renameInputRef.current;
+    if (!el) return;
+    el.focus();
+    el.select(); // whole-label select: renaming usually replaces rather than appends
+  }, [renaming]);
+
+  const handleMenuAction = (action, payload) => {
+    if (action === "rename") {
+      // The only item handled locally: it opens the inline editor. The contract's
+      // `{ label }` payload only exists once the edit COMMITS, via finishRename.
+      beginRename();
+      return;
+    }
+    onMenuAction && onMenuAction(action, agent.id, payload);
+  };
 
   // Mount a single xterm per pane (created once, kept for the pane's lifetime — the raw
   // PTY bytes are fed to it verbatim, exactly like the prod frontend's per-pane Terminal).
@@ -258,7 +330,9 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       data-pane-id={agent.id}
       style={style}
       onClick={() => onSelect(agent.id)}
-      className={`flex flex-col border cursor-pointer transition-all duration-200 bg-[#0A1219] overflow-hidden ${border}`}
+      // `zoomed` is a styling/query hook only — the actual zoom geometry arrives as
+      // the `style` rect from the tiling layer, which hands a zoomed pane the whole host box.
+      className={`flex flex-col border cursor-pointer transition-all duration-200 bg-[#0A1219] overflow-hidden ${zoomed ? "zoomed " : ""}${border}`}
     >
       <div
         onPointerDown={(e) => onDragStart && onDragStart(agent.id, e)}
@@ -274,13 +348,54 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
           >
             {checked && <span className="text-[#0A1219] text-[10px] font-bold leading-none">✓</span>}
           </button>
-          <span className="font-heading font-bold tracking-[0.15em] text-sm text-cyan-300">{agent.name || agent.id}</span>
+          {renaming ? (
+            <input
+              ref={renameInputRef}
+              defaultValue={displayName}
+              // The head drags on pointerdown and selects on click — keep both off the field.
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                // Only the keys handled here stop propagating: a blanket stop would swallow the
+                // app's global shortcuts, and whether those fire while a text field has focus is
+                // the shortcut owner's call, not this pane's.
+                if (e.key === "Enter") { e.stopPropagation(); finishRename(e.currentTarget.value, true); }
+                else if (e.key === "Escape") { e.stopPropagation(); finishRename(null, false); }
+              }}
+              onBlur={(e) => finishRename(e.currentTarget.value, true)}
+              aria-label="Pane name"
+              className="font-heading font-bold tracking-[0.15em] text-sm text-cyan-100 bg-[#0A1219] border border-cyan-500 outline-none px-1 py-0 min-w-0 w-32"
+            />
+          ) : (
+            <span
+              onDoubleClick={(e) => { e.stopPropagation(); beginRename(); }}
+              title={labelOverride ? `${displayName} (renamed from ${defaultName})` : "Double-click to rename"}
+              className="font-heading font-bold tracking-[0.15em] text-sm text-cyan-300 truncate"
+            >
+              {displayName}
+            </span>
+          )}
           <span className="font-mono text-[10px] text-cyan-600 tracking-wider truncate">{AGENT_KINDS[agent.kind]?.label} · {agent.id}</span>
           {agent.role && (
             <span className="font-mono text-[10px] text-cyan-700 tracking-wider uppercase truncate">[{agent.role}]</span>
           )}
         </div>
-        <span className={`font-mono text-sm font-bold shrink-0 ${meta.color}`}>({meta.badge})</span>
+        <div className="flex items-center gap-1 shrink-0">
+          <span className={`font-mono text-sm font-bold ${meta.color}`}>({meta.badge})</span>
+          <button
+            // stopPropagation, not preventDefault: the head's onPointerDown would otherwise read
+            // this click as the start of a pane drag.
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); onMaximize && onMaximize(agent.id); }}
+            title={zoomed ? "Restore pane" : "Maximize pane"}
+            aria-label={zoomed ? "Restore pane" : "Maximize pane"}
+            aria-pressed={zoomed}
+            className="w-4 h-5 flex items-center justify-center text-sm leading-none text-cyan-600 hover:text-cyan-300 hover:bg-cyan-300/10 transition-colors"
+          >
+            {zoomed ? "⤡" : "⤢"}
+          </button>
+          <PaneMenu hasBranch={!!agent.branch} workspaces={workspaces} onAction={handleMenuAction} />
+        </div>
       </div>
       <div className="px-3 py-1 border-b border-cyan-900/50 font-mono text-[10px] text-cyan-700 truncate">
         ⎇ {agent.branch} · {agent.worktree}
