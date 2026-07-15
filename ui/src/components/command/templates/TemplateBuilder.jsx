@@ -1,8 +1,9 @@
 import React, { useState } from "react";
 import { Plus, X, Save } from "lucide-react";
 import { AGENT_KINDS, KIND_IDS } from "@/lib/agentTypes";
+import { coerceTemplateAgents, DEFAULT_TEMPLATE_KIND } from "@/components/command/templates/templateAgents";
 
-const emptyRow = () => ({ role: "", kind: "claude-code", priority: "normal", autonomy: "semi" });
+const emptyRow = () => ({ role: "", kind: DEFAULT_TEMPLATE_KIND, priority: "normal", autonomy: "semi" });
 
 const inputCls = "bg-[#081019] border border-cyan-900 text-cyan-200 font-mono text-xs px-2 py-1.5 focus:border-cyan-400 focus:outline-none w-full";
 
@@ -54,7 +55,7 @@ export default function TemplateBuilder({ onSave, saving }) {
           <Plus className="w-3.5 h-3.5" /> ADD AGENT
         </button>
         <button
-          onClick={() => onSave({ name: name.trim(), description: description.trim(), agents: rows })}
+          onClick={() => onSave({ name: name.trim(), description: description.trim(), agents: coerceTemplateAgents(rows) })}
           disabled={!valid || saving}
           className="ml-auto flex items-center gap-1.5 px-5 py-2 bg-cyan-400/15 border border-cyan-400 text-cyan-300 font-heading font-bold tracking-[0.15em] text-xs hover:bg-cyan-400/25 disabled:opacity-40 disabled:cursor-not-allowed"
         >

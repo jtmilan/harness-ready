@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import { base44 } from "@/api/base44Client";
 import TemplateList from "@/components/command/templates/TemplateList";
 import TemplateBuilder from "@/components/command/templates/TemplateBuilder";
+import { coerceTemplateAgents } from "@/components/command/templates/templateAgents";
 
 export default function TemplatesOverlay({ onLaunch, onClose }) {
   const [templates, setTemplates] = useState([]);
@@ -54,7 +55,17 @@ export default function TemplatesOverlay({ onLaunch, onClose }) {
           </button>
         </div>
         {view === "list" ? (
-          <TemplateList templates={templates} loading={loading} onLaunch={(t) => { onLaunch(t); onClose(); }} onDelete={handleDelete} />
+          <TemplateList
+            templates={templates}
+            loading={loading}
+            onLaunch={(t) => {
+              // Home → bridge.spawnAgents(template.agents) assumes [{kind, role, ...}].
+              // Coerce so legacy/unmapped kinds never hit K4 refuse-as-bash path.
+              onLaunch({ ...t, agents: coerceTemplateAgents(t.agents) });
+              onClose();
+            }}
+            onDelete={handleDelete}
+          />
         ) : (
           <TemplateBuilder onSave={handleSave} saving={saving} />
         )}
