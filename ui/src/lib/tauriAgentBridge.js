@@ -25,8 +25,8 @@ const POLL_MS = 120;
 // UI kind (agentTypes.js key) → backend harness wire string. Wire strings are the
 // `descriptor().wire` values in agent-teams core/harness/src/lib.rs, parsed by
 // `parse_harness` (app/src-tauri/src/lib.rs) — NOT the CLI command name (cursor's
-// cmd is "cursor-agent" but its wire string is "cursor"). Unknown kinds fall
-// back to "bash".
+// cmd is "cursor-agent" but its wire string is "cursor"). Unknown kinds are
+// REFUSED (see harnessWireOf) — never silently remapped to "bash".
 const HARNESS_WIRE = {
   "claude-code": "claude",
   cursor: "cursor",
@@ -246,27 +246,42 @@ export class TauriAgentBridge {
     this._emit();
   }
 
+  // Returns minted pane ids whose spawn_workspace RESOLVED, in config order.
+  // Failed / refused spawns are excluded (they surface via red raw line + console.error).
   async spawnAgents(configs, _name) {
     // Backend groups panes into a workspace by right-splitting the id on "-p"
     // (wsNNNNNxK-pN shape) — one workspace id per spawnAgents call.
     const ws = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    /** @type {string[]} */
+    const minted = [];
     for (const [index, cfg] of configs.entries()) {
       const id = `${ws}-p${index}`;
-      // Register the id up front so its output is read from the next tick (before the
-      // pane ever enters list_queue) and an optimistic "starting" pane renders now.
       // Persist `repo` so restartAgents can recover the same folder (agent objects
       // never carry it — only kind/role reach the UI agent shape).
       const repo = cfg.repo || DEFAULT_REPO;
+      const harness = harnessWireOf(cfg.kind);
+      if (!harness) {
+        // K4: unmapped kind = REFUSED loudly. Never HARNESS_WIRE[kind] || "bash".
+        // Match restartAgents refused-harness tone: red raw + console.error, no ghost
+        // registration, excluded from returned ids.
+        const msg = "[spawn refused] unmapped kind " + String(cfg.kind) + " for " + id;
+        console.error("[TauriAgentBridge]", msg);
+        this.raw[id] = "\r\n\x1b[31m" + msg + "\x1b[0m\r\n";
+        continue;
+      }
+      // Register the id up front so its output is read from the next tick (before the
+      // pane ever enters list_queue) and an optimistic "starting" pane renders now.
       this.spawned[id] = { kind: cfg.kind, role: cfg.role, repo };
       this.offsets[id] = 0;
       try {
         await invoke("spawn_workspace", {
           id,
-          harness: HARNESS_WIRE[cfg.kind] || "bash",
+          harness,
           repo,
           role: cfg.role,
         });
         if (cfg.role) await invoke("set_pane_roles", { roles: [[id, cfg.role]] });
+        minted.push(id);
       } catch (e) {
         // A failed spawn must be visible, not a silent unhandled rejection.
         delete this.spawned[id];
@@ -276,6 +291,7 @@ export class TauriAgentBridge {
     }
     this._saveSpawned();
     this._poll();
+    return minted;
   }
 
   _forget(id) {
