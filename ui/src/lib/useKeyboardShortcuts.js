@@ -4,6 +4,13 @@
 //
 //   ⌘⇧I → onBroadcastToggle()   ⌘⇧G → onMaximizeToggle()
 //
+// Platform: macOS-only by ship target, not by accident. Bundle targets are `app`+`dmg`
+// (app/src-tauri/tauri.conf.json), sidecars are aarch64-apple-darwin only, install scripts
+// write into Contents/MacOS, and the sibling prod dispatcher is entirely metaKey-based
+// (app/src/main.js:8290-8364). No Ctrl+Shift fallback — Ctrl+Shift+I is the Windows/Linux
+// webview devtools chord, and there is no non-mac ship surface today. If bundle targets
+// ever grow past macOS, revisit this gate with a non-devtools chord, not a blind ctrlKey OR.
+//
 // Bound on `document` in the BUBBLE phase, which is load-bearing rather than incidental:
 // these shortcuts must keep working while focus is inside an xterm, and xterm listens on its
 // own textarea. Bubble phase lets the terminal see the key first and only reach us if it
@@ -39,9 +46,10 @@ export function useKeyboardShortcuts(handlers = {}) {
   React.useEffect(() => {
     /** @param {KeyboardEvent} e */
     const onKeyDown = (e) => {
-      // Require ⌘+⇧ exactly. Rejecting alt/ctrl keeps these from firing on supersets, and
-      // specifically keeps ⌘⇧G clear of prod's ⌘⌥G (auto-tile, main.js:8312) if that lands
-      // in this fork later.
+      // Require ⌘+⇧ exactly (macOS metaKey). Rejecting alt/ctrl keeps these from firing on
+      // supersets, keeps ⌘⇧G clear of prod's ⌘⌥G (auto-tile, main.js:8312) if that lands
+      // later, and deliberately refuses Ctrl+Shift — see file-header platform note.
+      // Not a missing Windows/Linux port: the app does not ship those targets today.
       if (!e.metaKey || !e.shiftKey || e.altKey || e.ctrlKey) return;
 
       // Autorepeat while the combo is held would flap a toggle on and off. Prod doesn't
