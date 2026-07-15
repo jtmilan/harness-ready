@@ -16,6 +16,7 @@
 // Requires `app.withGlobalTauri: true` in tauri.conf.json (exposes window.__TAURI__).
 
 import { randomAgentName } from "@/lib/agentNames";
+import { reconcilePaneLabels } from "@/lib/paneLabels";
 
 // Prod parity: POLL_TICK_MS = 120 in agent-teams app/src/poll-core.js:7 — 500ms reads a beat
 // behind a streaming TUI. Guarded against overlap in _poll (120ms can undercut a slow invoke).
@@ -232,6 +233,16 @@ export class TauriAgentBridge {
         gen: this.gen[id] || 0,
       };
     });
+    // Pane-label GC: drop hr:pane-labels keys for ids no longer in the live union.
+    // Site is a *successful* _pollOnce after list_queue + dead_pane_ids + spawned
+    // ghost-prune — the same set that just rebuilt `this.agents`. Not on mount, not
+    // on a failed tick (those never reach here). Recompute after _forget so a ghost
+    // pruned this tick is already absent.
+    // Empty-list path: reconcilePaneLabels no-ops when live.size === 0 (boot / full
+    // closeWorkspace / queue hiccup with empty spawned) — never wipe every custom label.
+    reconcilePaneLabels(
+      Array.from(new Set([...queue.map((r) => r.id), ...Object.keys(this.spawned)])),
+    );
     this._emit();
   }
 
@@ -423,9 +434,6 @@ export class TauriAgentBridge {
 
   resumeAll() { return Promise.all(this.agents.map((a) => invoke("resume_pane", { id: a.id }))); }
   stopAll() { return this.closeWorkspace(); }
-  advanceStarting() {}
-  setRunning(_r) {}
-  loadDemoFleet() {}
 
   async closeWorkspace() {
     for (const a of this.agents) await invoke("close_workspace", { id: a.id });

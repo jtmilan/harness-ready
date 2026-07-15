@@ -30,7 +30,6 @@ export default function Home() {
   const [activeWorkspace, setActiveWorkspace] = useState(() => loadWorkspaces()[0].id);
   const [overlay, setOverlay] = useState(null); // 'broadcast' | 'delegate' | 'bulk-broadcast' | 'templates'
   const [checkedIds, setCheckedIds] = useState([]);
-  const [running, setRunning] = useState(true);
   const [trend, setTrend] = useState([]);
   // Broadcast-toggle mode (⌘⇧I): every keystroke mirrors live into all panes, except terminal
   // reply traffic (isReplyTraffic). State lives here, not in TopBar/AgentPane.
@@ -48,8 +47,6 @@ export default function Home() {
     bridge.start();
     return unsubscribe;
   }, []);
-
-  useEffect(() => { bridge.setRunning(running); }, [running]);
 
   useEffect(() => { saveWorkspaces(workspaces); }, [workspaces]);
 
@@ -86,9 +83,6 @@ export default function Home() {
       ? bridge.broadcastRaw(data)
       : bridge.sendRaw(agentId, data);
   const handleResize = (agentId, rows, cols) => bridge.resizePane(agentId, rows, cols);
-  const handlePause = () => setRunning(false);
-  const handleStop = () => { setRunning(false); bridge.stopAll(); };
-  const handleSkip = () => bridge.advanceStarting();
 
   const toggleCheck = (id) =>
     setCheckedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -337,7 +331,6 @@ export default function Home() {
       <TitleBar />
       <TopBar
         activeCount={activeCount}
-        running={running}
         broadcastActive={broadcast}
         onBroadcastToggle={() => setBroadcast((b) => !b)}
         onNewAgent={() => setOverlay("new-agent")}
@@ -345,15 +338,11 @@ export default function Home() {
         onDelegate={() => setOverlay("delegate")}
         onTemplates={() => setOverlay("templates")}
         onCloseWorkspace={() => setOverlay("close-workspace")}
-        onPause={handlePause}
-        onStop={handleStop}
-        onSkip={handleSkip}
       />
       {agents.length === 0 ? (
         <EmptyState
           onNewAgent={() => setOverlay("new-agent")}
           onTemplates={() => setOverlay("templates")}
-          onLoadDemo={() => bridge.loadDemoFleet()}
           workspaces={workspaces}
           activeId={activeWorkspace}
           onSelectWorkspace={setActiveWorkspace}
@@ -430,7 +419,9 @@ export default function Home() {
         <AgentDirectory agents={agents} selectedId={selectedId} onSelect={handleSelect} />
         <PerformanceWidget trend={trend} agents={agents} />
         <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} />
-        <SessionInfo sessionId={SESSION_ID} startTime={SESSION_START} running={running} />
+        {/* running is always true: fleet Pause was local-only and is gone; SessionInfo still
+            expects the prop (that file is out of this lane). */}
+        <SessionInfo sessionId={SESSION_ID} startTime={SESSION_START} running />
       </div>
       </>
       )}
