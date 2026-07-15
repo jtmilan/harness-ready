@@ -13720,14 +13720,25 @@ pub fn run() {
                 }
             })?;
 
-            // ── T3: ⌘⇧G via APP MENU accelerator (NOT global_shortcut) ──
-            // ⌘⇧G is in macOS's Find-key-equivalent family; WKWebView swallows the
-            // keydown before the page sees it (Chrome preview works — same JS chain).
-            // An app-menu item with CmdOrCtrl+Shift+G claims the chord in-process so
-            // the native layer delivers a menu event instead. Deliberately NOT
-            // `global_shortcut`: a system-wide claim would shadow Finder's
-            // "Go to Folder". ⌘⇧J above is the global-registration precedent for the
+            // ── T3: ⌘G via APP MENU accelerator (NOT global_shortcut) ──
+            // Wave-7 shipped Pane ▸ Toggle Pane Zoom with CmdOrCtrl+Shift+G. Operator
+            // confirmed MENU CLICK maximizes (emit → Home listener → toggleZoom sound).
+            // The ⌘⇧G *chord* stayed dead in-app: macOS routes key equivalents into
+            // WKWebView first, and WKWebView natively consumes ⌘⇧G (Find-Previous family)
+            // — the keydown never reaches the page NOR falls through to the app menu.
+            // Unwinnable without NSEvent monitors (out of scope).
+            //
+            // ⌘G (no Shift) IS delivered to page JS in this webview class — proven daily
+            // by prod Agent Teams (main.js:8314, ⌘G = toggleGrid, works with terminals
+            // focused). Accelerator is therefore CmdOrCtrl+G. Do NOT "restore" ⌘⇧G.
+            //
+            // Deliberately NOT `global_shortcut`: a system-wide claim would fight browser
+            // Find / other apps. ⌘⇧J above is the global-registration precedent for the
             // emit idiom only — not for registration of this chord.
+            //
+            // Double-path with the JS keydown arm (useKeyboardShortcuts): WKWebView
+            // forwards ⌘G to the page first; JS preventDefault stops menu re-dispatch →
+            // exactly one toggle per press. Menu click still works when focus is elsewhere.
             //
             // Menu shape: Menu::default + a top-level "Pane" submenu (macOS menu bar
             // only accepts Submenus at the top level; a bare MenuItem cannot append).
@@ -13739,7 +13750,7 @@ pub fn run() {
                     "maximize-pane",
                     "Toggle Pane Zoom",
                     true,
-                    Some("CmdOrCtrl+Shift+G"),
+                    Some("CmdOrCtrl+G"),
                 )?;
                 let pane_menu =
                     Submenu::with_id_and_items(app, "pane", "Pane", true, &[&zoom])?;
