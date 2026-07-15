@@ -89,6 +89,8 @@ function lsSet(key, val) {
  *   seams: Seam[],
  *   onSeamPointerDown: (seam: Seam, e: PointerEvent) => void,
  *   movePane: (srcId: string, targetId: string, dir: MoveDir) => void,
+ *   zoomId: string|null,
+ *   toggleZoom: (id: string) => void,
  *   tree: TreeNode|null,
  *   serialize: () => object|null,
  *   restore: (serial: string|object) => boolean,
@@ -328,6 +330,47 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     [onSeamMove, endSeam],
   );
 
+  // ── Zoom (per-pane maximize) ────────────────────────────────────────────────────────────────
+  // An explicit per-pane pin, NOT a MODE: single/focus anchor on selectedId and derive their view,
+  // zoom names one pane. They coexist — zoom takes precedence while set (prod checks ws.zoom before
+  // the tree at main.js:904) and restoring it drops straight back to the mode's view.
+  //
+  // Keyed by wsId so a zoom survives a workspace switch, and IN-MEMORY ONLY: prod omits zoom from
+  // persistWorkspaces (main.js:4090), so it dies on reload. Deliberately NOT written to `hr:tiling:*`.
+  /** @type {[Record<string,string>, React.Dispatch<React.SetStateAction<Record<string,string>>>]} */
+  const [zoomByWs, setZoomByWs] = React.useState({});
+
+  // DERIVED, not stored: a zoomed pane that left paneIds (closed, or moved to another ws) would make
+  // `rects` a lone rect for a pane that no longer renders — i.e. a blank grid. Prod guards this at
+  // relayout (main.js:902); deriving it means the dangling id can never reach a paint, which an
+  // after-paint effect could not promise.
+  const rawZoom = zoomByWs[wsId] || null;
+  const zoomId = rawZoom && paneIds.includes(rawZoom) ? rawZoom : null;
+
+  // ...then drop the dead entry, so a pane returning to this ws can't resurrect a stale zoom.
+  React.useEffect(() => {
+    if (!rawZoom || zoomId) return;
+    setZoomByWs((prev) => {
+      if (!prev[wsId]) return prev;
+      const next = { ...prev };
+      delete next[wsId];
+      return next;
+    });
+  }, [rawZoom, zoomId, wsId]);
+
+  const toggleZoom = React.useCallback(
+    (id) => {
+      if (!id || !paneIdsRef.current.includes(id)) return; // prod: maximizePane no-ops on an unknown pane
+      setZoomByWs((prev) => {
+        const next = { ...prev };
+        if (next[wsId] === id) delete next[wsId]; // same pane → restore
+        else next[wsId] = id;
+        return next;
+      });
+    },
+    [wsId],
+  );
+
   // Intra-workspace reorder: prune src, re-insert it beside target on the given side.
   const movePane = React.useCallback(
     (srcId, targetId, dir) => {
@@ -373,6 +416,11 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     const w = size ? size.width : 0;
     const h = size ? size.height : 0;
     const box = { x: 0, y: 0, w, h };
+    // Zoom short-circuits the tree walk (prod parity, main.js:904): ONE full-host rect, every
+    // sibling ABSENT from `rects`. The absence IS the hide mechanism — Home.jsx already maps a
+    // missing rect to display:none + visible={false}, which detaches WebGL and skips the re-fit.
+    // No seams under zoom: the dividers belong to splits that aren't on screen (main.js:943).
+    if (zoomId) return { rects: { [zoomId]: { x: 0, y: 0, w, h } }, seams: [] };
     /** @type {Record<string, Rect>} */
     const rectsMap = {};
     for (const r of layoutRects(renderTree, box)) {
@@ -388,7 +436,7 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     }));
     return { rects: rectsMap, seams: seamList };
     // version/size/mode/focus/paneKey capture every relayout input (renderTree is derived from them).
-  }, [version, size, mode, focusedId, paneKey]);
+  }, [version, size, mode, focusedId, paneKey, zoomId]);
 
   return {
     rects,
@@ -397,6 +445,8 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     seams,
     onSeamPointerDown,
     movePane,
+    zoomId,
+    toggleZoom,
     tree: renderTree,
     serialize,
     restore,
