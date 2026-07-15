@@ -50,13 +50,6 @@ const DIR_MAP = {
   down: ["h", "after"],
 };
 
-// paneId → integer index. Panes are named `<wsId>-p<idx>` (mirrors deserializeTree), so the
-// index is the trailing `-p<n>` suffix. Returns null (drop the leaf) when it doesn't parse.
-function paneIdxOf(paneId) {
-  const m = /-p(\d+)$/.exec(String(paneId));
-  return m ? Number(m[1]) : null;
-}
-
 // localStorage is best-effort: a Tauri webview / private mode can throw on access. Never let a
 // storage failure break layout — degrade to in-memory-only.
 function lsGet(key) {
@@ -71,6 +64,13 @@ function lsSet(key, val) {
     window.localStorage.setItem(key, val);
   } catch {
     /* storage unavailable — layout still works, just doesn't persist */
+  }
+}
+function lsDel(key) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    /* ignore */
   }
 }
 
@@ -102,16 +102,32 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
   const paneKey = paneIds.join("|"); // stable dep for effects/memo (array identity churns)
 
   const modeKey = `hr:tiling:mode:${wsId}`;
-  const treeKey = `hr:tiling:tree:${wsId}`;
+  // tree2 = full-pane-id leaf shape (`{id}`). Old `hr:tiling:tree:` used index-only `{i:N}` which
+  // collides when one UI workspace holds panes from multiple backend workspaces (all -p0).
+  // Prefer tree2; fall back to legacy key once, migrate via deserialize + reconcile, rewrite tree2.
+  const treeKey = `hr:tiling:tree2:${wsId}`;
+  const legacyTreeKey = `hr:tiling:tree:${wsId}`;
 
   // Restore the persisted STRUCTURAL tree (tile/columns) for this ws, reconciled to live panes;
   // fall back to a fresh balanced tree. Structure only — single/focus are derived, not stored.
   const restoreStructTree = () => {
-    const raw = lsGet(treeKey);
+    let raw = lsGet(treeKey);
+    let fromLegacy = false;
+    if (!raw) {
+      raw = lsGet(legacyTreeKey);
+      fromLegacy = !!raw;
+    }
     if (raw) {
       try {
         const t = deserializeTree(JSON.parse(raw), wsId);
-        if (t) return reconcileTree(t, paneIds, focusedId).tree;
+        if (t) {
+          const healed = reconcileTree(t, paneIds, focusedId).tree;
+          // Always re-persist under tree2 with full ids so the next load never re-reads {i:N}.
+          const ser = serializeTree(healed);
+          lsSet(treeKey, ser ? JSON.stringify(ser) : "");
+          if (fromLegacy) lsDel(legacyTreeKey);
+          return healed;
+        }
       } catch {
         /* malformed persisted tree — rebuild fresh below */
       }
@@ -165,7 +181,8 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
   const [version, bump] = React.useReducer((n) => n + 1, 0);
 
   const persistStruct = React.useCallback(() => {
-    const ser = serializeTree(structRef.current, paneIdxOf);
+    // Full pane id — no paneIdxOf (index-keyed identity is the collision bug).
+    const ser = serializeTree(structRef.current);
     lsSet(treeKey, ser ? JSON.stringify(ser) : "");
   }, [treeKey]);
 
@@ -339,12 +356,13 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     [persistStruct],
   );
 
-  // Stable serialize/restore so layout survives reloads (index-keyed, ws-agnostic payload).
-  const serialize = React.useCallback(() => serializeTree(structRef.current, paneIdxOf), []);
+  // Stable serialize/restore so layout survives reloads (full-pane-id payload).
+  const serialize = React.useCallback(() => serializeTree(structRef.current), []);
   const restore = React.useCallback(
     (serial) => {
       try {
         const parsed = typeof serial === "string" ? JSON.parse(serial) : serial;
+        // wsId only used for legacy `{i:N}` leaves; new `{id}` leaves are self-contained.
         const t = deserializeTree(parsed, wsId);
         if (!t) return false;
         structRef.current = reconcileTree(t, paneIdsRef.current, focusedIdRef.current).tree;
