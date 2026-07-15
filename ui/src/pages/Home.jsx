@@ -92,8 +92,25 @@ export default function Home() {
   const handleBulkResume = () => bridge.resumeAgents(checkedIds);
   const handleBulkRestart = () => bridge.restartAgents(checkedIds);
   const handleBulkBroadcast = (msg) => bridge.broadcastTo(checkedIds, msg);
-  const handleLaunchTemplate = (template) => bridge.spawnAgents(template.agents, template.name);
-  const handleSpawnAgent = (cfg) => bridge.spawnAgents([cfg], "MANUAL LAUNCH");
+  // Default bucket = first workspace id (same arg as paneIdsForWorkspace below). Unassigned
+  // panes already land there — only assign when the operator is looking at a non-default ws
+  // (BUG-3 / K3). K1: spawnAgents resolves to minted ids (failed spawns excluded).
+  // K5 assignMany is not on this base; loop assign() (one write each) + single forceRerender.
+  const defaultWsId = workspaces[0]?.id;
+  const assignSpawnedToActive = (ids) => {
+    if (!ids || !ids.length) return;
+    if (!activeWorkspace || activeWorkspace === defaultWsId) return;
+    for (const id of ids) assign(id, activeWorkspace);
+    forceRerender();
+  };
+  const handleLaunchTemplate = async (template) => {
+    const ids = await bridge.spawnAgents(template.agents, template.name);
+    assignSpawnedToActive(ids);
+  };
+  const handleSpawnAgent = async (cfg) => {
+    const ids = await bridge.spawnAgents([cfg], "MANUAL LAUNCH");
+    assignSpawnedToActive(ids);
+  };
   const handleCloseWorkspace = () => {
     bridge.closeWorkspace();
     setCheckedIds([]);
@@ -101,7 +118,10 @@ export default function Home() {
     setOverlay(null);
   };
 
+  // K2 may fire onSelect on every terminal focus via onFocusCapture — keep this cheap and
+  // idempotent (no work when the id is already selected; scroll only on a real change).
   const handleSelect = (id) => {
+    if (id === selectedId) return;
     setSelectedId(id);
     document.getElementById(`pane-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
@@ -201,8 +221,12 @@ export default function Home() {
   });
 
   // Global shortcuts (L3/BRIEF C3): ⌘⇧I toggles broadcast mode, ⌘⇧G maximizes the highlighted pane.
-  // onMaximizeToggle acts on the currently selected pane only; if none is selected, it does nothing.
-  const handleMaximizeToggle = () => { if (selectedId) toggleZoom(selectedId); };
+  // BUG-1 / K3: selection-first, else the currently zoomed pane so restore stays reachable when
+  // selection was lost while zoomed. Nothing selected and nothing zoomed → no-op.
+  const handleMaximizeToggle = () => {
+    const target = selectedId ?? zoomId;
+    if (target) toggleZoom(target);
+  };
   useKeyboardShortcuts({
     onBroadcastToggle: () => setBroadcast((b) => !b),
     onMaximizeToggle: handleMaximizeToggle,
