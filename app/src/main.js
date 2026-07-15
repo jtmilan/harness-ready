@@ -615,6 +615,15 @@ function ensureSession(id) {
           }
           return false;
         }
+        // ⌘G maximize/restore — handle HERE so WKWebView "Find Next" (native) can't steal it
+        // when the xterm helper <textarea> is focused. Use maximizePane(this id) so we never
+        // depend on the activeId guard that toggleGrid() used to hit on a silent no-op.
+        if (e.type === "keydown" && e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey
+            && (e.key === "g" || e.key === "G")) {
+          e.preventDefault();
+          maximizePane(id);
+          return false;
+        }
         return true;
       });
     }
@@ -1196,8 +1205,31 @@ function updateGridBtn() {
 
 function toggleGrid() {
   const ws = activeWs ? workspaces[activeWs] : null;
-  if (!ws || !activeId || !sessions[activeId]) return;
-  ws.zoom = ws.zoom === activeId ? null : activeId;
+  if (!ws) return;
+  // Prefer activeId when still a live session; otherwise recover a sensible target so ⌘G
+  // doesn't silently no-op when focus landed without the mousedown → setActivePane path.
+  let id = activeId && sessions[activeId] ? activeId : null;
+  if (!id) {
+    if (ws.zoom && sessions[ws.zoom]) {
+      id = ws.zoom; // restore the currently maximized pane
+    } else {
+      const live = ws.paneIds.filter((p) => sessions[p]);
+      if (live.length === 1) {
+        id = live[0];
+      } else {
+        for (const pid of live) {
+          const s = sessions[pid];
+          if (s && s.el && s.el.contains(document.activeElement)) { id = pid; break; }
+        }
+      }
+    }
+    if (!id) {
+      console.debug("[toggleGrid] no-op: activeId null/stale and no recoverable focused/zoomed pane");
+      return;
+    }
+    activeId = id;
+  }
+  ws.zoom = ws.zoom === id ? null : id;
   updateGridBtn();
   relayout();
 }
