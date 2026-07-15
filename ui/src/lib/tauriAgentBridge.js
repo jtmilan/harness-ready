@@ -9,6 +9,7 @@
 //   spawnAgents          → spawn_workspace(id, harness, repo, ...)
 //   sendInput / delegate → send_input(id, data)
 //   broadcast(To)        → send_input per pane
+//   broadcastRaw         → send_input per LIVE pane, verbatim (broadcast toggle mode)
 //   closeWorkspace       → close_workspace(id) per pane
 //   restartAgents        → close_workspace + spawn_workspace
 //
@@ -49,6 +50,22 @@ export function isTauri() {
   return typeof window !== "undefined" && !!window.__TAURI__;
 }
 
+// A send_input reject that means "this pane's PTY is gone" (vs. a transient error).
+// Ported verbatim from agent-teams app/src/main.js:82.
+const DEAD_RE = /no longer alive|no such workspace|not alive/i;
+
+// Terminal REPLY traffic. xterm emits these through the SAME onData channel as
+// keystrokes, but UNPROMPTED — no user key is behind them: SGR mouse reports
+// (\x1b[<…M/m), focus in/out (\x1b[I / \x1b[O), and OSC query replies (\x1b]11;rgb:…,
+// the background-colour probe). A reply belongs ONLY to the pane whose app asked for
+// it; fanning one out types it as garbage into every sibling's input line (live-fired
+// on a prod commandcode pane: "[<35;28;24M…]11;rgb:0a0a/…"). Arrow and function keys
+// (\x1b[A, \x1bOP, …) do NOT match, and so still fan out.
+// Ported from agent-teams app/src/main.js:636.
+export function isReplyTraffic(data) {
+  return /^(?:\x1b\[<|\x1b\[[IO]$|\x1b\])/.test(data);
+}
+
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 
 const SPAWNED_KEY = "hr:spawned-panes";
@@ -76,6 +93,11 @@ export class TauriAgentBridge {
                              // (their PTYs survive in the backend but list_queue never surfaces them).
     this.listeners = new Set();
     this.timer = null;
+    this.dead = new Set();      // pane ids known dead: backend truth ∪ deadLocal. Read by broadcastRaw.
+    this.deadLocal = new Set(); // deaths a keystroke reject taught us BEFORE dead_pane_ids caught up;
+                                // unioned in every poll so the next tick can't clobber them.
+    this._deadBurst = new Set();
+    this._deadBurstTimer = null;
   }
 
   _saveSpawned() {
@@ -115,7 +137,12 @@ export class TauriAgentBridge {
   async _pollOnce() {
     // 1. Ranked "who needs you" queue — authoritative status source.
     const queue = await invoke("list_queue");
+    // Backend truth, unioned with deaths a broadcast keystroke already proved (its reject
+    // lands up to a tick before dead_pane_ids agrees — see _noteDeadPane). Republished on
+    // `this` so broadcastRaw can skip corpses BETWEEN ticks, not just at poll time.
     const dead = new Set(await invoke("dead_pane_ids"));
+    for (const id of this.deadLocal) dead.add(id);
+    this.dead = dead;
     const rowById = {};
     for (const row of queue) rowById[row.id] = row;
 
@@ -229,6 +256,8 @@ export class TauriAgentBridge {
     delete this.offsets[id];
     delete this.raw[id];
     delete this.gen[id];
+    this.dead.delete(id);
+    this.deadLocal.delete(id); // else a forgotten id is re-unioned as dead on every poll, forever
     this._saveSpawned();
   }
 
@@ -244,6 +273,50 @@ export class TauriAgentBridge {
   delegate(id, task) { return this.sendInput(id, task); }
   broadcast(text) { return Promise.all(this.agents.map((a) => this.sendInput(a.id, text))); }
   broadcastTo(ids, text) { return Promise.all(ids.map((id) => this.sendInput(id, text))); }
+
+  // Broadcast TOGGLE mode: one keystroke → every LIVE pane, verbatim (sendRaw's payload
+  // shape — NO trailing "\n"; the terminal's own bytes already carry \r). Distinct from
+  // broadcast(text), which is the one-shot line-submit path.
+  //
+  // The CALLER must keep terminal reply traffic out of here — it belongs to the focused
+  // pane alone. The seam reads:
+  //   broadcast && !isReplyTraffic(data) ? bridge.broadcastRaw(data) : bridge.sendRaw(id, data)
+  // broadcastRaw stays deliberately dumb about it: a caller that hands it reply traffic
+  // should see it fan out, not vanish silently into a filter it did not ask for.
+  broadcastRaw(data) {
+    const targets = this.agents.filter((a) => !this.dead.has(a.id));
+    return Promise.all(targets.map((a) =>
+      // A pane that died since the last keystroke rejects here — that reject IS the news.
+      // Swallow it (an unhandled rejection per keystroke per corpse is noise) and let
+      // _noteDeadPane both drop it from the rest of the burst and light its error state.
+      this.sendRaw(a.id, data).catch((e) => {
+        if (DEAD_RE.test(String(e))) this._noteDeadPane(a.id);
+        else console.error("[TauriAgentBridge] broadcast send_input failed:", a.id, e);
+      })
+    ));
+  }
+
+  // ONE pane died. Mark it so the rest of the burst skips it, flip its status through the
+  // EXISTING subscribe channel (same red error state the poll's dead_pane_ids drives, just
+  // without waiting for the next tick), and COALESCE the burst: a broadcast fires this once
+  // per corpse per keystroke, so a message per reject would be N×keystrokes of noise.
+  // Mirrors agent-teams main.js:7508 — which debounces a "N panes dead, skipped" toast.
+  _noteDeadPane(id) {
+    if (this.dead.has(id)) return;
+    this.dead.add(id);
+    this.deadLocal.add(id);
+    this._deadBurst.add(id);
+    // REPLACE the row, don't mutate it: _pollOnce rebuilds agents as fresh objects every
+    // tick, so consumers may compare by identity — an in-place status flip could be missed.
+    const i = this.agents.findIndex((a) => a.id === id);
+    if (i !== -1) { this.agents[i] = { ...this.agents[i], status: "error" }; this._emit(); }
+    clearTimeout(this._deadBurstTimer);
+    this._deadBurstTimer = setTimeout(() => {
+      const n = this._deadBurst.size;
+      this._deadBurst = new Set();
+      if (n) console.warn(`[TauriAgentBridge] ${n} pane${n === 1 ? "" : "s"} dead, skipped`);
+    }, 400);
+  }
 
   pauseAgents(ids) { return Promise.all(ids.map((id) => invoke("pause_pane", { id }))); }
   async restartAgents(ids) {
@@ -262,6 +335,8 @@ export class TauriAgentBridge {
     this.raw = {};
     this.gen = {};
     this.spawned = {};
+    this.dead = new Set();
+    this.deadLocal = new Set();
     this._saveSpawned();
     this._emit();
   }
