@@ -20,6 +20,21 @@
 // (agent-teams/app/src/main.js:8290-8364) guards only ⌥↑/↓ and F2 with `_isTypingTarget`,
 // and leaves every ⌘ combo unguarded; we match that. A typing guard here would break the
 // primary use case, since a focused terminal is exactly when you reach for broadcast.
+//
+// ── Matching semantics (VERIFIED, static audit of this file) ──────────────────────────
+// BOTH arms match on physical `e.code` ("KeyI" / "KeyG"), never on `e.key`. They are
+// symmetric: same meta+shift gate, same e.repeat reject, same preventDefault +
+// stopPropagation. There is NO key-vs-code asymmetry between ⌘⇧I and ⌘⇧G.
+//
+// Why `e.code` (not `e.key`):
+//   - Shift alone uppercases letter keys on macOS QWERTY (`e.key` → "G"/"I"), which a
+//     lower-case `e.key === "g"` check would miss — but does NOT change `e.code`.
+//   - Option remaps `e.key` entirely (⌥G → "©"); prod hit this and switched to
+//     `e.code === "KeyG"` (main.js:8312). `e.code` is also layout-independent.
+//
+// Implication for BUG-1 (⌘⇧G "dead"): if ⌘⇧I demonstrably fires, this listener is live
+// and the KeyG arm will fire under the same gate. A silent maximize no-op is then in
+// the onMaximizeToggle consumer (Home.jsx selectedId), not in the match here.
 
 import * as React from "react";
 
@@ -56,14 +71,16 @@ export function useKeyboardShortcuts(handlers = {}) {
       // guard this, but every binding here is a toggle, so one press = one flip.
       if (e.repeat) return;
 
-      // `e.code` (physical key), not `e.key`: macOS mangles `e.key` for modified letters —
-      // ⌥G arrives as "©". Prod hit this and switched to `e.code === "KeyG"` (main.js:8312).
-      // `e.code` is also layout-independent, so it survives a non-QWERTY keymap.
+      // Symmetric arms: both use e.code (see file-header "Matching semantics").
+      // preventDefault + stopPropagation on every hit so the chord never leaks to the
+      // webview (devtools-adjacent chords) or a parent handler if one is ever added.
       if (e.code === "KeyI") {
         e.preventDefault();
+        e.stopPropagation();
         latest.current.onBroadcastToggle?.();
       } else if (e.code === "KeyG") {
         e.preventDefault();
+        e.stopPropagation();
         latest.current.onMaximizeToggle?.();
       }
     };
