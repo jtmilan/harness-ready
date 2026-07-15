@@ -175,8 +175,10 @@ struct AppState {
     // by the rewrite → that worktree leaks on the next crash. do_spawn runs on command
     // threads + the HUD tick; the delegate controller runs on a detached thread — they CAN
     // overlap, so every registry_add/registry_remove pair takes this guard (P1 review HIGH
-    // follow-up; same class as live_registry_lock above, different file).
-    worktree_registry_lock: Mutex<()>,
+    // follow-up; same class as live_registry_lock above, different file). Arc so the
+    // close path's DETACHED disk-cleanup thread (see `pending_cleanups`) can hold the
+    // same guard while it rewrites the registry after the slow worktree removal.
+    worktree_registry_lock: std::sync::Arc<Mutex<()>>,
     // Plan 05-04 (voice INPUT): push-to-talk mic capture. The cpal input `Stream` is
     // `!Send`, so it can NEVER live in this (Send+Sync) struct — it stays thread-local
     // on a dedicated capture thread (see `start_dictation`). AppState holds only the
@@ -190,6 +192,14 @@ struct AppState {
     // are tiny (`Arc<Mutex<()>>`) keyed by pane id; ids from closed panes are bounded by the
     // session's pane count and cost bytes, so no eviction pass is needed.
     pane_write_locks: Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    // Per-pane id → in-flight DISK-CLEANUP lock for the close path. `close_workspace`
+    // returns as soon as the PTY child is dead and moves the slow cleanup (git worktree
+    // remove + branch -D + state-dir delete — seconds to ~15s on a big tree) onto a
+    // detached thread that holds this entry's lock for the whole cleanup. A same-id
+    // respawn (`do_spawn`) waits on the entry before `add_worktree`, so a reopen can
+    // never reuse a worktree that is mid-deletion. Arc'd so the cleanup thread can
+    // drop its own entry when done (ptr-guarded) — the map stays bounded.
+    pending_cleanups: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>>,
     // 06-02 Phase-B HTTP transport (DRAFT): the LIVE bound port of the loopback-HTTP
     // listener, set when `spawn_http_listener` binds (None if http_enabled=false or the
     // bind failed). mcp_http_status reports this — it's the source of truth for
@@ -1430,6 +1440,18 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
         ));
     }
     let repo_path = PathBuf::from(&ps.repo);
+    // A prior close of THIS id may still be deleting its worktree on the detached
+    // cleanup thread (`close_workspace`) — wait for it (lock+drop) before add_worktree,
+    // or the reopen would "reuse" a tree that vanishes under the fresh pane.
+    let pending = state
+        .pending_cleanups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&ps.id)
+        .cloned();
+    if let Some(l) = pending {
+        drop(l.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
     // isolate in a (sparse-scoped) worktree; fall back to the folder itself if
     // it's not inside a git repo. On reopen this reuses an existing worktree dir.
     let wt = add_worktree(&repo_path, &ps.id).ok();
@@ -1995,17 +2017,47 @@ fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), Stri
     // Drop this pane's per-pane write lock — otherwise the map grows one entry per distinct pane id
     // over a long high-churn session (thousands of opens/closes) and never shrinks.
     state.pane_write_locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
-    if let Some(Some((git_root, wt_root))) = state.meta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
-        let _ = remove_worktree(&git_root, &id, &wt_root);
-    }
-    {
-        let _g = state.worktree_registry_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry_remove(&state.worktree_registry, &id);
-    }
     // Drop this workspace from the live registry (D37) — it is no longer live, so the
     // sidecar must stop counting it in the app-up set.
     live_registry_update(state.inner(), |ws| ws.retain(|w| w.id != id));
-    let _ = std::fs::remove_dir_all(state.state_root.join(&id));
+    // Slow DISK cleanup (git worktree remove + branch -D + state-dir delete) moves OFF the
+    // close path: the frontend awaits this command before disposing the pane tile, so a big
+    // worktree (node_modules, target/) made every close hang the pane for many seconds. The
+    // PTY is already dead (kill() above is bounded) — everything below is pure disk I/O, so
+    // it runs on a DETACHED thread that holds the per-id `pending_cleanups` entry; a same-id
+    // respawn waits on that entry in `do_spawn` before `add_worktree` (no mid-deletion reuse).
+    // Ordering INSIDE the thread is the pre-existing crash-safe order: worktree removal FIRST,
+    // registry_remove AFTER — a crash mid-cleanup leaves the registry entry, and the next
+    // startup's `sweep_orphan_worktrees` finishes the job (never a silently leaked worktree).
+    let wt_meta = state.meta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+    let cleanup_lock = state
+        .pending_cleanups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(id.clone())
+        .or_default()
+        .clone();
+    let cleanups = std::sync::Arc::clone(&state.pending_cleanups);
+    let reg_lock = std::sync::Arc::clone(&state.worktree_registry_lock);
+    let registry = state.worktree_registry.clone();
+    let state_dir = state.state_root.join(&id);
+    std::thread::spawn(move || {
+        let _busy = cleanup_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(Some((git_root, wt_root))) = wt_meta {
+            let _ = remove_worktree(&git_root, &id, &wt_root);
+        }
+        {
+            let _g = reg_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry_remove(&registry, &id);
+        }
+        let _ = std::fs::remove_dir_all(&state_dir);
+        // Self-drain: drop this id's entry, but ONLY if it is still OUR lock — a later
+        // close cycle for a reused id may have minted a fresh entry (never remove theirs).
+        let mut map = cleanups.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(&id).is_some_and(|l| std::sync::Arc::ptr_eq(l, &cleanup_lock)) {
+            map.remove(&id);
+        }
+    });
     Ok(())
 }
 
@@ -13711,11 +13763,13 @@ pub fn run() {
                 pending: Mutex::new(VecDeque::new()),
                 runs_log: default_runs_path(),
                 live_registry_lock: Mutex::new(()),
-                worktree_registry_lock: Mutex::new(()),
+                worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
                 // 05-04: no capture in flight at launch (push-to-talk fills this).
                 dictation: Mutex::new(None),
                 // per-pane write serializer: filled lazily on first write to each pane.
                 pane_write_locks: Mutex::new(HashMap::new()),
+                // async-close disk-cleanup serializer: filled per close, self-draining.
+                pending_cleanups: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 // 06-02 Phase-B HTTP: no listener bound yet (filled by
                 // spawn_http_listener iff http_enabled).
                 http_port: Mutex::new(None),
@@ -21121,9 +21175,10 @@ mod daemon_spawn_routing_tests {
                 pending: Mutex::new(VecDeque::new()),
                 runs_log: self.dir.join("runs.jsonl"),
                 live_registry_lock: Mutex::new(()),
-                worktree_registry_lock: Mutex::new(()),
+                worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
                 dictation: Mutex::new(None),
                 pane_write_locks: Mutex::new(HashMap::new()),
+                pending_cleanups: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 http_port: Mutex::new(None),
                 delegation_in_flight: Mutex::new(None),
                 delegate_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
