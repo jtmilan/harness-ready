@@ -115,6 +115,16 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   // Per-pane renderer state for the WebGL policy (term set at mount; webgl managed by visibility).
   const glRef = useRef({ term: null, webgl: null, webglBlocked: false });
 
+  // Latest-prop refs for callbacks bound once inside the mount-once xterm effect (deps =
+  // [agent.id] only — the terminal must never be re-created; resize fix 870dacf depends on
+  // that). Without these, term.onData / the fit→resize_pty path close over the FIRST render's
+  // onInput / onResize forever (BUG-2: broadcast stays false inside the bound keystroke path).
+  // onSelect is NOT once-bound — it rides the container's re-rendered JSX handlers — so no ref.
+  const onInputRef = useRef(onInput);
+  const onResizeRef = useRef(onResize);
+  useEffect(() => { onInputRef.current = onInput; });
+  useEffect(() => { onResizeRef.current = onResize; });
+
   // ---- Rename (display label).
   // The label READ lives here because this component renders the header label and nothing else
   // does; routing it through a prop would need a Home.jsx edit, which belongs to another lane.
@@ -213,7 +223,12 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     glRef.current.term = term;
 
     // Keystrokes → raw PTY input (no trailing newline; xterm already includes \r etc.).
-    const onDataDisposable = term.onData((data) => onInput && onInput(agent.id, data));
+    // Call through the ref so a later onInput (e.g. broadcast toggle) is seen without
+    // re-creating the terminal (mount effect deliberately runs once per agent.id).
+    const onDataDisposable = term.onData((data) => {
+      const fn = onInputRef.current;
+      if (fn) fn(agent.id, data);
+    });
 
     // Sync the backend PTY winsize to the terminal so TUIs paint at the widget size.
     // Prod-parity fitSession guard (agent-teams main.js:667-675): only tell the PTY to
@@ -251,7 +266,8 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
-      Promise.resolve(onResize && onResize(agent.id, rows, cols))
+      // Same latest-ref pattern as onData: onResize is bound once in this mount effect.
+      Promise.resolve(onResizeRef.current && onResizeRef.current(agent.id, rows, cols))
         .then(() => { lastRows = rows; lastCols = cols; })
         .catch(() => {
           // Backend can't resize yet (pane still spawning / transient) — leave the
@@ -354,6 +370,11 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       data-pane-id={agent.id}
       style={style}
       onClick={() => onSelect(agent.id)}
+      // Focus into the embedded xterm textarea must select this pane (BUG-1: ⌘⇧G uses
+      // selectedId, which previously only updated on container click). Capture so focus
+      // inside the terminal still bubbles here. Skip if already selected — onSelect is
+      // idempotent from this side; avoids redundant parent work on every re-focus.
+      onFocusCapture={() => { if (!selected) onSelect(agent.id); }}
       // `zoomed` is a styling/query hook only — the actual zoom geometry arrives as
       // the `style` rect from the tiling layer, which hands a zoomed pane the whole host box.
       className={`flex flex-col border cursor-pointer transition-all duration-200 bg-[#0A1219] overflow-hidden ${zoomed ? "zoomed " : ""}${border}`}
