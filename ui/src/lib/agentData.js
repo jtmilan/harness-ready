@@ -43,6 +43,9 @@ export function randomLine() {
   return OUTPUT_LINES[Math.floor(Math.random() * OUTPUT_LINES.length)];
 }
 
+// Mock web-preview fleet. Every `kind` is a HARNESS_WIRE key (claude-code, cursor,
+// codex, opencode, commandcode, cline, grok, bash) — same closed set the template
+// builder offers — so preview and Tauri spawn agree after K4 drops || "bash".
 const INITIAL = [
   { kind: "claude-code", status: "working" },
   { kind: "cursor", status: "needs_input" },
