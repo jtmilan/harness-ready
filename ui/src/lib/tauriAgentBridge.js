@@ -20,6 +20,38 @@ import { randomAgentName } from "@/lib/agentNames";
 // behind a streaming TUI. Guarded against overlap in _poll (120ms can undercut a slow invoke).
 const POLL_MS = 120;
 
+/**
+ * After a byte-window slice, advance to a safe replay start so term.reset()+write never
+ * begins mid-CSI/SGR (which leaves the emulator with broken DECAWM/SGR → 1-col wrap).
+ * 1) Drop through the first newline (discard the likely-truncated first line).
+ * 2) If still opening on ESC, skip past a complete CSI/simple ESC or drop a lone incomplete ESC.
+ */
+export function trimAtSafeBoundary(s) {
+  if (!s) return s;
+  const nl = s.indexOf("\n");
+  if (nl !== -1) s = s.slice(nl + 1);
+  // Partial ESC at the head (slice landed inside an escape, or no newline was present).
+  if (s.charCodeAt(0) === 0x1b /* ESC */) {
+    let i = 1;
+    if (i < s.length && s[i] === "[") {
+      // CSI: ESC [ intermediate/params… final byte in 0x40–0x7E
+      i += 1;
+      while (i < s.length) {
+        const c = s.charCodeAt(i);
+        i += 1;
+        if (c >= 0x40 && c <= 0x7e) break;
+      }
+      // Incomplete CSI (no final byte in the window): drop the orphan prefix entirely.
+      s = s.slice(i);
+    } else if (i < s.length) {
+      s = s.slice(2); // ESC + single-char sequence
+    } else {
+      s = ""; // lone ESC with nothing after
+    }
+  }
+  return s;
+}
+
 // UI kind (agentTypes.js key) → backend harness wire string. Wire strings are the
 // `descriptor().wire` values in agent-teams core/harness/src/lib.rs, parsed by
 // `parse_harness` (app/src-tauri/src/lib.rs) — NOT the CLI command name (cursor's
@@ -146,9 +178,8 @@ export class TauriAgentBridge {
       // this pane's buffer and bump its generation so the terminal does a full RIS.
       if (d.truncated) {
         // Cap a huge replay too (backend retains 4MB) — the gen bump below already
-        // resets the terminal, so starting mid-stream costs at most one cosmetic
-        // fragment at the very top of scrollback.
-        this.raw[d.id] = d.data.slice(-160000);
+        // resets the terminal. trimAtSafeBoundary avoids starting mid-CSI/SGR.
+        this.raw[d.id] = trimAtSafeBoundary(d.data.slice(-160000));
         this.gen[d.id] = (this.gen[d.id] || 0) + 1;
       } else {
         // The pane writes raw.slice(writtenRef) — an ABSOLUTE cursor into this
@@ -159,9 +190,10 @@ export class TauriAgentBridge {
         // bytes ever written; backend truncation at 4MB never fires because our
         // `since` cursor keeps advancing). Trim in big hysteresis steps WITH a
         // gen bump instead, so the pane does reset + full rewrite of the window.
+        // Always trim at a safe line/ESC boundary so replay never starts mid-SGR.
         const grown = (this.raw[d.id] || "") + d.data;
         if (grown.length > 240000) {
-          this.raw[d.id] = grown.slice(-120000);
+          this.raw[d.id] = trimAtSafeBoundary(grown.slice(-120000));
           this.gen[d.id] = (this.gen[d.id] || 0) + 1;
         } else {
           this.raw[d.id] = grown;

@@ -148,10 +148,21 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       // FitAddon can propose its 2×1 minimum and SIGWINCH the TUI into garbage.
       const box = mountRef.current && mountRef.current.getBoundingClientRect();
       if (!box || box.width < 2 || box.height < 2) return;
+      // Degenerate winsize (FitAddon floor is ~2 cols): skip fit + PTY sync.
+      // A transient small box used to push 2-col through resize_pty → 1-col garble.
+      // Prefer proposeDimensions so we never commit a bad fit into xterm either.
+      if (fit && typeof fit.proposeDimensions === "function") {
+        let proposed;
+        try { proposed = fit.proposeDimensions(); } catch { return; }
+        if (!proposed || !proposed.cols || !proposed.rows) return;
+        if (proposed.cols < 20 || proposed.rows < 5) return;
+      }
       try { fit && fit.fit(); } catch { return; }
       const rows = term.rows;
       const cols = term.cols;
       if (!rows || !cols) return;
+      // Belt-and-braces: never send a degenerate winsize to resize_pty.
+      if (cols < 20 || rows < 5) return;
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;
