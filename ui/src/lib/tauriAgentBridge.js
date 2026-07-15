@@ -276,6 +276,8 @@ export class TauriAgentBridge {
   async restartAgents(ids) {
     for (const id of ids) { await invoke("close_workspace", { id }); this._forget(id); }
   }
+  // Kill the given panes for good (PTY + worktree via close_workspace) — no respawn.
+  closeAgents(ids) { return this.restartAgents(ids); }
   resumeAll() { return Promise.all(this.agents.map((a) => invoke("resume_pane", { id: a.id }))); }
   stopAll() { return this.closeWorkspace(); }
   advanceStarting() {}

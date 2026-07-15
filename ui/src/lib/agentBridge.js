@@ -102,6 +102,12 @@ class MockAgentBridge {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> AGENT RESTARTED", { status: "working", attention: null }));
   }
 
+  // Real backend: kill each PTY child + `git worktree remove`, then drop the panes.
+  closeAgents(ids) {
+    this.agents = this.agents.filter((a) => !ids.includes(a.id));
+    this._emit();
+  }
+
   resumeAll() {
     this._patch((a) => a.status === "idle", (a) => ({ ...a, status: "working" }));
   }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
-import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace } from "@/lib/workspaceStore";
+import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace } from "@/lib/workspaceStore";
 import { assign, paneIdsForWorkspace } from "@/lib/workspaceAssign";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
@@ -26,7 +26,8 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState(null);
   const [workspaces, setWorkspaces] = useState(loadWorkspaces);
   const [activeWorkspace, setActiveWorkspace] = useState(() => loadWorkspaces()[0].id);
-  const [overlay, setOverlay] = useState(null); // 'broadcast' | 'delegate' | 'bulk-broadcast' | 'templates'
+  const [overlay, setOverlay] = useState(null); // 'broadcast' | 'delegate' | 'bulk-broadcast' | 'templates' | 'delete-workspace' | ...
+  const [wsToDelete, setWsToDelete] = useState(null); // ws id pending delete confirmation
   const [checkedIds, setCheckedIds] = useState([]);
   const [running, setRunning] = useState(true);
   const [trend, setTrend] = useState([]);
@@ -55,6 +56,30 @@ export default function Home() {
   };
   const handleRenameWorkspace = (id, name) =>
     setWorkspaces((prev) => prev.map((w) => (w.id === id ? { ...w, name } : w)));
+
+  // Delete flow: tile trash icon → confirm overlay → handleDeleteWorkspace.
+  // Deleting a workspace terminates every pane visible under its tab (explicitly
+  // assigned panes, plus default-bucket panes when deleting the first workspace),
+  // then removes the tab. Never offered on the last remaining workspace.
+  const requestDeleteWorkspace = (id) => {
+    setWsToDelete(id);
+    setOverlay("delete-workspace");
+  };
+  const handleDeleteWorkspace = async () => {
+    const id = wsToDelete;
+    setOverlay(null);
+    setWsToDelete(null);
+    if (!id) return;
+    const paneIds = paneIdsForWorkspace(id, agents.map((a) => a.id), workspaces[0]?.id);
+    if (paneIds.length) {
+      await bridge.closeAgents(paneIds);
+      setCheckedIds((prev) => prev.filter((x) => !paneIds.includes(x)));
+      if (paneIds.includes(selectedId)) setSelectedId(null);
+    }
+    const next = deleteWorkspace(id);
+    setWorkspaces(next);
+    if (activeWorkspace === id) setActiveWorkspace(next[0]?.id);
+  };
 
   // Sample fleet activity for the performance trend
   const agentsRef = useRef(agents);
@@ -348,6 +373,7 @@ export default function Home() {
           onSelectWorkspace={setActiveWorkspace}
           onAddWorkspace={handleAddWorkspace}
           onRenameWorkspace={handleRenameWorkspace}
+          onDeleteWorkspace={requestDeleteWorkspace}
         />
       ) : (
       <>
@@ -404,7 +430,7 @@ export default function Home() {
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-[1fr_1.3fr_1.3fr_1fr] gap-4 p-4 pt-0 h-64 shrink-0">
         <AgentDirectory agents={agents} selectedId={selectedId} onSelect={handleSelect} />
         <PerformanceWidget trend={trend} agents={agents} />
-        <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} />
+        <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} onDelete={requestDeleteWorkspace} />
         <SessionInfo sessionId={SESSION_ID} startTime={SESSION_START} running={running} />
       </div>
       </>
@@ -435,6 +461,23 @@ export default function Home() {
           onClose={() => setOverlay(null)}
         />
       )}
+      {overlay === "delete-workspace" && (() => {
+        const ws = workspaces.find((w) => w.id === wsToDelete);
+        const count = paneIdsForWorkspace(wsToDelete, agents.map((a) => a.id), workspaces[0]?.id).length;
+        return (
+          <ConfirmOverlay
+            title="DELETE WORKSPACE"
+            description={
+              count > 0
+                ? `// delete "${ws?.name ?? wsToDelete}" — terminate its ${count} agent(s), remove their worktrees, and drop the tab`
+                : `// delete "${ws?.name ?? wsToDelete}" — the workspace is empty; the tab is removed`
+            }
+            confirmLabel="DELETE"
+            onConfirm={handleDeleteWorkspace}
+            onClose={() => { setOverlay(null); setWsToDelete(null); }}
+          />
+        );
+      })()}
       {overlay === "new-agent" && (
         <NewAgentOverlay onLaunch={handleSpawnAgent} onClose={() => setOverlay(null)} />
       )}

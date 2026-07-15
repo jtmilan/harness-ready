@@ -3,7 +3,9 @@ import { Plus, LayoutTemplate, Zap } from "lucide-react";
 import { AGENT_KINDS, KIND_IDS } from "@/lib/agentTypes";
 import WorkspaceTile from "@/components/command/WorkspaceTile";
 
-export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, workspaces = [], activeId, onSelectWorkspace, onAddWorkspace, onRenameWorkspace }) {
+export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, workspaces = [], activeId, onSelectWorkspace, onAddWorkspace, onRenameWorkspace, onDeleteWorkspace }) {
+  // Never offer delete on the last remaining workspace.
+  const deletable = workspaces.length > 1 ? onDeleteWorkspace : undefined;
   return (
     <div className="flex-1 flex flex-col items-center justify-center overflow-y-auto terminal-scroll p-8">
       <div className="font-mono text-xs text-cyan-700 mb-5">$ agent fleet status — 0 active</div>
@@ -38,7 +40,7 @@ export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, worksp
         <div className="font-heading text-xs tracking-[0.35em] text-cyan-600 font-bold text-center mb-3">SELECT WORKSPACE</div>
         <div className="flex flex-wrap justify-center gap-2">
           {workspaces.map((w) => (
-            <WorkspaceTile key={w.id} ws={w} chip active={activeId === w.id} onSelect={onSelectWorkspace} onRename={onRenameWorkspace} />
+            <WorkspaceTile key={w.id} ws={w} chip active={activeId === w.id} onSelect={onSelectWorkspace} onRename={onRenameWorkspace} onDelete={deletable} />
           ))}
           <button
             onClick={onAddWorkspace}
