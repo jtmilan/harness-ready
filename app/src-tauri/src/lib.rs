@@ -13720,6 +13720,46 @@ pub fn run() {
                 }
             })?;
 
+            // ── T3: ⌘⇧G via APP MENU accelerator (NOT global_shortcut) ──
+            // ⌘⇧G is in macOS's Find-key-equivalent family; WKWebView swallows the
+            // keydown before the page sees it (Chrome preview works — same JS chain).
+            // An app-menu item with CmdOrCtrl+Shift+G claims the chord in-process so
+            // the native layer delivers a menu event instead. Deliberately NOT
+            // `global_shortcut`: a system-wide claim would shadow Finder's
+            // "Go to Folder". ⌘⇧J above is the global-registration precedent for the
+            // emit idiom only — not for registration of this chord.
+            //
+            // Menu shape: Menu::default + a top-level "Pane" submenu (macOS menu bar
+            // only accepts Submenus at the top level; a bare MenuItem cannot append).
+            {
+                use tauri::menu::{Menu, MenuItem, Submenu};
+
+                let zoom = MenuItem::with_id(
+                    app,
+                    "maximize-pane",
+                    "Toggle Pane Zoom",
+                    true,
+                    Some("CmdOrCtrl+Shift+G"),
+                )?;
+                let pane_menu =
+                    Submenu::with_id_and_items(app, "pane", "Pane", true, &[&zoom])?;
+                let menu = Menu::default(app.handle())?;
+                menu.append(&pane_menu)?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    if event.id().as_ref() == "maximize-pane" {
+                        // Same raise + emit idiom as raise_and_jump (⌘⇧J): resolve main
+                        // window best-effort, then emit for the frontend. Errors ignored.
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app.emit("maximize-pane", ());
+                    }
+                });
+            }
+
             // ---- Phase 05 / 05-01: menubar HUD (tray badge + OS notifications) ----
             // Tray icon: left-click = jump-to-top (reuses raise_and_jump); right-click
             // opens a menu (Jump / Show / Quit). The badge (title) is driven by the
