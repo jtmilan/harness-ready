@@ -112,13 +112,16 @@ function chainNodes(nodes, dir) {
 }
 
 // Self-heal the tree against the authoritative live set: prune leaves whose pane is no longer
-// live (sibling promoted), then append any live pane missing from the tree by splitting the
-// focused leaf (or the last leaf) with an alternating direction (tmux-style balance). Returns
-// { tree }. Idempotent — safe to call on every relayout. This is also the MIGRATION path: a
-// null tree + live panes → buildDefaultTree fallback happens at the call site.
+// live (sibling promoted), drop DUPLICATE leaves (keep first DFS occurrence — legacy index-keyed
+// serialize could rehydrate two different backend panes as the same id), then append any live
+// pane missing from the tree by splitting the focused leaf (or the last leaf) with an alternating
+// direction (tmux-style balance). Returns { tree }. Idempotent — safe to call on every relayout.
+// This is also the MIGRATION path: a null tree + live panes → buildDefaultTree at the call site.
 export function reconcileTree(tree, livePaneIds, focusedPaneId) {
   const live = new Set(livePaneIds || []);
-  let t = pruneDead(tree, live);
+  // seen tracks pane ids already kept so a second leaf with the same id is dropped (sibling
+  // promoted). Critical when a stale index-keyed tree deserializes multiple -p0 leaves to one id.
+  let t = pruneDead(tree, live, new Set());
   const present = new Set(leafPanes(t));
   const missing = (livePaneIds || []).filter((id) => !present.has(id));
   for (const id of missing) {
@@ -132,32 +135,42 @@ export function reconcileTree(tree, livePaneIds, focusedPaneId) {
   }
   return { tree: t };
 }
-function pruneDead(node, live) {
+function pruneDead(node, live, seen) {
   if (!node) return null;
-  if (node.t === "leaf") return live.has(node.pane) ? node : null;
-  const a = pruneDead(node.a, live);
-  const b = pruneDead(node.b, live);
+  if (node.t === "leaf") {
+    if (!live.has(node.pane)) return null;
+    if (seen.has(node.pane)) return null; // duplicate id → drop (keep first)
+    seen.add(node.pane);
+    return node;
+  }
+  const a = pruneDead(node.a, live, seen);
+  const b = pruneDead(node.b, live, seen);
   if (a && b) return { ...node, a, b };
   return a || b || null; // one child gone → sibling promoted; both gone → null
 }
 
-// Persistence: serialize with the pane INDEX (the -pN suffix) so the tree is keyed in the same
-// idx-space as idxList/harnesses/roles and survives the id-rebuild on reopen. paneIdxOf maps a
-// paneId → integer index (or null/undefined to drop the leaf).
-export function serializeTree(node, paneIdxOf) {
+// Persistence: serialize leaves by FULL pane id (`{id:"…"}`). Index-keyed `{i:N}` collided when
+// one UI workspace held panes from different backend workspaces (wsA-p0 + wsB-p0 → both i:0).
+// `paneIdxOf` is ignored when present (legacy call-site compat); always write the id shape.
+export function serializeTree(node, _paneIdxOf) {
   if (!node) return null;
   if (node.t === "leaf") {
-    const idx = paneIdxOf(node.pane);
-    return typeof idx === "number" ? { t: "leaf", i: idx } : null;
+    return node.pane ? { t: "leaf", id: node.pane } : null;
   }
-  const a = serializeTree(node.a, paneIdxOf);
-  const b = serializeTree(node.b, paneIdxOf);
+  const a = serializeTree(node.a, _paneIdxOf);
+  const b = serializeTree(node.b, _paneIdxOf);
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };
   return a || b || null;
 }
+// Load leaves by full id. Backward compat: accept legacy `{i:N}` → `${wsId}-p${N}` (homogeneous
+// workspaces only; mixed sets heal via reconcileTree against the live full-id list).
 export function deserializeTree(node, wsId) {
   if (!node) return null;
-  if (node.t === "leaf") return typeof node.i === "number" ? leaf(`${wsId}-p${node.i}`) : null;
+  if (node.t === "leaf") {
+    if (typeof node.id === "string" && node.id) return leaf(node.id);
+    if (typeof node.i === "number") return leaf(`${wsId}-p${node.i}`);
+    return null;
+  }
   const a = deserializeTree(node.a, wsId);
   const b = deserializeTree(node.b, wsId);
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };

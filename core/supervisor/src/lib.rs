@@ -1394,13 +1394,20 @@ impl Supervisor {
 
     /// Resize the PTY to match the UI terminal (sends SIGWINCH → the harness
     /// TUI repaints at the new size). Call whenever xterm fits/resizes.
-    pub fn resize(&self, rows: u16, cols: u16) {
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+    ///
+    /// Propagates `master.resize` failures — a silent `Ok` here was a false ACK:
+    /// the UI latched dimensions the kernel never applied (garbled 100-col paint
+    /// in a narrower xterm). Callers must surface `Err` so the frontend can leave
+    /// the "acked dims" guard open and retry.
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// All RETAINED output (lossy UTF-8) — bounded by [`RETAIN_CAP`], so output older
