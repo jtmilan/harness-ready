@@ -10,8 +10,12 @@
 // A "v" split slices WIDTH (side-by-side columns); an "h" split slices HEIGHT (stacked rows).
 
 export const TILE_GAP = 6; // gutter between tiles, == the old grid gap
-export const MIN_V = 160;  // min pane width floor
-export const MIN_H = 90;   // min pane height floor
+export const MIN_V = 160;  // min pane width floor (~enough for ≥20 cols @ typical mono)
+// Min full-pane height must leave room for AgentPane chrome (header ~36 + branch ~28 +
+// padding) PLUS ≥5–6 xterm rows @ fontSize 11 (~13px/row) so the sized-gate can open.
+// 90px was below chrome+6rows → legal tiles could leave OpenCode/Cline blank forever
+// while agent.raw was full (writes held until cols≥20/rows≥5).
+export const MIN_H = 160;
 
 // Split `total` px along an axis at `ratio`, flooring each side at `min` when there's room.
 // Returns [a, b] where a + b == total − TILE_GAP (the gutter is carved out first).

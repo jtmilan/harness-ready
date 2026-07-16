@@ -311,13 +311,15 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       const rows = term.rows;
       const cols = term.cols;
       if (!rows || !cols) return;
-// PTY dim floor (spawn-window squeeze + degenerate FitAddon floors): keep local
-      // xterm fit but do NOT ship single-digit dims to the child. ACK/retry below
-      // is unchanged (870dacf). Floor is rows < 6 (parity) / cols < 20 (both).
-      if (cols < 20 || rows < 6) return;
-      // First valid geometry: release backlog replay BEFORE the change-guard —
+      // Local write floor (align with proposeDimensions above): release backlog replay
+      // once the xterm grid is usable. Still never write into <20×5 (wrap-safe).
+      if (cols < 20 || rows < 5) return;
+      // First valid geometry: release backlog BEFORE the PTY change-guard —
       // on a remount the PTY may already match, but the replay still waits.
       if (!sizedLatched) { sizedLatched = true; setSized(true); }
+      // PTY dim floor (spawn-window squeeze): keep local fit/writes, but do NOT ship
+      // near-degenerate dims to the child (rows < 6 / cols < 20). ACK/retry unchanged.
+      if (cols < 20 || rows < 6) return;
       if (rows === lastRows && cols === lastCols) return; // PTY already matches
       if (syncing) { pending = true; return; }
       syncing = true;

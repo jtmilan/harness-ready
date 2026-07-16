@@ -293,6 +293,35 @@ export default function Home() {
     };
   }, []);
 
+  // OpenCode/Bun can segfault once at startup; backend respawns the same pane id with a
+  // fresh PTY. Reset bridge cursor/scrollback so the terminal rewrites (legacy main.js
+  // already handled this; React path was missing it → silent blank after respawn).
+  // Does NOT touch the sized-gate / wrap path.
+  useEffect(() => {
+    if (!isTauri()) return undefined;
+    const listen = window.__TAURI__?.event?.listen;
+    if (typeof listen !== "function") return undefined;
+    let unlisten = null;
+    let cancelled = false;
+    listen("pane-early-respawn", (e) => {
+      const p = (e && e.payload) || {};
+      if (!p.id || !p.ok) return;
+      if (typeof bridge.onEarlyRespawn === "function") bridge.onEarlyRespawn(p.id);
+    }).then((fn) => {
+      if (cancelled) {
+        try { fn(); } catch { /* ignore */ }
+        return;
+      }
+      unlisten = fn;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (typeof unlisten === "function") {
+        try { unlisten(); } catch { /* ignore */ }
+      }
+    };
+  }, []);
+
   // Cross-workspace drop: reassign the pane, then re-render so the grid re-buckets.
   const handleDropOnWorkspace = (paneId, wsId) => {
     if (!paneId || !wsId) return;
