@@ -1310,7 +1310,15 @@ impl Supervisor {
         // worktree→repo fallback is applied by the callers that know the repo
         // (app `do_spawn` / daemon `RealSpawnExec::spawn`); this is the final
         // belt-and-suspenders for EVERY harness spawned through a PTY.
-        cmd.cwd(resolve_spawn_cwd(Some(&spec.worktree), None));
+        let spawn_cwd = resolve_spawn_cwd(Some(&spec.worktree), None);
+        // OpenCode interactive TUI: `opencode [project]` — the binary IGNORES process
+        // cwd and walks `.git` up to the main repo unless given an explicit project path
+        // (live-verified isolation footgun; headless path already passes `--dir`).
+        // Workers build their own argv in worker_spawn and must not get a second path.
+        if matches!(spec.harness, Harness::OpenCode) && !spec.is_worker {
+            cmd.arg(&spawn_cwd);
+        }
+        cmd.cwd(&spawn_cwd);
         cmd.env("AGENT_TEAMS_STATE_DIR", state_root);
         // Pane provenance (threat-model C2/C7): the sidecar's memory/task WRITE tools
         // stamp Actor::Pane from this — server-set here at spawn, NEVER an agent-supplied
@@ -1323,8 +1331,11 @@ impl Supervisor {
         // sees them and the two never diverge (mem_key is computed once above).
         cmd.env("AGENT_TEAMS_MEMORY_REPO_KEY", &mem_key);
         cmd.env("AGENT_TEAMS_TASK_SCOPE", &spec.id);
-        // a real terminal type so the harness TUIs (claude/cursor) paint
+        // a real terminal type so the harness TUIs (claude/cursor/opencode/cline) paint
         cmd.env("TERM", "xterm-256color");
+        // Truecolor probe (OSC 10/11 + 24-bit SGR) — OpenTUI/cline expect this; without it
+        // some builds delay or skip full paint in a bare PTY.
+        cmd.env("COLORTERM", "truecolor");
         // GUI launch loses the shell PATH → inject one so claude/cursor resolve
         cmd.env("PATH", harness_path());
 
