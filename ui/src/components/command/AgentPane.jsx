@@ -222,16 +222,9 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     let fit = null;
     try { fit = new FitAddon(); term.loadAddon(fit); } catch { fit = null; }
     term.open(mountRef.current);
-    // Bootstrap local geometry at the PTY spawn size (30×100) so TUI capability probes
-    // (CSI 6n cursor report, OSC 10/11 color queries used by OpenCode OpenTUI + Cline)
-    // reach xterm and are answered via onData→PTY *before* the tiling host measures.
-    // The hard sized-gate used to hold ALL raw writes until the first valid fit; while
-    // probes sat unread in the poll buffer, modern TUIs stayed blank (child alive, pane
-    // empty). Do NOT call resize_pty here — syncNow still owns real geometry + backend
-    // winsize once ResizeObserver reports a real box.
-    try {
-      term.resize(100, 30);
-    } catch { /* xterm not ready — syncNow will recover */ }
+    // NO mount-time fit: the tiling host measures via ResizeObserver, so on first mount
+    // (and workspace switch) this box is 0×0/tiny — an unguarded fit here commits FitAddon's
+    // ~2-col floor into xterm. syncNow below owns fitting, with full dimension guards.
     termRef.current = term;
     // Release ⌘G / ⌘⇧I to the window listener (Home.jsx / p3) — xterm would otherwise
     // swallow them while the pane textarea is focused. return false = do not handle.
@@ -277,10 +270,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     let debTimer = 0;
     let retryTimer = 0;
     let disposed = false;
-    // Latched true immediately after bootstrap resize above so the write effect can
-    // feed probe/paint bytes; real fit still upgrades via syncNow + setSized(true).
-    let sizedLatched = true;
-    setSized(true);
+    let sizedLatched = false; // setSized(true) fired once for this mount
     const MAX_BACKOFF_MS = 5000;
 
     const termHasContent = () => {

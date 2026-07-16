@@ -197,16 +197,13 @@ impl Harness {
                 // State-blind like codex/commandcode (no hooks). Bare `opencode` launches
                 // the interactive TUI; no startup-suppression flags are needed for the TUI
                 // spawn (the headless WORKER path uses `opencode run …`, built in
-                // `worker_spawn`, not here). Interactive path MUST also pass the worktree as
-                // the positional project (supervisor adds it) — opencode ignores process cwd.
+                // `worker_spawn`, not here).
                 inject: None,
                 wire: "opencode",
                 display: "OpenCode",
                 spawn_args: &[],
-                // Plugin turn-end is best-effort; without a synthetic SessionStart the queue
-                // never sees the pane (same as codex/commandcode/cline). Was incorrectly
-                // `false` while the comment claimed state-blind.
-                state_blind: true,
+                // has a turn-end channel (or, for bash, never enters the agent state machine)
+                state_blind: false,
             },
             Harness::Cline => HarnessDescriptor {
                 command: "cline",
@@ -698,19 +695,14 @@ mod tests {
 
     #[test]
     fn state_blind_bit_marks_exactly_the_no_turn_end_harnesses() {
-        // state_blind = NO reliable turn-end in the app's state machine → the pane shows
-        // Working forever after the synthetic SessionStart. Today: commandcode + cline +
-        // opencode + grok. (opencode's auto-loaded plugin is best-effort and was
-        // incorrectly marked state_blind=false, so panes vanished from the ready-event
-        // path.) claude/cursor have lifecycle hooks, codex has the notify override, bash
-        // never enters the agent state machine. Driven off all() so a new variant must
-        // take an explicit position (the descriptor match is closed).
+        // state_blind = NO turn-end signal at all → the pane shows Working forever after
+        // the synthetic SessionStart. Today: commandcode + cline ONLY. claude/cursor have
+        // lifecycle hooks, codex has the notify override, opencode has the auto-loaded
+        // plugin, and bash never enters the agent state machine. Driven off all() so a
+        // new variant must take an explicit position (the descriptor match is closed).
         for h in Harness::all() {
             let d = h.descriptor();
-            let want = matches!(
-                h,
-                Harness::CommandCode | Harness::Cline | Harness::OpenCode | Harness::Grok
-            );
+            let want = matches!(h, Harness::CommandCode | Harness::Cline | Harness::Grok);
             assert_eq!(
                 d.state_blind, want,
                 "{h:?} state_blind must be {want} (wire {:?})",

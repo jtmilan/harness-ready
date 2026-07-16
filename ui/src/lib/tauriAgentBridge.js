@@ -353,18 +353,6 @@ export class TauriAgentBridge {
     this._saveSpawned();
   }
 
-  // Early-death auto-respawn (backend arm_early_death_respawn): same pane id, brand-new PTY.
-  // Reset the delta cursor + scrollback + gen so AgentPane RIS-rewrites, and clear dead flags.
-  onEarlyRespawn(id) {
-    if (!id) return;
-    this.offsets[id] = 0;
-    this.raw[id] = "";
-    this.gen[id] = (this.gen[id] || 0) + 1;
-    this.dead.delete(id);
-    this.deadLocal.delete(id);
-    this._poll();
-  }
-
   sendInput(id, text) { return invoke("send_input", { id, data: text + "\n" }); }
   // Raw keystrokes from the xterm terminal — sent verbatim (NO trailing newline; the
   // terminal already includes \r etc.). Distinct from sendInput's line-submit path.
