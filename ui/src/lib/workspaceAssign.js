@@ -5,39 +5,101 @@
 // been moved to, which is exactly what makes cross-workspace move possible:
 // reassigning a pane's wsId relocates it.
 //
-// DEFAULT-BUCKET RULE: a pane with NO entry here belongs to the "default bucket"
-// -- the first/active workspace the caller names via `defaultWsId`. That way a
-// fresh fleet (nothing assigned yet) stays fully visible under the active tab
-// and no pane can silently disappear. See `paneIdsForWorkspace`.
+// DEFAULT-BUCKET RULE (load-bearing — BUG-3 / Home spawn path + paneIdsForWorkspace):
+// a pane with NO entry here belongs to the "default bucket" — the first/active
+// workspace the caller names via `defaultWsId`. Spawned panes stay unassigned
+// until Home pins them with assignMany; until then they still render under
+// defaultWsId so nothing silently disappears from the active tab. Do not "fix"
+// unassigned panes by auto-assigning at write time; absence IS the default bucket.
+//
+// Subscription + cross-window sync mirror paneLabels.js: in-memory map replaced
+// (never mutated) on write, one notify per mutation, `storage` re-reads peers.
 const KEY = "acc-workspace-assign";
 
-/**
- * Current pane->workspace map.
- * @returns {Record<string, string>} paneId -> wsId ({} if empty or corrupt).
- */
-export function getAssignment() {
+/** @type {Record<string, string>} paneId -> wsId. Replaced (never mutated) on write. */
+let assignment = load();
+const listeners = new Set();
+
+function load() {
   try {
+    if (typeof localStorage === "undefined") return {};
     const saved = JSON.parse(localStorage.getItem(KEY));
     if (saved && typeof saved === "object" && !Array.isArray(saved)) return saved;
   } catch {
-    /* fall through to empty map */
+    /* unreadable / corrupt / private mode / node — fall through to empty map */
   }
   return {};
 }
 
-function persist(map) {
-  localStorage.setItem(KEY, JSON.stringify(map));
+function persist() {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(KEY, JSON.stringify(assignment));
+  } catch {
+    /* quota or private mode: the in-memory map still holds for this session */
+  }
+}
+
+function notify() {
+  for (const fn of [...listeners]) fn();
 }
 
 /**
- * Assign (or re-assign) a pane to a workspace. Idempotent.
+ * Subscribe to assignment-map changes (this window's writes + peer-window storage).
+ * @param {() => void} fn
+ * @returns {() => void} unsubscribe
+ */
+export function subscribe(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+// Cross-window sync: `storage` fires in *other* documents that share this origin when
+// localStorage changes. The writing window already has the new map in memory and has
+// notified its own listeners; this path only reloads + wakes peers so two windows do
+// not silently diverge. Guarded for vitest/node (no window / no localStorage).
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (e.key !== KEY && e.key !== null) return;
+    assignment = load();
+    notify();
+  });
+}
+
+/**
+ * Current pane->workspace map.
+ * Returns a shallow copy so callers cannot mutate module state by accident.
+ * @returns {Record<string, string>} paneId -> wsId ({} if empty or corrupt).
+ */
+export function getAssignment() {
+  return { ...assignment };
+}
+
+/**
+ * Assign (or re-assign) a pane to a workspace. Idempotent write (always persists + notifies).
  * @param {string} paneId
  * @param {string} wsId
  */
 export function assign(paneId, wsId) {
-  const map = getAssignment();
-  map[paneId] = wsId;
-  persist(map);
+  assignment = { ...assignment, [paneId]: wsId };
+  persist();
+  notify();
+}
+
+/**
+ * Assign many panes to one workspace in a single storage write and a single notify.
+ * Semantics match N× assign(paneId, wsId) for the map contents; empty/null paneIds is a
+ * no-op (no write, no notify).
+ * @param {string[]|null|undefined} paneIds
+ * @param {string} wsId
+ */
+export function assignMany(paneIds, wsId) {
+  if (!paneIds || paneIds.length === 0) return;
+  const map = { ...assignment };
+  for (const id of paneIds) map[id] = wsId;
+  assignment = map;
+  persist();
+  notify();
 }
 
 /**
@@ -45,11 +107,33 @@ export function assign(paneId, wsId) {
  * @param {string} paneId
  */
 export function unassign(paneId) {
-  const map = getAssignment();
-  if (paneId in map) {
-    delete map[paneId];
-    persist(map);
+  if (!(paneId in assignment)) return;
+  const map = { ...assignment };
+  delete map[paneId];
+  assignment = map;
+  persist();
+  notify();
+}
+
+/**
+ * Drop every pane assignment pointing at `wsId` (used when a workspace is
+ * deleted so the map holds no stale entries for a tab that no longer exists).
+ * Mutates module state the same way as `unassign` (replace map + persist + notify).
+ * @param {string} wsId
+ */
+export function unassignWorkspace(wsId) {
+  let changed = false;
+  const map = { ...assignment };
+  for (const paneId of Object.keys(map)) {
+    if (map[paneId] === wsId) {
+      delete map[paneId];
+      changed = true;
+    }
   }
+  if (!changed) return;
+  assignment = map;
+  persist();
+  notify();
 }
 
 /**
@@ -67,7 +151,7 @@ export function unassign(paneId) {
  * @returns {string[]} pane ids belonging to `wsId`
  */
 export function paneIdsForWorkspace(wsId, allIds, defaultWsId = null) {
-  const map = getAssignment();
+  const map = assignment;
   return allIds.filter((id) => {
     const assigned = map[id];
     return assigned ? assigned === wsId : wsId === defaultWsId;

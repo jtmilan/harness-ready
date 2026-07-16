@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Launch Harness Ready (standalone) in dev. Fully isolated from ~/Personal/agent-teams:
 #   - identifier com.jeffrymilan.harnessready.dev (tauri.dev.conf.json)
-#   - AGENT_TEAMS_STATE_DIR → harness-ready's OWN state dir. The default state root is the
-#     hardcoded ".../agent-teams" name (core is not yet rebranded), so this override is MANDATORY:
-#     without it, Harness Ready shares the socket + live registry with agent-teams and its startup
-#     can wipe/reap the other app's fleet. Passed EXPLICITLY (a stale inherited value would defeat
+#   - AGENT_TEAMS_STATE_DIR → this dev run's OWN state dir. The default state root is now
+#     fork-private (~/Library/Application Support/harness-ready/agent-teams — isolated from
+#     production agent-teams), but a dev run must ALSO not share the socket + live registry
+#     siblings (which land in the state dir's PARENT) with the INSTALLED fork app — so nest
+#     under harness-ready-dev/. Passed EXPLICITLY (a stale inherited value would defeat
 #     a ${VAR:-default} fallback — that env-leak reaped a fleet before).
 set -euo pipefail
 cd "$(dirname "$0")/../app"
 
-export AGENT_TEAMS_STATE_DIR="$HOME/Library/Application Support/harness-ready/state"
+export AGENT_TEAMS_STATE_DIR="$HOME/Library/Application Support/harness-ready-dev/state"
 mkdir -p "$AGENT_TEAMS_STATE_DIR"
 
 echo "[harness-ready] identifier : com.jeffrymilan.harnessready.dev"

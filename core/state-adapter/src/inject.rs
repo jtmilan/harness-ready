@@ -332,15 +332,16 @@ pub fn inject_commandcode_mcp(
 /// root here: `<cline_home>/data/settings/cline_mcp_settings.json`.
 ///
 /// `--config` relocates cline's ENTIRE `data/` tree, including `providers.json` (the OAuth token).
-/// An un-seeded root → the pane is `Unauthorized`. So we copy `providers.json` (+ `cli-notices.json`
-/// to suppress the first-run notice) from the user's real `~/.cline` on every spawn. The token is
-/// short-lived (~1h, refreshes only in the live file) → re-seeding each spawn keeps a fresh-enough
-/// copy; a very long-idle pane may need re-auth (acceptable, documented).
+/// An un-seeded root → the pane is `Unauthorized` with no useful UI. So we copy `providers.json`
+/// (+ `cli-notices.json` to suppress the first-run notice) from the user's real `~/.cline` on
+/// **every** spawn (overwrite → freshest live token; OAuth is short-lived ~1h and only refreshes
+/// in `~/.cline`). After seed we **verify** the per-pane `providers.json` exists and is non-empty;
+/// on failure we return a clear `Err` so the supervisor can fall back to plain `~/.cline` (no
+/// `--config`) instead of leaving a silent Unauthorized pane. std-only.
 ///
 /// Schema is cline's **transport-nested** shape (`mcpServers.<n>.transport.{type,command,args}`),
 /// NOT the flat `{command,args}` of the commandcode/cursor templates — see `cline-mcp.tmpl.json`.
-/// SAME provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE). Best-effort auth seed: a
-/// missing source file logs + continues (the MCP entry still lists; only auth degrades). std-only.
+/// SAME provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE).
 pub fn inject_cline_mcp(
     cline_home: &Path, // per-pane config ROOT (a state SIBLING — survives the state_root wipe)
     user_cline_home: &Path, // the user's real ~/.cline (source of providers.json / cli-notices.json)
@@ -354,15 +355,62 @@ pub fn inject_cline_mcp(
     let settings_dir = cline_home.join("data").join("settings");
     fs::create_dir_all(&settings_dir)?;
 
-    // Seed auth + first-run state from the user's real ~/.cline so a `--config`-relocated root is
-    // not Unauthorized. Best-effort: a missing source is fine (only auth degrades, MCP still lists).
+    // Seed auth + first-run state from the user's real ~/.cline FIRST (before MCP write) so a
+    // failed seed never leaves a --config root that would open Unauthorized. Always overwrite
+    // so a re-spawn picks up the freshest token from the live ~/.cline file.
     let user_settings = user_cline_home.join("data").join("settings");
     for name in ["providers.json", "cli-notices.json"] {
         let src = user_settings.join(name);
         if src.is_file() {
-            if let Err(e) = fs::copy(&src, settings_dir.join(name)) {
-                eprintln!("[agent-teams] cline auth-seed copy of {name} failed (pane may be unauthorized): {e}");
-            }
+            fs::copy(&src, settings_dir.join(name)).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cline auth seed: copy of {name} from {} failed: {e}",
+                        src.display()
+                    ),
+                )
+            })?;
+        }
+    }
+
+    // Hard gate: per-pane providers.json must exist and be non-empty. A missing/empty seed is
+    // the Unauthorized footgun — return Err with a clear message (supervisor surfaces it and
+    // falls back to no --config / plain ~/.cline).
+    let providers_dst = settings_dir.join("providers.json");
+    let providers_src = user_settings.join("providers.json");
+    match fs::metadata(&providers_dst) {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cline auth seed: providers.json is empty at {} (source {}); \
+                     cannot use --config root (would be Unauthorized)",
+                    providers_dst.display(),
+                    providers_src.display()
+                ),
+            ));
+        }
+        Err(_) if !providers_src.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "cline auth seed: {} missing; cannot seed per-pane auth \
+                     (would be Unauthorized under --config)",
+                    providers_src.display()
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "cline auth seed: providers.json missing at {} after copy from {}: {e}",
+                    providers_dst.display(),
+                    providers_src.display()
+                ),
+            ));
         }
     }
 
@@ -886,10 +934,27 @@ mod mcp_tests {
         );
         assert!(cline_home.join("data/settings/cli-notices.json").is_file());
 
-        // best-effort auth seed: a MISSING user providers.json must NOT fail the inject (the MCP
-        // entry still lists; only auth degrades). Re-run against an empty user home.
+        // Re-seed overwrites with the freshest user token (stale per-pane copy must not stick).
+        fs::write(user_settings.join("providers.json"), r#"{"token":"fresh"}"#).unwrap();
+        inject_cline_mcp(
+            &cline_home,
+            &user_home,
+            &staged,
+            &sidecar,
+            &state,
+            "ws-cl-p0",
+            "ws-cl",
+        )
+        .expect("re-seed");
+        assert_eq!(
+            fs::read_to_string(cline_home.join("data/settings/providers.json")).unwrap(),
+            r#"{"token":"fresh"}"#
+        );
+
+        // Hard gate: MISSING user providers.json must FAIL inject (clear Err) so the supervisor
+        // can fall back to no --config instead of a silent Unauthorized pane.
         let empty_user = root.join("empty-user");
-        let again = inject_cline_mcp(
+        let err = inject_cline_mcp(
             &root.join("cline-homes/ws-cl-p1"),
             &empty_user,
             &staged,
@@ -898,10 +963,39 @@ mod mcp_tests {
             "ws-cl-p1",
             "ws-cl",
         )
-        .expect("inject cline tolerates a missing user ~/.cline");
+        .expect_err("inject cline must fail without a seedable providers.json");
+        let msg = err.to_string();
         assert!(
-            again.is_file(),
-            "settings still written without an auth source"
+            msg.contains("auth seed") || msg.contains("providers.json"),
+            "error must name the auth-seed failure: {msg}"
+        );
+        // MCP settings must NOT be written when auth seed fails (failed early, before template write).
+        assert!(
+            !root
+                .join("cline-homes/ws-cl-p1/data/settings/cline_mcp_settings.json")
+                .exists(),
+            "must not write MCP settings after a failed auth seed"
+        );
+
+        // Empty providers.json source also fails the hard gate.
+        let empty_token_user = root.join("empty-token-user");
+        let empty_token_settings = empty_token_user.join("data/settings");
+        fs::create_dir_all(&empty_token_settings).unwrap();
+        fs::write(empty_token_settings.join("providers.json"), "").unwrap();
+        let err_empty = inject_cline_mcp(
+            &root.join("cline-homes/ws-cl-p2"),
+            &empty_token_user,
+            &staged,
+            &sidecar,
+            &state,
+            "ws-cl-p2",
+            "ws-cl",
+        )
+        .expect_err("empty providers.json must fail inject");
+        assert!(
+            err_empty.to_string().contains("empty")
+                || err_empty.to_string().contains("providers.json"),
+            "error must mention empty/providers: {err_empty}"
         );
 
         let _ = fs::remove_dir_all(&root);

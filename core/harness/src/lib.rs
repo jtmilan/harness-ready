@@ -91,6 +91,13 @@ pub enum Harness {
     /// its built-in autonomous-commit posture. ALL headless cline behavior is UNVERIFIED.
     /// Resume (`--id`)/MCP/role persona = deferred.
     Cline,
+    /// Grok CLI (`grok` binary — xAI's "Grok Build TUI"). Spawnable interactive
+    /// TUI via bare `grok`; like codex/opencode/cline it has NO hook mechanism
+    /// today → `inject: None` → STATE-BLIND (no who-needs-you queue report).
+    /// Headless worker mode is `grok agent --cwd <cwd> [-m model] <positional-prompt>`
+    /// (see `worker_spawn`). ALL headless grok behavior is UNVERIFIED.
+    /// Resume/MCP/role persona = deferred.
+    Grok,
 }
 
 /// The data-driven, per-variant facts about a harness (Phase 2 / preset-wizard
@@ -211,12 +218,25 @@ impl Harness {
                 // NO turn-end signal → perpetual Working after the synthetic SessionStart
                 state_blind: true,
             },
+            Harness::Grok => HarnessDescriptor {
+                command: "grok",
+                // State-blind like codex/opencode/cline (no hooks). Bare `grok` opens the
+                // interactive TUI; no startup-suppression flags needed for the TUI spawn
+                // (the headless WORKER path uses `grok agent --cwd <cwd> ...`, built in
+                // `worker_spawn`, not here).
+                inject: None,
+                wire: "grok",
+                display: "Grok Build",
+                spawn_args: &[],
+                // NO turn-end signal -> perpetual Working after the synthetic SessionStart
+                state_blind: true,
+            },
         }
     }
 
     /// All variants — for enumerating in the harness catalog / wizard UI and for a
     /// table-driven `parse_harness` (no per-variant arm to forget).
-    pub fn all() -> [Harness; 7] {
+    pub fn all() -> [Harness; 8] {
         [
             Harness::Claude,
             Harness::Cursor,
@@ -225,6 +245,7 @@ impl Harness {
             Harness::CommandCode,
             Harness::OpenCode,
             Harness::Cline,
+            Harness::Grok,
         ]
     }
 
@@ -264,7 +285,8 @@ pub fn supports_end_of_options(h: Harness) -> bool {
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline => false,
+        | Harness::Cline
+        | Harness::Grok => false,
     }
 }
 
@@ -580,6 +602,23 @@ pub fn worker_spawn(
                 prompt_via_stdin: false,
             }
         }
+        // UNVERIFIED: mirror the cline positional shape (`--cwd <cwd>` + trailing positional prompt).
+        // `grok agent` is the headless subcommand; `grok --cwd` redirects the interactive TUI's cwd.
+        // For headless worker mode, use `grok agent --cwd <cwd> [-m model] <positional-prompt>`.
+        // grok has a path sandbox (`--sandbox`), so extra_dirs are NOT wired through here.
+        Harness::Grok => {
+            let mut args: Vec<String> =
+                vec!["agent".into(), "--cwd".into(), cwd.to_string_lossy().into_owned()];
+            if let Some(m) = &m {
+                args.push("-m".into());
+                args.push(m.clone());
+            }
+            WorkerSpawn {
+                program: "grok".into(),
+                args,
+                prompt_via_stdin: false,
+            }
+        }
         Harness::Bash => {
             // bash is NOT an agentic worker (no model, no edit loop). The flywheel UI must not
             // offer it; if one slips through, this no-op exits cleanly (the controller's
@@ -615,15 +654,16 @@ mod tests {
                 Harness::CommandCode => 4,
                 Harness::OpenCode => 5,
                 Harness::Cline => 6,
+                Harness::Grok => 7,
             }
         }
         let all = Harness::all();
         assert_eq!(
             all.len(),
-            7,
+            8,
             "all() size must equal the Harness variant count"
         );
-        let mut seen = [0u32; 7];
+        let mut seen = [0u32; 8];
         for h in all {
             seen[tag(h)] += 1;
         }
@@ -662,7 +702,7 @@ mod tests {
         // new variant must take an explicit position (the descriptor match is closed).
         for h in Harness::all() {
             let d = h.descriptor();
-            let want = matches!(h, Harness::CommandCode | Harness::Cline);
+            let want = matches!(h, Harness::CommandCode | Harness::Cline | Harness::Grok);
             assert_eq!(
                 d.state_blind, want,
                 "{h:?} state_blind must be {want} (wire {:?})",
@@ -880,6 +920,12 @@ mod tests {
                 "cline",
                 "anthropic/claude-sonnet-4",
                 &["-c"],
+            ),
+            (
+                Harness::Grok,
+                "grok",
+                "xai/grok-3.5",
+                &["agent", "--cwd"],
             ),
         ];
         for (h, prog, model, must_have) in cases {

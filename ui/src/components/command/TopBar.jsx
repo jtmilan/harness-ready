@@ -1,21 +1,12 @@
 import React from "react";
-import { Megaphone, Network, Play, Pause, Square, FastForward, LayoutTemplate, Plus, Power } from "lucide-react";
+import { Megaphone, Network, Radio, LayoutTemplate, Plus, Power } from "lucide-react";
 
-const PlayBtn = ({ icon: Icon, onClick, active, title }) => (
-  <button
-    onClick={onClick}
-    title={title}
-    className={`w-9 h-9 flex items-center justify-center border transition-all duration-150 ${
-      active
-        ? "border-cyan-400 text-cyan-300 bg-cyan-400/10 shadow-[0_0_10px_rgba(0,229,255,0.35)]"
-        : "border-cyan-900 text-cyan-700 hover:border-cyan-500 hover:text-cyan-300"
-    }`}
-  >
-    <Icon className="w-4 h-4" fill={active ? "currentColor" : "none"} />
-  </button>
-);
-
-export default function TopBar({ activeCount, running, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace, onPlay, onPause, onStop, onSkip }) {
+// `broadcastActive` / `onBroadcastToggle` drive the ⌘⇧I broadcast TOGGLE (every keystroke
+// mirrors live into all panes) — state lives with the caller, not here. Distinct from
+// `onBroadcast`, which opens the one-shot "send this text once" prompt.
+// Fleet Pause/Stop/Skip (playmode cluster) removed: Pause was local-only state, Stop was
+// an unconfirmed closeWorkspace duplicate of CLOSE WORKSPACE, Skip was a no-op stub.
+export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace }) {
   return (
     <div className="flex items-center gap-6 px-5 py-4 border-b border-cyan-900/60 bg-[#0A0E13]">
       <button
@@ -26,9 +17,24 @@ export default function TopBar({ activeCount, running, onNewAgent, onBroadcast, 
       </button>
       <button
         onClick={onBroadcast}
+        title="Broadcast (⌘⇧I)"
         className="flex items-center gap-2 px-5 py-2.5 border border-cyan-800 text-cyan-500 font-heading tracking-[0.2em] text-sm font-bold hover:border-cyan-400 hover:text-cyan-300 transition-colors"
       >
         <Megaphone className="w-4 h-4" /> BROADCAST
+      </button>
+      <button
+        onClick={onBroadcastToggle}
+        title="Broadcast typing to all panes (⌘⇧I)"
+        aria-label="Broadcast typing to all panes"
+        aria-pressed={!!broadcastActive}
+        className={`flex items-center gap-2 px-3 py-2.5 border transition-colors ${
+          broadcastActive
+            ? "border-cyan-400 text-cyan-300 bg-cyan-400/15 shadow-[0_0_14px_rgba(0,229,255,0.3)]"
+            : "border-cyan-800 text-cyan-600 hover:border-cyan-400 hover:text-cyan-300"
+        }`}
+      >
+        <Radio className="w-4 h-4" />
+        <kbd className="px-1.5 py-0.5 border border-cyan-800/60 text-[10px] font-mono leading-none">⌘⇧I</kbd>
       </button>
       <button
         onClick={onDelegate}
@@ -42,16 +48,6 @@ export default function TopBar({ activeCount, running, onNewAgent, onBroadcast, 
       >
         <LayoutTemplate className="w-4 h-4" /> TEMPLATES
       </button>
-      <div className="h-8 w-px bg-cyan-900/60" />
-      <div className="flex flex-col items-center gap-1.5">
-        <span className="text-[10px] font-heading tracking-[0.3em] text-cyan-600 font-bold">PLAYMODE CONTROLS</span>
-        <div className="flex gap-2">
-          <PlayBtn icon={Play} onClick={onPlay} active={running} title="Resume all" />
-          <PlayBtn icon={Pause} onClick={onPause} title="Pause all" />
-          <PlayBtn icon={Square} onClick={onStop} title="Stop all" />
-          <PlayBtn icon={FastForward} onClick={onSkip} title="Advance starting agents" />
-        </div>
-      </div>
       <div className="ml-auto flex items-center gap-5">
         <div className="font-heading tracking-[0.2em] text-lg font-bold text-cyan-300">
           ACTIVE AGENTS: <span className="text-cyan-200">{activeCount}</span>

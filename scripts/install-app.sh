@@ -12,7 +12,7 @@
 #   bash scripts/install-app.sh --build    # `bun tauri build` first, then install
 #   bash scripts/install-app.sh --live     # build WITH the `delegate-live` feature (autonomous
 #                                          #   workers + flywheel + §6-v2 remediation), then install
-#   bash scripts/install-app.sh --testing  # install a SEPARATE "Agent Teams Dev" app (own bundle id
+#   bash scripts/install-app.sh --testing  # install a SEPARATE "Harness Ready Dev" app (own bundle id
 #                                          #   + isolated state dir) ALONGSIDE the stable one — a dev
 #                                          #   sandbox to bounce per-commit without touching the app
 #                                          #   you use. Implies --live. Quits/relaunches only the dev app.
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Agent Teams"          # build-output bundle name (always — tauri.conf productName)
+APP_NAME="Harness Ready"        # build-output bundle name (always — tauri.conf productName)
 SRC="$REPO/app/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 
 DO_BUILD=0
@@ -42,17 +42,33 @@ for arg in "$@"; do
   esac
 done
 
-# --testing installs a SEPARATE "Agent Teams Dev" app: a distinct bundle id (so it coexists with
+# Harness Ready fork guard: NEVER honor a leaked PRODUCTION state dir. Shells and
+# panes descended from the production Agent Teams app inherit AGENT_TEAMS_STATE_DIR
+# pointing at prod's state root (documented env-leak footgun). Honoring it here
+# would write this fork's dev-updater pointer (and, if the gated daemon were armed,
+# its socket path) into PROD's state siblings — poisoning the prod app's "Update
+# Now" into dittoing THIS fork's bundle over /Applications/Agent Teams.app. Accept
+# an override only when it clearly targets this fork's state tree.
+if [[ -n "${AGENT_TEAMS_STATE_DIR:-}" && "${AGENT_TEAMS_STATE_DIR}" != *"harness-ready"* ]]; then
+  echo "WARN: ignoring inherited AGENT_TEAMS_STATE_DIR='$AGENT_TEAMS_STATE_DIR'" >&2
+  echo "      (not a harness-ready path — likely leaked from the production Agent Teams" >&2
+  echo "      environment); falling back to this fork's default state root." >&2
+  unset AGENT_TEAMS_STATE_DIR
+fi
+
+# --testing installs a SEPARATE "Harness Ready Dev" app: a distinct bundle id (so it coexists with
 # AND runs alongside the stable app) + an isolated AGENT_TEAMS_STATE_DIR baked via Info.plist
-# LSEnvironment. Every sibling dir (runs, events, hooks, MCP socket, ephemeral HTTP port,
-# dev-source) derives from state_root, so this one var sandboxes the whole thing. Shared with the
-# stable app: ONLY mcp-config.json (arming lives at the Application-Support root, keyed off
-# state_root's PARENT — both resolve to the same file).
+# LSEnvironment.
+#
+# CRITICAL: fixed-name siblings (agent-teams-mcp.sock, agent-teams-live.json, mcp-config.json)
+# land in the PARENT of state_root. Nest under harness-ready-dev/ (same as scripts/dev.sh) so
+# Dev never shares sock/registry/config with stable HR (…/harness-ready/agent-teams). A flat
+# …/harness-ready/agent-teams-dev leaf was wrong — both parents were harness-ready/.
 DEST_NAME="$APP_NAME"
 if [[ "$TESTING" == "1" ]]; then
-  DEST_NAME="Agent Teams Dev"
-  DEV_BUNDLE_ID="com.jeffrymilan.agentteams.dev"
-  DEV_STATE_DIR="$HOME/Library/Application Support/agent-teams-dev"
+  DEST_NAME="Harness Ready Dev"
+  DEV_BUNDLE_ID="com.jeffrymilan.harnessready.dev"
+  DEV_STATE_DIR="$HOME/Library/Application Support/harness-ready-dev/state"
 fi
 DEST="/Applications/$DEST_NAME.app"
 
@@ -116,8 +132,10 @@ fi
 
 # Quit ALL running instances first — two instances would collide on the shared
 # app-support state_root + WKWebView localStorage (same bundle id).
-# Quit only the SAME app we're installing over ("Agent Teams" vs "Agent Teams Dev" are distinct
-# bundle ids with isolated state — a --testing install must NOT kill the stable app, and vice versa).
+# Quit only the SAME app we're installing over ("Harness Ready" vs "Harness Ready Dev" are distinct
+# bundle ids with isolated state — a --testing install must NOT kill the stable app, and vice versa;
+# neither name matches the production "Agent Teams"/"Agent Teams Dev"/"Agent Teams DevTest" apps,
+# which this fork's installer must NEVER quit, kill, or touch).
 echo "==> quitting any running '$DEST_NAME'…"
 osascript -e "quit app \"$DEST_NAME\"" 2>/dev/null || true
 sleep 1
@@ -140,16 +158,16 @@ ditto "$SRC" "$DEST"                       # bundle-correct copy (preserves perm
 if [[ "$TESTING" == "1" ]]; then
   PL="$DEST/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $DEV_BUNDLE_ID" "$PL"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleName Agent Teams Dev" "$PL" 2>/dev/null || true
-  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Agent Teams Dev" "$PL" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Agent Teams Dev" "$PL"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName Harness Ready Dev" "$PL" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Harness Ready Dev" "$PL" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Harness Ready Dev" "$PL"
   /usr/libexec/PlistBuddy -c "Delete :LSEnvironment" "$PL" 2>/dev/null || true
   /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$PL"
   /usr/libexec/PlistBuddy -c "Add :LSEnvironment:AGENT_TEAMS_STATE_DIR string $DEV_STATE_DIR" "$PL"
   echo "==> dev variant: bundle id $DEV_BUNDLE_ID · state $DEV_STATE_DIR"
 fi
 
-# Provision the stable "Agent Teams Dev" code-signing identity if it's absent, so
+# Provision the stable code-signing identity if it's absent, so
 # the preferred-identity branch below actually fires. This closes the c3 cert gap:
 # previously install-app.sh only WARNed and asked the operator to run the cert
 # script by hand, so on any fresh box the identity never existed → it always fell
@@ -165,6 +183,12 @@ echo "==> ensuring stable code-signing identity present…"
 # AGENT_TEAMS_SIGN_IDENTITY override mints AND signs under the same name (the
 # wrapper forwards IDENTITY_NAME to gen-signing-cert.sh). Without this the two
 # would drift — provisioning the default name while signing looks for the override.
+# NOTE (Harness Ready fork): the default identity name "Agent Teams Dev" is kept
+# DELIBERATELY — it is a generic keychain identity inherited from the parent repo
+# that already exists on this machine; reusing it avoids minting a second cert.
+# The TCC Designated Requirement pins cert leaf + BUNDLE ID, and this fork's
+# bundle ids differ from production's, so sharing the cert does not conflate the
+# apps' TCC identities. This string names a keychain cert only — never an app.
 SIGN_IDENTITY="${AGENT_TEAMS_SIGN_IDENTITY:-Agent Teams Dev}"
 IDENTITY_NAME="$SIGN_IDENTITY" bash "$REPO/scripts/ensure-dev-cert.sh" \
   || echo "WARN: identity provisioning failed; will fall back to ad-hoc signing below." >&2
@@ -205,13 +229,13 @@ echo "==> installed v$VER"
 
 # ── Phase 08: daemon LaunchAgent plist install (A1 socket-activation, D45) ──
 #
-# Generates and loads ~/Library/LaunchAgents/com.agent-teams.daemon.plist so the
+# Generates and loads ~/Library/LaunchAgents/com.harness-ready.daemon.plist so the
 # daemon binary is start-on-demand (launchd socket-activation). Key invariants:
 #   RunAtLoad=false  → daemon ONLY starts when a connection arrives on the socket.
 #   KeepAlive=false  → launchd does NOT restart on exit; idle-exit = intentional.
 #   SockPathName     → MUST match agent_teams_core::socket_path(state_root), i.e.
 #                      <state_root-parent>/agent-teams-mcp.sock, the shared UDS.
-#   StandardErrorPath → stable log sink at ~/Library/Logs/agent-teams/daemon.log.
+#   StandardErrorPath → stable log sink at ~/Library/Logs/harness-ready/daemon.log.
 #
 # This section is idempotent: bootout (unload) is best-effort (no-op if absent),
 # then bootstrap (re)loads from the newly-generated plist. A stale plist is
@@ -242,24 +266,31 @@ elif [[ ! -x "$_DAEMON_BINARY" || "${AGENT_TEAMS_DAEMON_LAUNCHAGENT:-0}" != "1" 
   # owed a security review of the live PTY-ownership transfer, design Q4).
   echo "==> daemon LaunchAgent registration gated OFF (set AGENT_TEAMS_DAEMON_LAUNCHAGENT=1 to enable) — skipping"
 else
-  # AGENT_TEAMS_STATE_DIR (default ~/Library/Application Support/agent-teams) IS
+  # AGENT_TEAMS_STATE_DIR (default ~/Library/Application Support/harness-ready/agent-teams) IS
   # state_root — the SAME value the app's default_state_root() (app/src-tauri/src/lib.rs)
   # and the daemon's resolve_state_root() (core/daemon/src/main.rs) both resolve. Do NOT
   # append /agent-teams: that would double-nest state_root and place the socket INSIDE it
   # (the inside path is wiped on every app launch — see state_sibling()).
-  _DAEMON_STATE_ROOT="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}"
+  _DAEMON_STATE_ROOT="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}"
   # Socket path mirrors agent_teams_core::socket_path EXACTLY:
   #   socket_path(state_root) = state_root.parent()/agent-teams-mcp.sock
   # i.e. a SIBLING of state_root, one level up (NOT inside it). This is the same UDS the
   # running app's MCP server binds and the daemon_client dialer reaches.
   _DAEMON_SOCK_PATH="$(dirname "$_DAEMON_STATE_ROOT")/agent-teams-mcp.sock"
-  _DAEMON_LABEL="com.agent-teams.daemon"
+  # Harness Ready fork: label + log dir are FORK-PRIVATE. Production Agent Teams
+  # registers ~/Library/LaunchAgents/com.agent-teams.daemon.plist — reusing that
+  # label here would bootout/overwrite the PRODUCTION plist. The socket filename
+  # (agent-teams-mcp.sock) stays: it is the agent_teams_core::socket_path SSOT and
+  # already isolated by the fork-private state root's parent (harness-ready/).
+  _DAEMON_LABEL="com.harness-ready.daemon"
   _DAEMON_PLIST_DIR="$HOME/Library/LaunchAgents"
   _DAEMON_PLIST="$_DAEMON_PLIST_DIR/$_DAEMON_LABEL.plist"
-  _DAEMON_LOG_DIR="$HOME/Library/Logs/agent-teams"
+  _DAEMON_LOG_DIR="$HOME/Library/Logs/harness-ready"
   _DAEMON_LOG="$_DAEMON_LOG_DIR/daemon.log"
 
-  mkdir -p "$_DAEMON_PLIST_DIR" "$_DAEMON_LOG_DIR"
+  # The socket's parent (state_root's parent, …/harness-ready/) is NOT pre-existing the way
+  # Application Support/ is — launchd needs it present to bind SockPathName.
+  mkdir -p "$_DAEMON_PLIST_DIR" "$_DAEMON_LOG_DIR" "$(dirname "$_DAEMON_SOCK_PATH")"
 
   echo "==> installing daemon LaunchAgent plist (D45 A1 socket-activation)…"
   cat > "$_DAEMON_PLIST" <<DAEMON_PLIST_EOF
@@ -323,7 +354,7 @@ fi
 if [[ "$TESTING" == "1" ]]; then
   STATE_DIR="$DEV_STATE_DIR"
 else
-  STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}"
+  STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}"
 fi
 DEV_SOURCE="$(dirname "$STATE_DIR")/$(basename "$STATE_DIR")-dev-source"
 mkdir -p "$(dirname "$DEV_SOURCE")"

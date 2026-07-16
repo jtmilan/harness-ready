@@ -47,7 +47,7 @@ fn resolve_state_root() -> std::path::PathBuf {
         return std::path::PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home).join("Library/Application Support/agent-teams")
+    std::path::PathBuf::from(home).join("Library/Application Support/harness-ready/agent-teams")
 }
 
 fn main() {

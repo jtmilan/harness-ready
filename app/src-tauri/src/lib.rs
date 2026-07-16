@@ -107,10 +107,12 @@ struct AppState {
     // (Esc on EVERY write would interrupt claude mid-generation — Esc is its interrupt key).
     // Cleared on (re)spawn so a fresh pane at the same id re-primes.
     claude_primed: Mutex<std::collections::HashSet<String>>,
-    // Pane ids that already spent their ONE early-death auto-respawn (the sporadic
+    // Pane id → how many early-death auto-respawns already used (the sporadic
     // opencode/Bun startup-segfault class — see arm_early_death_respawn). Per app run,
-    // never cleared: a second startup death stays an honest dead pane, no crash-loop.
-    early_respawned: Mutex<std::collections::HashSet<String>>,
+    // never cleared: once the per-harness budget is spent, further early deaths stay
+    // an honest dead pane (frontend notified via pane-early-respawn), no crash-loop.
+    // Budget: opencode = 2 retries (Bun:ffi is flakier); every other harness = 1.
+    early_respawned: Mutex<std::collections::HashMap<String, u8>>,
     // Handle back to the app, for detached lifecycle threads (the early-death watcher
     // needs `.state::<AppState>()` + `emit` after `do_spawn`'s `&AppState` borrow ends).
     // OnceLock (seeded in setup) so unit tests can build an AppState without a running
@@ -173,8 +175,10 @@ struct AppState {
     // by the rewrite → that worktree leaks on the next crash. do_spawn runs on command
     // threads + the HUD tick; the delegate controller runs on a detached thread — they CAN
     // overlap, so every registry_add/registry_remove pair takes this guard (P1 review HIGH
-    // follow-up; same class as live_registry_lock above, different file).
-    worktree_registry_lock: Mutex<()>,
+    // follow-up; same class as live_registry_lock above, different file). Arc so the
+    // close path's DETACHED disk-cleanup thread (see `pending_cleanups`) can hold the
+    // same guard while it rewrites the registry after the slow worktree removal.
+    worktree_registry_lock: std::sync::Arc<Mutex<()>>,
     // Plan 05-04 (voice INPUT): push-to-talk mic capture. The cpal input `Stream` is
     // `!Send`, so it can NEVER live in this (Send+Sync) struct — it stays thread-local
     // on a dedicated capture thread (see `start_dictation`). AppState holds only the
@@ -188,6 +192,14 @@ struct AppState {
     // are tiny (`Arc<Mutex<()>>`) keyed by pane id; ids from closed panes are bounded by the
     // session's pane count and cost bytes, so no eviction pass is needed.
     pane_write_locks: Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>,
+    // Per-pane id → in-flight DISK-CLEANUP lock for the close path. `close_workspace`
+    // returns as soon as the PTY child is dead and moves the slow cleanup (git worktree
+    // remove + branch -D + state-dir delete — seconds to ~15s on a big tree) onto a
+    // detached thread that holds this entry's lock for the whole cleanup. A same-id
+    // respawn (`do_spawn`) waits on the entry before `add_worktree`, so a reopen can
+    // never reuse a worktree that is mid-deletion. Arc'd so the cleanup thread can
+    // drop its own entry when done (ptr-guarded) — the map stays bounded.
+    pending_cleanups: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>>,
     // 06-02 Phase-B HTTP transport (DRAFT): the LIVE bound port of the loopback-HTTP
     // listener, set when `spawn_http_listener` binds (None if http_enabled=false or the
     // bind failed). mcp_http_status reports this — it's the source of truth for
@@ -754,6 +766,9 @@ async fn list_harness_models(harness: String) -> serde_json::Value {
             // generic probe risks the codex-style billed trap) → fallback tiles until one is
             // verified. Explicit arm so a reader doesn't mistake it for an oversight.
             Some(Harness::Cline) => None,
+            // grok: no verified credit-free list command (model flag AMBIGUOUS / unverified) →
+            // fallback tiles until one is verified. Explicit arm (LAST, after cline).
+            Some(Harness::Grok) => None,
             // claude (no list command — it's a billed trap), bash (no model), unknown wire.
             Some(Harness::Claude) | Some(Harness::Bash) | None => None,
         }
@@ -1425,6 +1440,18 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
         ));
     }
     let repo_path = PathBuf::from(&ps.repo);
+    // A prior close of THIS id may still be deleting its worktree on the detached
+    // cleanup thread (`close_workspace`) — wait for it (lock+drop) before add_worktree,
+    // or the reopen would "reuse" a tree that vanishes under the fresh pane.
+    let pending = state
+        .pending_cleanups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&ps.id)
+        .cloned();
+    if let Some(l) = pending {
+        drop(l.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
     // isolate in a (sparse-scoped) worktree; fall back to the folder itself if
     // it's not inside a git repo. On reopen this reuses an existing worktree dir.
     let wt = add_worktree(&repo_path, &ps.id).ok();
@@ -1515,9 +1542,9 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
                     do_resume = false; // → session_args = [] (fresh chat)
                 }
             }
-            // bash + codex + commandcode + opencode + cline never resume (session_args is
+            // bash + codex + commandcode + opencode + cline + grok never resume (session_args is
             // always [] for them) → no safety-net downgrade needed; a fresh spawn is the only path.
-            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline => {}
+            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline | Harness::Grok => {}
         }
     }
 
@@ -1635,24 +1662,45 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
 /// How long after spawn a harness death counts as a STARTUP crash (auto-respawn window).
 const EARLY_DEATH_WINDOW_SECS: u64 = 10;
 
-/// True exactly ONCE per pane id: records the id in the spent-retry set and reports
-/// whether this call was the first use. Pure over the set (poison-tolerated) so the
-/// one-retry-no-crash-loop invariant is unit-testable without threads/PTYs.
-fn early_respawn_first_use(seen: &Mutex<std::collections::HashSet<String>>, id: &str) -> bool {
-    seen.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(id.to_string())
+/// How many early-death auto-respawns a harness may consume per pane id per app run.
+/// opencode gets 2 (sporadic Bun:ffi OpenTUI startup segfault is flakier); others get 1.
+fn early_respawn_budget(harness: &str) -> u8 {
+    if harness == "opencode" {
+        2
+    } else {
+        1
+    }
+}
+
+/// Record one early-death retry attempt for `id`. Returns `true` when a respawn is still
+/// within budget (`used < budget` before this call). Pure over the map (poison-tolerated)
+/// so the budget/no-crash-loop invariant is unit-testable without threads/PTYs.
+fn early_respawn_try(
+    seen: &Mutex<std::collections::HashMap<String, u8>>,
+    id: &str,
+    budget: u8,
+) -> bool {
+    let mut g = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let used = g.entry(id.to_string()).or_insert(0);
+    if *used >= budget {
+        return false;
+    }
+    *used = used.saturating_add(1);
+    true
 }
 
 /// Watch a freshly spawned pane for [`EARLY_DEATH_WINDOW_SECS`]; if its harness process
 /// dies inside the window (a startup crash — e.g. the sporadic opencode/Bun segfault in
-/// OpenTUI's native renderer), respawn the SAME [`PendingSpawn`] spec ONCE per pane id
-/// per app run, then notify the frontend (`pane-early-respawn` — it resets the terminal
-/// cursor and toasts). A second early death is left alone: honest dead pane, never a
-/// crash-loop. Detached thread per spawn, exits within the window; a pane that was
+/// OpenTUI's native renderer), respawn the SAME [`PendingSpawn`] spec up to the
+/// per-harness budget ([`early_respawn_budget`]) per pane id per app run, then notify
+/// the frontend (`pane-early-respawn` — it resets the terminal cursor and toasts). When
+/// the budget is spent, emit a final failure event (honest dead pane) and never crash-
+/// loop. Detached thread per spawn, exits within the window; a pane that was
 /// closed/replaced (id absent from `sups`) ends the watch immediately. The respawn goes
 /// straight through `do_spawn` (run_now-style force-admit — it occupies the same slot
-/// the crashed pane just freed).
+/// the crashed pane just freed; `do_spawn` re-arms this watcher for the next window).
 fn arm_early_death_respawn(app: tauri::AppHandle, ps: PendingSpawn) {
     std::thread::spawn(move || {
         for _ in 0..EARLY_DEATH_WINDOW_SECS {
@@ -1661,8 +1709,25 @@ fn arm_early_death_respawn(app: tauri::AppHandle, ps: PendingSpawn) {
             match st.sups.with_mut(&ps.id, |s| s.is_alive()) {
                 Some(true) => {} // still running — keep watching
                 Some(false) => {
-                    if !early_respawn_first_use(&st.early_respawned, &ps.id) {
-                        return; // this pane's one retry is already spent
+                    let budget = early_respawn_budget(&ps.harness);
+                    if !early_respawn_try(&st.early_respawned, &ps.id, budget) {
+                        // Budget spent — surface a final failure so the pane is not a
+                        // silent blank corpse (frontend pane-early-respawn toast).
+                        let _ = app.emit(
+                            "pane-early-respawn",
+                            serde_json::json!({
+                                "id": ps.id,
+                                "harness": ps.harness,
+                                "ok": false,
+                                "error": format!(
+                                    "crashed {} times at startup within {}s; giving up after {} auto-respawn(s)",
+                                    budget + 1,
+                                    EARLY_DEATH_WINDOW_SECS,
+                                    budget
+                                ),
+                            }),
+                        );
+                        return;
                     }
                     let outcome = do_spawn(st.inner(), &ps);
                     let _ = app.emit(
@@ -1923,6 +1988,11 @@ fn mcp_http_reveal_token(state: tauri::State<AppState>) -> Result<String, String
 /// (async): `remove_worktree` is a git subprocess + `remove_dir_all` is disk I/O.
 #[tauri::command(async)]
 fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), String> {
+    // Same id contract as spawn_workspace: reject empty / traversal / separators so
+    // `state_root.join(&id)` can never resolve to state_root itself (wipe) or escape it.
+    if !validate_spawn_id(&id) {
+        return Err(format!("invalid pane id for close_workspace: {id:?}"));
+    }
     // Drop the one-shot claude priming flag for this pane id up front, on EVERY close path
     // (local or daemon-owned). It is inserted on a local claude spawn (see `claude_primed`)
     // but was previously never removed on close, so the set grew one id per closed claude
@@ -1952,17 +2022,57 @@ fn close_workspace(state: tauri::State<AppState>, id: String) -> Result<(), Stri
     // Drop this pane's per-pane write lock — otherwise the map grows one entry per distinct pane id
     // over a long high-churn session (thousands of opens/closes) and never shrinks.
     state.pane_write_locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
-    if let Some(Some((git_root, wt_root))) = state.meta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
-        let _ = remove_worktree(&git_root, &id, &wt_root);
-    }
-    {
-        let _g = state.worktree_registry_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry_remove(&state.worktree_registry, &id);
-    }
     // Drop this workspace from the live registry (D37) — it is no longer live, so the
     // sidecar must stop counting it in the app-up set.
     live_registry_update(state.inner(), |ws| ws.retain(|w| w.id != id));
-    let _ = std::fs::remove_dir_all(state.state_root.join(&id));
+    // Slow DISK cleanup (git worktree remove + branch -D + state-dir delete) moves OFF the
+    // close path: the frontend awaits this command before disposing the pane tile, so a big
+    // worktree (node_modules, target/) made every close hang the pane for many seconds. The
+    // PTY is already dead (kill() above is bounded) — everything below is pure disk I/O, so
+    // it runs on a DETACHED thread that holds the per-id `pending_cleanups` entry; a same-id
+    // respawn waits on that entry in `do_spawn` before `add_worktree` (no mid-deletion reuse).
+    // Ordering INSIDE the thread is the pre-existing crash-safe order: worktree removal FIRST,
+    // registry_remove AFTER — a crash mid-cleanup leaves the registry entry, and the next
+    // startup's `sweep_orphan_worktrees` finishes the job (never a silently leaked worktree).
+    let wt_meta = state.meta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+    // Publish a FRESH cleanup lock (never or_default on a leftover entry) so do_spawn's
+    // wait cannot race an unlocked Arc: the cleanup thread must HOLD the lock before we
+    // return Ok(()) — handshake via sync_channel(0). Otherwise spawn could lock-and-drop
+    // a free mutex and add_worktree while remove_worktree still runs.
+    let cleanup_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    {
+        let mut map = state
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(id.clone(), cleanup_lock.clone());
+    }
+    let cleanups = std::sync::Arc::clone(&state.pending_cleanups);
+    let reg_lock = std::sync::Arc::clone(&state.worktree_registry_lock);
+    let registry = state.worktree_registry.clone();
+    let state_dir = state.state_root.join(&id);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    std::thread::spawn(move || {
+        let _busy = cleanup_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Signal that the barrier is held — close_workspace may return; do_spawn will block.
+        let _ = ready_tx.send(());
+        if let Some(Some((git_root, wt_root))) = wt_meta {
+            let _ = remove_worktree(&git_root, &id, &wt_root);
+        }
+        {
+            let _g = reg_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry_remove(&registry, &id);
+        }
+        let _ = std::fs::remove_dir_all(&state_dir);
+        // Self-drain: drop this id's entry, but ONLY if it is still OUR lock — a later
+        // close cycle for a reused id may have minted a fresh entry (never remove theirs).
+        let mut map = cleanups.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(&id).is_some_and(|l| std::sync::Arc::ptr_eq(l, &cleanup_lock)) {
+            map.remove(&id);
+        }
+    });
+    // Block until the cleanup thread holds the per-id lock (or the thread died).
+    let _ = ready_rx.recv();
     Ok(())
 }
 
@@ -2293,17 +2403,21 @@ fn set_pane_roles(state: tauri::State<AppState>, roles: Vec<(String, String)>) -
 #[tauri::command]
 fn resize_pty(state: tauri::State<AppState>, id: String, rows: u16, cols: u16) -> Result<(), String> {
     // F1 (Q4 Stage-4): resize-over-wire for a Daemon-owned pane is DEFERRED (there is NO
-    // `ResizePty` wire op; a daemon pane renders via `Attach` streaming, also deferred). No-op
-    // OK so the frontend's per-render resize never errors on a daemon pane.
+    // `ResizePty` wire op; a daemon pane renders via `Attach` streaming, also deferred).
+    // Honest Err — not a silent Ok false-ACK. Callers: legacy `app/src/main.js` swallows via
+    // `.catch(() => {})`; live `ui/.../tauriAgentBridge.js` `resizePane` returns the promise
+    // (p1 treats reject as not-acked and retries). Silent Ok was worse for both.
     if pane_owner_is_daemon(&state, &id) {
-        return Ok(());
+        return Err(
+            "resize_pty: daemon-owned pane has no ResizePty wire op yet (resize deferred)".into(),
+        );
     }
     // resize takes &self → an immutable snapshot borrow suffices; absent id → error.
+    // Propagate master.resize failures so the frontend promise rejects (no false ACK).
     state
         .sups
         .with_snapshot(&id, |sup| sup.resize(rows, cols))
-        .ok_or("no such workspace")?;
-    Ok(())
+        .ok_or_else(|| "no such workspace".to_string())?
 }
 
 /// One poll's worth of new pane output (perf-2026-06-10 seam 1). `base` is the
@@ -2706,7 +2820,12 @@ fn default_state_root() -> PathBuf {
         return PathBuf::from(d);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/agent-teams")
+    // NESTED under harness-ready/ (one level below Application Support) so the fixed-name
+    // SIBLINGS of state_root — agent-teams-mcp.sock, the live registry, persist/audit files —
+    // land in harness-ready/, private to this fork. The production Agent Teams app uses
+    // Application Support/agent-teams with siblings directly in Application Support/; sharing
+    // that dir meant our startup wipe + socket bind clobbered the other app's fleet.
+    PathBuf::from(home).join("Library/Application Support/harness-ready/agent-teams")
 }
 
 /// Staging dir for the bundled hooks — a sibling of `state_root`, so the startup
@@ -13552,6 +13671,13 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let state_root = default_state_root();
+            // The default state_root parent (…/harness-ready/) does not pre-exist the way
+            // Application Support/ does — create it BEFORE the sibling writers touch it
+            // (instance.lock flock, live-registry write, mcp socket bind). Idempotent,
+            // best-effort; also covers an AGENT_TEAMS_STATE_DIR override with a fresh parent.
+            if let Some(parent) = state_root.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let worktree_registry = default_registry_path();
             // Q4 Stage-4 D6 write-ahead store: a sibling of state_root (survives the startup
             // wipe) so an id we asked the daemon to spawn is reconcilable after a crash/relaunch.
@@ -13624,7 +13750,7 @@ pub fn run() {
                 sups: DaemonSups::new(),
                 meta: Mutex::new(HashMap::new()),
                 claude_primed: Mutex::new(std::collections::HashSet::new()),
-                early_respawned: Mutex::new(std::collections::HashSet::new()),
+                early_respawned: Mutex::new(std::collections::HashMap::new()),
                 app_handle: {
                     let cell = std::sync::OnceLock::new();
                     let _ = cell.set(app.handle().clone());
@@ -13652,11 +13778,13 @@ pub fn run() {
                 pending: Mutex::new(VecDeque::new()),
                 runs_log: default_runs_path(),
                 live_registry_lock: Mutex::new(()),
-                worktree_registry_lock: Mutex::new(()),
+                worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
                 // 05-04: no capture in flight at launch (push-to-talk fills this).
                 dictation: Mutex::new(None),
                 // per-pane write serializer: filled lazily on first write to each pane.
                 pane_write_locks: Mutex::new(HashMap::new()),
+                // async-close disk-cleanup serializer: filled per close, self-draining.
+                pending_cleanups: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 // 06-02 Phase-B HTTP: no listener bound yet (filled by
                 // spawn_http_listener iff http_enabled).
                 http_port: Mutex::new(None),
@@ -13704,6 +13832,57 @@ pub fn run() {
                     raise_and_jump(&handle);
                 }
             })?;
+
+            // ── T3: ⌘G via APP MENU accelerator (NOT global_shortcut) ──
+            // Wave-7 shipped Pane ▸ Toggle Pane Zoom with CmdOrCtrl+Shift+G. Operator
+            // confirmed MENU CLICK maximizes (emit → Home listener → toggleZoom sound).
+            // The ⌘⇧G *chord* stayed dead in-app: macOS routes key equivalents into
+            // WKWebView first, and WKWebView natively consumes ⌘⇧G (Find-Previous family)
+            // — the keydown never reaches the page NOR falls through to the app menu.
+            // Unwinnable without NSEvent monitors (out of scope).
+            //
+            // ⌘G (no Shift) IS delivered to page JS in this webview class — proven daily
+            // by prod Agent Teams (main.js:8314, ⌘G = toggleGrid, works with terminals
+            // focused). Accelerator is therefore CmdOrCtrl+G. Do NOT "restore" ⌘⇧G.
+            //
+            // Deliberately NOT `global_shortcut`: a system-wide claim would fight browser
+            // Find / other apps. ⌘⇧J above is the global-registration precedent for the
+            // emit idiom only — not for registration of this chord.
+            //
+            // Double-path with the JS keydown arm (useKeyboardShortcuts): WKWebView
+            // forwards ⌘G to the page first; JS preventDefault stops menu re-dispatch →
+            // exactly one toggle per press. Menu click still works when focus is elsewhere.
+            //
+            // Menu shape: Menu::default + a top-level "Pane" submenu (macOS menu bar
+            // only accepts Submenus at the top level; a bare MenuItem cannot append).
+            {
+                use tauri::menu::{Menu, MenuItem, Submenu};
+
+                let zoom = MenuItem::with_id(
+                    app,
+                    "maximize-pane",
+                    "Toggle Pane Zoom",
+                    true,
+                    Some("CmdOrCtrl+G"),
+                )?;
+                let pane_menu =
+                    Submenu::with_id_and_items(app, "pane", "Pane", true, &[&zoom])?;
+                let menu = Menu::default(app.handle())?;
+                menu.append(&pane_menu)?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    if event.id().as_ref() == "maximize-pane" {
+                        // Same raise + emit idiom as raise_and_jump (⌘⇧J): resolve main
+                        // window best-effort, then emit for the frontend. Errors ignored.
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app.emit("maximize-pane", ());
+                    }
+                });
+            }
 
             // ---- Phase 05 / 05-01: menubar HUD (tray badge + OS notifications) ----
             // Tray icon: left-click = jump-to-top (reuses raise_and_jump); right-click
@@ -18635,14 +18814,24 @@ mod socket_seam_tests {
     }
 
     #[test]
-    fn early_respawn_is_one_shot_per_pane_id() {
-        // The no-crash-loop invariant: the FIRST early death of a pane id may respawn;
-        // every later one must not (per app run). Distinct ids are independent.
-        let seen = Mutex::new(std::collections::HashSet::new());
-        assert!(early_respawn_first_use(&seen, "ws1-p0"), "first death → retry allowed");
-        assert!(!early_respawn_first_use(&seen, "ws1-p0"), "second death → NO second respawn");
-        assert!(!early_respawn_first_use(&seen, "ws1-p0"), "still spent");
-        assert!(early_respawn_first_use(&seen, "ws1-p1"), "another pane gets its own retry");
+    fn early_respawn_respects_per_harness_budget() {
+        // No-crash-loop: default budget is 1 retry; opencode gets 2. Distinct ids independent.
+        assert_eq!(early_respawn_budget("claude"), 1);
+        assert_eq!(early_respawn_budget("opencode"), 2);
+
+        let seen = Mutex::new(std::collections::HashMap::new());
+        // Default harness (budget 1): first death → retry; second → spent.
+        assert!(early_respawn_try(&seen, "ws1-p0", 1), "first death → retry allowed");
+        assert!(!early_respawn_try(&seen, "ws1-p0", 1), "second death → NO second respawn");
+        assert!(!early_respawn_try(&seen, "ws1-p0", 1), "still spent");
+        // Fresh pane id still gets its own budget.
+        assert!(early_respawn_try(&seen, "ws1-p1", 1), "another pane gets its own retry");
+
+        // opencode (budget 2): two retries, third death is final.
+        let oc = Mutex::new(std::collections::HashMap::new());
+        assert!(early_respawn_try(&oc, "ws2-p0", 2), "opencode 1st death → retry");
+        assert!(early_respawn_try(&oc, "ws2-p0", 2), "opencode 2nd death → retry");
+        assert!(!early_respawn_try(&oc, "ws2-p0", 2), "opencode 3rd death → give up");
     }
 
     #[test]
@@ -21037,7 +21226,7 @@ mod daemon_spawn_routing_tests {
                 sups: DaemonSups::new(),
                 meta: Mutex::new(HashMap::new()),
                 claude_primed: Mutex::new(std::collections::HashSet::new()),
-                early_respawned: Mutex::new(std::collections::HashSet::new()),
+                early_respawned: Mutex::new(std::collections::HashMap::new()),
                 app_handle: std::sync::OnceLock::new(), // unseeded — no watcher in tests
                 hooks_dir: self.dir.join("hooks"),
                 sidecar_bin: self.dir.join("sidecar"),
@@ -21052,9 +21241,10 @@ mod daemon_spawn_routing_tests {
                 pending: Mutex::new(VecDeque::new()),
                 runs_log: self.dir.join("runs.jsonl"),
                 live_registry_lock: Mutex::new(()),
-                worktree_registry_lock: Mutex::new(()),
+                worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
                 dictation: Mutex::new(None),
                 pane_write_locks: Mutex::new(HashMap::new()),
+                pending_cleanups: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 http_port: Mutex::new(None),
                 delegation_in_flight: Mutex::new(None),
                 delegate_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

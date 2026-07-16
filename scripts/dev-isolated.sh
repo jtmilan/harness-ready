@@ -7,7 +7,8 @@
 #   - identifier  com.jeffrymilan.agentteams.dev   → its OWN localStorage (presets,
 #     workspaces, recents) + its OWN macOS TCC identity, separate from production.
 #   - AGENT_TEAMS_STATE_DIR → its OWN registry / run-log / live-worktree record, so the
-#     app's startup state-dir wipe NEVER touches production's
+#     app's startup state-dir wipe NEVER touches this fork's installed default
+#     (~/Library/Application Support/harness-ready/agent-teams) nor production's
 #     ~/Library/Application Support/agent-teams.
 #
 # CRITICAL: the MCP mutation socket (agent-teams-mcp.sock) and the live registry
@@ -23,8 +24,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../app"
 
-# nested under agent-teams-dev/ so the socket + registry siblings land in agent-teams-dev/, not Application Support/
-export AGENT_TEAMS_STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams-dev/state}"
+# nested under harness-ready/agent-teams-dev/ so the socket + registry siblings land in
+# harness-ready/agent-teams-dev/ — private to this fork's dev instance (NOT harness-ready/,
+# where the installed fork app's siblings live, and NOT the prod repo's agent-teams-dev/)
+export AGENT_TEAMS_STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams-dev/state}"
 mkdir -p "$AGENT_TEAMS_STATE_DIR"
 
 echo "[dev-isolated] identifier : com.jeffrymilan.agentteams.dev (separate from production)"

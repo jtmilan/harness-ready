@@ -5,8 +5,10 @@
  * as a native macOS app (Tauri / Electron), replace MockAgentBridge with an
  * implementation that drives real PTYs and git worktrees:
  *
- *   - spawnAgents(configs): for each config, `git worktree add <path> -b <branch>`
- *     then spawn AGENT_KINDS[kind].cmd in a PTY (portable-pty / node-pty) cwd'd there.
+ *   - spawnAgents(configs, name, { assignTo?, wsId? }): for each config, `git worktree
+ *     add <path> -b <branch>` then spawn AGENT_KINDS[kind].cmd in a PTY cwd'd there.
+ *     Returns Promise<{ wsId, paneIds }> of minted ids whose spawn resolved (K1).
+ *     Unmapped kinds are refused (K4), never silently rewritten to bash.
  *   - subscribe(cb): push a full agent-state snapshot on every PTY output chunk
  *     or status change. cb receives the agents array.
  *   - sendInput(id, text): write `text + "\n"` to that agent's PTY stdin.
@@ -22,6 +24,26 @@
 import { createAgents, randomLine, ATTENTION_REASONS } from "@/lib/agentData";
 import { TauriAgentBridge, isTauri } from "@/lib/tauriAgentBridge";
 import { randomAgentName } from "@/lib/agentNames";
+import { assignMany, unassign } from "@/lib/workspaceAssign";
+
+// Closed UI-kind set. Local copy of tauriAgentBridge.js `HARNESS_WIRE` keys (SSOT lives
+// there). Deliberate duplication — do not import the constant from the Tauri module
+// just to share a table; keep both lists in lockstep when a harness is added.
+const HARNESS_WIRE = {
+  "claude-code": "claude",
+  cursor: "cursor",
+  codex: "codex",
+  opencode: "opencode",
+  commandcode: "commandcode",
+  cline: "cline",
+  grok: "grok",
+  bash: "bash",
+};
+
+/** @param {unknown} kind */
+function isMappedKind(kind) {
+  return typeof kind === "string" && Object.prototype.hasOwnProperty.call(HARNESS_WIRE, kind);
+}
 
 class MockAgentBridge {
   constructor() {
@@ -29,6 +51,10 @@ class MockAgentBridge {
     this.listeners = new Set();
     this.running = true;
     this.timer = null;
+    // Side buffer for refused-spawn red lines (mirrors TauriAgentBridge.raw[id] when
+    // a spawn fails without registering a live agent). Not currently rendered by any
+    // subscriber; kept so console + buffer match the real bridge's failure surface.
+    this.raw = {};
   }
 
   start() {
@@ -93,17 +119,38 @@ class MockAgentBridge {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, `>> BROADCAST: ${text}`));
   }
 
+  // Broadcast TOGGLE mode — interface parity with TauriAgentBridge.broadcastRaw.
+  // Home.jsx calls this when ⌘⇧I is on; missing it TypeErrors the web preview.
+  // sendRaw is a no-op stub here (no PTY), so this is shape-only fan-out.
+  broadcastRaw(data) {
+    for (const a of this.agents) {
+      if (a.status === "error") continue;
+      this.sendRaw(a.id, data);
+    }
+  }
+
   // --- process control (signals in the real backend) ---
   pauseAgents(ids) {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> PAUSED BY OPERATOR", { status: "idle", attention: null }));
+  }
+
+  // Mirrors TauriAgentBridge.resumeAgents (per-pane SIGCONT). Required for interface
+  // parity: `bridge` is whichever impl isTauri() picks, so a method present on only one
+  // of them is a TypeError in the hosted web preview the moment RESUME is pressed.
+  // Replaces the old resumeAll() — see the rationale in tauriAgentBridge.js.
+  resumeAgents(ids) {
+    this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> RESUMED BY OPERATOR", { status: "working", attention: null }));
   }
 
   restartAgents(ids) {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> AGENT RESTARTED", { status: "working", attention: null }));
   }
 
-  resumeAll() {
-    this._patch((a) => a.status === "idle", (a) => ({ ...a, status: "working" }));
+  // Real backend: kill each PTY child + `git worktree remove`, then drop the panes.
+  closeAgents(ids) {
+    for (const id of ids) unassign(id);
+    this.agents = this.agents.filter((a) => !ids.includes(a.id));
+    this._emit();
   }
 
   stopAll() {
@@ -126,30 +173,69 @@ class MockAgentBridge {
   }
 
   // --- lifecycle (git worktree add + PTY spawn in the real backend) ---
-  spawnAgents(configs, templateName) {
+//
+  // Returns `{ wsId, paneIds }` so Home can create a UI workspace tab + assign panes.
+  // K1: paneIds = minted ids whose spawn "resolved", in config order. Failed/refused
+  // configs are excluded.
+  //
+  // opts.assignTo / opts.wsId: same semantics as TauriAgentBridge.
+  //
+  // Mock "failure" definition (no real PTY): the only refuse path is K4 unmapped
+  // kind. Mapped kinds always mint — there is no backend reject to simulate; the
+  // unassign-on-failure branch is still written for parity with the Tauri bridge.
+  async spawnAgents(configs, templateName, { assignTo, wsId: wsIdOpt } = {}) {
     const base = this.agents.length;
-    const newIds = [];
-    configs.forEach((cfg, i) => {
+    // Mint a backend-shaped workspace id so mock + real share the same call contract.
+    const wsId =
+      typeof wsIdOpt === "string" && wsIdOpt
+        ? wsIdOpt
+        : "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
+    const plan = configs.map((cfg, i) => {
       const num = String(base + i + 1).padStart(3, "0");
-      newIds.push(`AGENT-${num}`);
-      this.agents.push({
-        id: `AGENT-${num}`,
-        name: randomAgentName(),
-        kind: cfg.kind || "bash",
-        role: cfg.role,
-        branch: `feat/${(cfg.role || cfg.kind || "task").toLowerCase().replace(/\s+/g, "-")}-${num}`,
-        worktree: `~/worktrees/agent-${num}`,
-        status: "starting",
-        attention: null,
-        output: [
-          `>> LAUNCHED FROM TEMPLATE: ${templateName}`,
-          `>> ROLE: ${(cfg.role || "").toUpperCase()} | AGENT: ${(cfg.kind || "bash").toUpperCase()} | PRIORITY: ${(cfg.priority || "normal").toUpperCase()} | AUTONOMY: ${(cfg.autonomy || "semi").toUpperCase()}`,
-          "$ git worktree add ... && agent init",
-        ],
-      });
+      return { id: `AGENT-${num}`, num, cfg, mapped: isMappedKind(cfg.kind) };
     });
+    if (assignTo) {
+      const assignable = plan.filter((p) => p.mapped).map((p) => p.id);
+      if (assignable.length) assignMany(assignable, assignTo);
+    }
+    /** @type {string[]} */
+    const minted = [];
+    for (const { id, num, cfg, mapped } of plan) {
+      // K4: unmapped kind = REFUSED loudly. Never `cfg.kind || "bash"`.
+      // Match tauriAgentBridge spawn-refused tone: red buffer + console.error,
+      // no agents.push (no ghost), excluded from returned ids.
+      if (!mapped) {
+        const msg = "[spawn refused] unmapped kind " + String(cfg.kind) + " for " + id;
+        console.error("[MockAgentBridge]", msg);
+        this.raw[id] = "\r\n\x1b[31m" + msg + "\x1b[0m\r\n";
+        continue;
+      }
+      try {
+        minted.push(id);
+        this.agents.push({
+          id,
+          name: randomAgentName(),
+          kind: cfg.kind,
+          role: cfg.role,
+          branch: `feat/${(cfg.role || cfg.kind || "task").toLowerCase().replace(/\s+/g, "-")}-${num}`,
+          worktree: `~/worktrees/agent-${num}`,
+          status: "starting",
+          attention: null,
+          output: [
+            `>> LAUNCHED FROM TEMPLATE: ${templateName}`,
+            `>> ROLE: ${(cfg.role || "").toUpperCase()} | AGENT: ${cfg.kind.toUpperCase()} | PRIORITY: ${(cfg.priority || "normal").toUpperCase()} | AUTONOMY: ${(cfg.autonomy || "semi").toUpperCase()}`,
+            "$ git worktree add ... && agent init",
+          ],
+        });
+      } catch (e) {
+        // Parity with Tauri ghost cleanup — mock push almost never throws.
+        if (assignTo) unassign(id);
+        console.error("[MockAgentBridge] spawn failed:", id, e);
+      }
+    }
     this._emit();
-    setTimeout(() => this._patch((a) => newIds.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);
+    setTimeout(() => this._patch((a) => minted.includes(a.id) && a.status === "starting", (a) => ({ ...a, status: "working" })), 3000);
+    return { wsId, paneIds: minted };
   }
 }
 

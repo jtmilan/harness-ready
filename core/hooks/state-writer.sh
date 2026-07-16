@@ -27,7 +27,7 @@ EVENT="${2:-unknown}"
 WSID="${3:-unknown}"
 PAYLOAD="$(cat 2>/dev/null)"
 
-STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/agent-teams}/$WSID"
+STATE_DIR="${AGENT_TEAMS_STATE_DIR:-$HOME/Library/Application Support/harness-ready/agent-teams}/$WSID"
 mkdir -p "$STATE_DIR" 2>/dev/null
 LOG="$STATE_DIR/events.jsonl"
 

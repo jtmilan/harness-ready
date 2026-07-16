@@ -50,13 +50,6 @@ const DIR_MAP = {
   down: ["h", "after"],
 };
 
-// paneId → integer index. Panes are named `<wsId>-p<idx>` (mirrors deserializeTree), so the
-// index is the trailing `-p<n>` suffix. Returns null (drop the leaf) when it doesn't parse.
-function paneIdxOf(paneId) {
-  const m = /-p(\d+)$/.exec(String(paneId));
-  return m ? Number(m[1]) : null;
-}
-
 // localStorage is best-effort: a Tauri webview / private mode can throw on access. Never let a
 // storage failure break layout — degrade to in-memory-only.
 function lsGet(key) {
@@ -72,6 +65,28 @@ function lsSet(key, val) {
   } catch {
     /* storage unavailable — layout still works, just doesn't persist */
   }
+}
+function lsDel(key) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Storage envelope for structural trees. Only `{v:2, tree:<node>}` is accepted on read —
+// index-era roots (`{t:"leaf",i:N}`), empty string, and malformed JSON are discarded (no
+// migration; the old format never round-tripped in this fork anyway).
+const TREE_STORE_V = 2;
+function packTree(node) {
+  const tree = serializeTree(node);
+  return tree ? { v: TREE_STORE_V, tree } : null;
+}
+function unpackTree(parsed) {
+  if (!parsed || typeof parsed !== "object" || parsed.v !== TREE_STORE_V || !parsed.tree) {
+    return null;
+  }
+  return deserializeTree(parsed.tree);
 }
 
 /**
@@ -89,6 +104,8 @@ function lsSet(key, val) {
  *   seams: Seam[],
  *   onSeamPointerDown: (seam: Seam, e: PointerEvent) => void,
  *   movePane: (srcId: string, targetId: string, dir: MoveDir) => void,
+ *   zoomId: string|null,
+ *   toggleZoom: (id: string) => void,
  *   tree: TreeNode|null,
  *   serialize: () => object|null,
  *   restore: (serial: string|object) => boolean,
@@ -102,18 +119,35 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
   const paneKey = paneIds.join("|"); // stable dep for effects/memo (array identity churns)
 
   const modeKey = `hr:tiling:mode:${wsId}`;
-  const treeKey = `hr:tiling:tree:${wsId}`;
+  // tree2 = full-pane-id leaf shape (`{id}`). Old `hr:tiling:tree:` used index-only `{i:N}` which
+  // collides when one UI workspace holds panes from multiple backend workspaces (all -p0).
+  // Prefer tree2; fall back to legacy key once, migrate via deserialize + reconcile, rewrite tree2.
+  const treeKey = `hr:tiling:tree2:${wsId}`;
+  const legacyTreeKey = `hr:tiling:tree:${wsId}`;
 
   // Restore the persisted STRUCTURAL tree (tile/columns) for this ws, reconciled to live panes;
   // fall back to a fresh balanced tree. Structure only — single/focus are derived, not stored.
+  // Reads latest paneIds/focusedId from the render closure (or refs when called from effects).
   const restoreStructTree = () => {
-    const raw = lsGet(treeKey);
+    let raw = lsGet(treeKey);
+    let fromLegacy = false;
+    if (!raw) {
+      raw = lsGet(legacyTreeKey);
+      fromLegacy = !!raw;
+    }
     if (raw) {
       try {
-        const t = deserializeTree(JSON.parse(raw), wsId);
-        if (t) return reconcileTree(t, paneIds, focusedId).tree;
+const t = unpackTree(JSON.parse(raw));
+        if (t) {
+          const healed = reconcileTree(t, paneIds, focusedId).tree;
+          // Always re-persist under tree2 so the next load never re-reads a bad envelope.
+          const packed = packTree(healed);
+          lsSet(treeKey, packed ? JSON.stringify(packed) : "");
+          if (fromLegacy) lsDel(legacyTreeKey);
+          return healed;
+        }
       } catch {
-        /* malformed persisted tree — rebuild fresh below */
+        /* malformed / non-v2 persisted tree — rebuild fresh below */
       }
     }
     return buildBalancedTree(paneIds);
@@ -165,31 +199,44 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
   const [version, bump] = React.useReducer((n) => n + 1, 0);
 
   const persistStruct = React.useCallback(() => {
-    const ser = serializeTree(structRef.current, paneIdxOf);
-    lsSet(treeKey, ser ? JSON.stringify(ser) : "");
+// Full pane id inside v2 envelope — no paneIdxOf (index-keyed identity is the collision bug).
+    const packed = packTree(structRef.current);
+    lsSet(treeKey, packed ? JSON.stringify(packed) : "");
   }, [treeKey]);
+
+  // Workspace id that structRef / the last restore is aligned with. The reconcile effect and the
+  // ws-switch restore effect both fire when switching A→B (paneKey + wsId change together) —
+  // and reconcile is declared first. Without this guard, reconcile runs against the OLD tree +
+  // NEW paneIds + NEW treeKey and persistStruct clobbers B's saved layout before restore reads it.
+  // On a switch turn: reconcile early-returns; restore reloads B and advances this ref.
+  const residentWsIdRef = React.useRef(wsId);
 
   // Reconcile the structural tree to the live pane set on add/remove (prune dead leaves, append
   // new panes) — preserving existing seam ratios. Skipped in single/focus (derived views). Runs
   // on pane-set / focus change; reconcileTree is idempotent so re-runs are safe.
+  // MUST NOT run (and MUST NOT persist) on the render where wsId changed — restore owns that turn.
   React.useEffect(() => {
+    if (residentWsIdRef.current !== wsId) return;
     if (modeRef.current === "single" || modeRef.current === "focus") return;
     structRef.current =
       reconcileTree(structRef.current, paneIds, focusedId).tree || buildDefaultTree(paneIds);
     persistStruct();
     bump();
     // paneKey stands in for the paneIds array (identity churns each render); reconcile is idempotent.
-  }, [paneKey, focusedId, persistStruct]);
+  }, [paneKey, focusedId, persistStruct, wsId]);
 
   // Workspace switch: reload the persisted mode + structural tree for the new ws. Skipped on
-  // mount (the lazy init above already built the tree for the first ws).
+  // mount (the lazy init above already built the tree for the first ws). Marks residence so the
+  // next reconcile may persist again — only while this ws is active.
   const firstWs = React.useRef(true);
   React.useEffect(() => {
     if (firstWs.current) {
       firstWs.current = false;
+      residentWsIdRef.current = wsId;
       return;
     }
     structRef.current = restoreStructTree();
+    residentWsIdRef.current = wsId;
     const savedMode = lsGet(modeKey);
     if (MODES.includes(/** @type {TilingMode} */ (savedMode))) {
       setModeState(/** @type {TilingMode} */ (savedMode));
@@ -328,6 +375,47 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     [onSeamMove, endSeam],
   );
 
+  // ── Zoom (per-pane maximize) ────────────────────────────────────────────────────────────────
+  // An explicit per-pane pin, NOT a MODE: single/focus anchor on selectedId and derive their view,
+  // zoom names one pane. They coexist — zoom takes precedence while set (prod checks ws.zoom before
+  // the tree at main.js:904) and restoring it drops straight back to the mode's view.
+  //
+  // Keyed by wsId so a zoom survives a workspace switch, and IN-MEMORY ONLY: prod omits zoom from
+  // persistWorkspaces (main.js:4090), so it dies on reload. Deliberately NOT written to `hr:tiling:*`.
+  /** @type {[Record<string,string>, React.Dispatch<React.SetStateAction<Record<string,string>>>]} */
+  const [zoomByWs, setZoomByWs] = React.useState({});
+
+  // DERIVED, not stored: a zoomed pane that left paneIds (closed, or moved to another ws) would make
+  // `rects` a lone rect for a pane that no longer renders — i.e. a blank grid. Prod guards this at
+  // relayout (main.js:902); deriving it means the dangling id can never reach a paint, which an
+  // after-paint effect could not promise.
+  const rawZoom = zoomByWs[wsId] || null;
+  const zoomId = rawZoom && paneIds.includes(rawZoom) ? rawZoom : null;
+
+  // ...then drop the dead entry, so a pane returning to this ws can't resurrect a stale zoom.
+  React.useEffect(() => {
+    if (!rawZoom || zoomId) return;
+    setZoomByWs((prev) => {
+      if (!prev[wsId]) return prev;
+      const next = { ...prev };
+      delete next[wsId];
+      return next;
+    });
+  }, [rawZoom, zoomId, wsId]);
+
+  const toggleZoom = React.useCallback(
+    (id) => {
+      if (!id || !paneIdsRef.current.includes(id)) return; // prod: maximizePane no-ops on an unknown pane
+      setZoomByWs((prev) => {
+        const next = { ...prev };
+        if (next[wsId] === id) delete next[wsId]; // same pane → restore
+        else next[wsId] = id;
+        return next;
+      });
+    },
+    [wsId],
+  );
+
   // Intra-workspace reorder: prune src, re-insert it beside target on the given side.
   const movePane = React.useCallback(
     (srcId, targetId, dir) => {
@@ -339,13 +427,15 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     [persistStruct],
   );
 
-  // Stable serialize/restore so layout survives reloads (index-keyed, ws-agnostic payload).
-  const serialize = React.useCallback(() => serializeTree(structRef.current, paneIdxOf), []);
+// Stable serialize/restore (v2 envelope + full pane ids). Exported for callers that want an
+  // explicit snapshot; day-to-day persistence goes through persistStruct / restoreStructTree.
+  const serialize = React.useCallback(() => packTree(structRef.current), []);
   const restore = React.useCallback(
     (serial) => {
       try {
         const parsed = typeof serial === "string" ? JSON.parse(serial) : serial;
-        const t = deserializeTree(parsed, wsId);
+// Accept either a v2 envelope `{v:2, tree}` or a bare tree node (legacy callers).
+        const t = unpackTree(parsed) || deserializeTree(parsed, wsId);
         if (!t) return false;
         structRef.current = reconcileTree(t, paneIdsRef.current, focusedIdRef.current).tree;
         persistStruct();
@@ -355,7 +445,7 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
         return false;
       }
     },
-    [wsId, persistStruct],
+    [persistStruct],
   );
 
   // The tree actually laid out this render. single/focus → the focused pane full-box (others
@@ -373,6 +463,11 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     const w = size ? size.width : 0;
     const h = size ? size.height : 0;
     const box = { x: 0, y: 0, w, h };
+    // Zoom short-circuits the tree walk (prod parity, main.js:904): ONE full-host rect, every
+    // sibling ABSENT from `rects`. The absence IS the hide mechanism — Home.jsx already maps a
+    // missing rect to display:none + visible={false}, which detaches WebGL and skips the re-fit.
+    // No seams under zoom: the dividers belong to splits that aren't on screen (main.js:943).
+    if (zoomId) return { rects: { [zoomId]: { x: 0, y: 0, w, h } }, seams: [] };
     /** @type {Record<string, Rect>} */
     const rectsMap = {};
     for (const r of layoutRects(renderTree, box)) {
@@ -388,7 +483,7 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     }));
     return { rects: rectsMap, seams: seamList };
     // version/size/mode/focus/paneKey capture every relayout input (renderTree is derived from them).
-  }, [version, size, mode, focusedId, paneKey]);
+  }, [version, size, mode, focusedId, paneKey, zoomId]);
 
   return {
     rects,
@@ -397,6 +492,8 @@ export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef,
     seams,
     onSeamPointerDown,
     movePane,
+    zoomId,
+    toggleZoom,
     tree: renderTree,
     serialize,
     restore,

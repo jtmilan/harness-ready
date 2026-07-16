@@ -1,7 +1,7 @@
 // Local workspace registry — persisted in localStorage.
 // Real backend: each workspace maps to a repo root directory that agents
 // create their git worktrees under.
-import { assign, getAssignment } from "@/lib/workspaceAssign";
+import { assign, getAssignment, unassignWorkspace } from "@/lib/workspaceAssign";
 
 const KEY = "acc-workspaces";
 
@@ -37,6 +37,23 @@ export function moveAgentToWorkspace(paneId, toWsId) {
 // Note: panes with NO explicit assignment (default-bucket panes shown under the
 // first/active workspace) carry no entry, so they are untouched here and simply
 // follow whatever workspace is the default bucket after the merge.
+// Delete `wsId` from the registry — unless it is the last remaining workspace
+// (never leave the fleet with zero). Also drops every pane assignment pointing
+// at the deleted workspace so the map holds no stale entries; the caller is
+// responsible for closing (or re-homing) those panes BEFORE deleting.
+//
+// Returns the resulting workspace list so React callers can `setWorkspaces(...)`
+// in one step (same command+query shape as mergeWorkspaces).
+export function deleteWorkspace(wsId) {
+  const list = loadWorkspaces();
+  if (list.length <= 1) return list;
+  const next = list.filter((w) => w.id !== wsId);
+  if (next.length === list.length) return list; // wsId wasn't in the registry
+  unassignWorkspace(wsId);
+  saveWorkspaces(next);
+  return next;
+}
+
 export function mergeWorkspaces(fromWsId, intoWsId) {
   const list = loadWorkspaces();
   if (fromWsId === intoWsId) return list;

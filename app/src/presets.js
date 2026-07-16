@@ -28,7 +28,7 @@ export const ENVELOPE_VERSION = 1;
 // catalog (a harness_catalog() Tauri command). Until then, keep in sync with
 // parse_harness() (app/src-tauri/src/lib.rs:235) and the #f-harness <select>
 // (app/src/index.html:108-112).
-export const KNOWN_HARNESSES = ["claude", "codex", "commandcode", "cursor", "opencode", "cline", "bash"];
+export const KNOWN_HARNESSES = ["claude", "codex", "commandcode", "cursor", "opencode", "cline", "grok", "bash"];
 export function isKnownHarness(id) { return KNOWN_HARNESSES.includes(id); }
 
 // Round-robin an ORDERED, multi-selected harness set across `count` panes: pane i takes

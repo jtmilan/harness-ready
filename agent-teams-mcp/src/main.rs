@@ -29,7 +29,7 @@
 //! coordinator peer-pid gate).
 //!
 //! State dir resolution mirrors the `adapter` binary: `$AGENT_TEAMS_STATE_DIR`,
-//! else `~/Library/Application Support/agent-teams`.
+//! else `~/Library/Application Support/harness-ready/agent-teams`.
 
 use std::path::{Path, PathBuf};
 
@@ -1022,14 +1022,14 @@ fn identified_queue(state_dir: &Path) -> Vec<QueueRow> {
     compute_queue_identified(state_dir, registry.as_ref())
 }
 
-/// `$AGENT_TEAMS_STATE_DIR`, else `~/Library/Application Support/agent-teams`
+/// `$AGENT_TEAMS_STATE_DIR`, else `~/Library/Application Support/harness-ready/agent-teams`
 /// (mirrors `core/state-adapter/src/bin/adapter.rs`).
 fn default_state_dir() -> PathBuf {
     if let Ok(d) = std::env::var("AGENT_TEAMS_STATE_DIR") {
         return PathBuf::from(d);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/agent-teams")
+    PathBuf::from(home).join("Library/Application Support/harness-ready/agent-teams")
 }
 
 #[tokio::main]

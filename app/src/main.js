@@ -615,6 +615,19 @@ function ensureSession(id) {
           }
           return false;
         }
+        // ⌘G maximize/restore — handle HERE so WKWebView "Find Next" (native) can't steal it
+        // when the xterm helper <textarea> is focused. Use maximizePane(this id) so we never
+        // depend on the activeId guard that toggleGrid() used to hit on a silent no-op.
+        // stopPropagation: xterm only skips its own input when we return false — the DOM
+        // event still bubbles, and the document keydown handler would toggleGrid() again
+        // (double-toggle → no visible change). Stop bubble so only this path runs.
+        if (e.type === "keydown" && e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey
+            && (e.key === "g" || e.key === "G")) {
+          e.preventDefault();
+          e.stopPropagation();
+          maximizePane(id);
+          return false;
+        }
         return true;
       });
     }
@@ -1196,8 +1209,31 @@ function updateGridBtn() {
 
 function toggleGrid() {
   const ws = activeWs ? workspaces[activeWs] : null;
-  if (!ws || !activeId || !sessions[activeId]) return;
-  ws.zoom = ws.zoom === activeId ? null : activeId;
+  if (!ws) return;
+  // Prefer activeId when still a live session; otherwise recover a sensible target so ⌘G
+  // doesn't silently no-op when focus landed without the mousedown → setActivePane path.
+  let id = activeId && sessions[activeId] ? activeId : null;
+  if (!id) {
+    if (ws.zoom && sessions[ws.zoom]) {
+      id = ws.zoom; // restore the currently maximized pane
+    } else {
+      const live = ws.paneIds.filter((p) => sessions[p]);
+      if (live.length === 1) {
+        id = live[0];
+      } else {
+        for (const pid of live) {
+          const s = sessions[pid];
+          if (s && s.el && s.el.contains(document.activeElement)) { id = pid; break; }
+        }
+      }
+    }
+    if (!id) {
+      console.debug("[toggleGrid] no-op: activeId null/stale and no recoverable focused/zoomed pane");
+      return;
+    }
+    activeId = id;
+  }
+  ws.zoom = ws.zoom === id ? null : id;
   updateGridBtn();
   relayout();
 }
@@ -5671,20 +5707,24 @@ let fwWorkers = 3;
 // CLAUDE is live-verifiable AND keeps the token/cost meter (it emits parseable usage) + a tight
 // allowlist (commit ✓ / push ✗). The others run on YOUR subscription (the meter goes blind →
 // "subscription" label) via a coarser autonomous-commit mode, and are UNVERIFIED → experimental.
-const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline"];
-const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline" };
+const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline", "grok"];
+const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline", grok: "Grok Build" };
 // Curated quick-pick models per harness. NOT exhaustive + ACCOUNT-SCOPED (ids rot + depend on your
-// auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "default"
-// chip) = the harness account default (no --model), the SAFEST pick (a stale/unauthed id 400s).
+// auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "(default)"
+// chip) = the harness account default (no --model / no -m), the SAFEST pick (a stale/unauthed id 400s).
 // Deep-verified live on this machine: codex/cursor = plain slug, opencode = provider/model. codex
 // `-codex` slugs are API-key-only → omitted (400 on a ChatGPT-auth account).
+// opencode: leading "" is the resilient default (NO -m → opencode uses its own authed config;
+// e.g. openrouter/… when that is what auth.json has). Explicit provider/model ids below are
+// OPT-IN only — github-copilot/* 400s when that provider is not authenticated.
 const FW_MODELS = {
   claude: ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
   codex: ["gpt-5.5", "gpt-5.4-mini"],
   cursor: ["composer-2.5-fast", "composer-2.5", "gpt-5.5-high", "auto"],
   commandcode: ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"],
-  opencode: ["github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
+  opencode: ["", "github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
   cline: ["anthropic/claude-sonnet-4", "anthropic/claude-opus-4", "openai/gpt-5"],
+  grok: ["grok-4.5"],
 };
 let fwHarness = "claude";
 function fwModelTextEl() { return document.getElementById("fw-model-text"); }
@@ -5739,7 +5779,13 @@ function fillHarnessDatalist(h) {
   const entry = fwModelCache[h];
   const full = (entry && entry.models.length) ? entry.models : (FW_MODELS[h] || []);
   dl.replaceChildren();
-  for (const m of full) { const o = document.createElement("option"); o.value = m; dl.appendChild(o); }
+  // Skip "" — blank field already means account default (no -m); empty datalist options are useless.
+  for (const m of full) {
+    if (!m) continue;
+    const o = document.createElement("option");
+    o.value = m;
+    dl.appendChild(o);
+  }
 }
 
 // ── Shared harness/model picker factory (#E4) ─────────────────────────────────────────────
@@ -5767,8 +5813,14 @@ function makeHarnessPicker({ prefix, getHarness, setHarness, modelTextEl }) {
       b.onclick = () => { if (txt) txt.value = id; renderModels(); };
       return b;
     };
-    row.appendChild(mk("", "default")); // clears the override → harness account default
-    for (const m of (FW_MODELS[getHarness()] || [])) row.appendChild(mk(m, m));
+    // "(default)" → empty model string → supervisor model_args omits -m/--model (account default).
+    // FW_MODELS may include "" (opencode) as a documented resilient entry; skip it here so we
+    // don't paint two identical default chips.
+    row.appendChild(mk("", "(default)"));
+    for (const m of (FW_MODELS[getHarness()] || [])) {
+      if (!m) continue;
+      row.appendChild(mk(m, m));
+    }
     // Back the free-text field with a <datalist> of the FULL live list (autocomplete over all real
     // ids without exploding the tile row). Falls back to the curated set when there's no live list.
     const entry = fwModelCache[getHarness()];
@@ -5776,7 +5828,12 @@ function makeHarnessPicker({ prefix, getHarness, setHarness, modelTextEl }) {
     if (dl) {
       dl.replaceChildren();
       const full = (entry && entry.models.length) ? entry.models : (FW_MODELS[getHarness()] || []);
-      for (const m of full) { const o = document.createElement("option"); o.value = m; dl.appendChild(o); }
+      for (const m of full) {
+        if (!m) continue;
+        const o = document.createElement("option");
+        o.value = m;
+        dl.appendChild(o);
+      }
     }
     // Honest source badge: live (dynamic enumeration) vs curated (this harness can't list).
     const src = $("model-src");

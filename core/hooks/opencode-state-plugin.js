@@ -23,7 +23,7 @@ export const AgentTeamsStatePlugin = async () => {
         if (!wsid) return; // not an agent-teams pane → no-op
         const base =
           process.env.AGENT_TEAMS_STATE_DIR ||
-          join(process.env.HOME || "", "Library/Application Support/agent-teams");
+          join(process.env.HOME || "", "Library/Application Support/harness-ready/agent-teams");
         const dir = join(base, wsid);
         mkdirSync(dir, { recursive: true });
         const line =
