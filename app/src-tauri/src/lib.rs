@@ -66,6 +66,11 @@ mod daemon_client;
 // OFF there are no daemon-owned panes → no reader is ever started → byte-identical to today.
 mod daemon_stream;
 
+// Codex CLI trust-sync: auto-registers worktree paths as trusted projects in
+// ~/.codex/config.toml so Codex CLI uses the same settings in worktrees as in
+// the main repo. Fail-soft — a missing ~/.codex/ is a no-op, never an error.
+mod codex_trust;
+
 /// A delegation run is considered STALE (possibly a hung controller thread) when this many ms pass
 /// with NO heartbeat (no `say_back` progress line AND no worker-stdout flush). The HUD surfaces it and
 /// offers a human force-clear; nothing auto-kills. Generous so a long-but-live worker edit (no stdout)
@@ -1595,6 +1600,9 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
     let wt_meta = wt.map(|w| {
         let _g = state.worktree_registry_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         registry_add(&state.worktree_registry, &ps.id, &w.git_root, &w.root, None);
+        // Codex CLI trust-sync: register this worktree path so Codex CLI uses the
+        // same settings here as in the main repo. Fail-soft (best-effort).
+        let _ = codex_trust::ensure_trusted(&w.root);
         (w.git_root, w.root)
     });
     // Kill-on-replace (perf-review F1): commands left the main thread (async attr), so a
@@ -9610,6 +9618,31 @@ struct ConfigFileLocations {
     trusted_repos: String,
 }
 
+/// Sync all worktree paths (from the persistent registry + git worktree list for
+/// the given repo) into `~/.codex/config.toml` as trusted projects. Returns the
+/// count of newly registered paths. The frontend Settings page can call this so
+/// the user can trigger a full sync after creating worktrees outside the app.
+#[tauri::command]
+fn sync_codex_trust(
+    state: tauri::State<AppState>,
+    repo_root: Option<String>,
+) -> Result<u32, String> {
+    let registry = &state.worktree_registry;
+    let mut total = 0u32;
+    // Always sync the registry (covers all recorded worktrees).
+    total += codex_trust::sync_registry_worktrees(registry)
+        .map_err(|e| format!("registry sync failed: {e}"))?;
+    // If a repo root was provided, also sync its git worktree list.
+    if let Some(ref root) = repo_root {
+        let path = std::path::Path::new(root);
+        if path.is_dir() {
+            total += codex_trust::sync_git_worktrees(path)
+                .map_err(|e| format!("git worktree sync failed: {e}"))?;
+        }
+    }
+    Ok(total)
+}
+
 // ─────────────────── P3 §3.9-A — pre-flight repo-map (DEFINE enrichment) ───────────────────
 //
 // "Map before agents look": before any worker touches code, prepend a cheap, deterministic,
@@ -13687,6 +13720,14 @@ pub fn run() {
             // are kept; run before the state-dir wipe (the registry is a sibling,
             // so the wipe spares it).
             sweep_orphan_worktrees(&worktree_registry);
+            // Codex CLI trust-sync: register all recorded worktree paths as trusted
+            // projects so Codex CLI uses the same settings in worktrees as in the main
+            // repo. Fail-soft — a missing ~/.codex/ is a silent no-op.
+            if let Ok(n) = codex_trust::sync_registry_worktrees(&worktree_registry) {
+                if n > 0 {
+                    eprintln!("[codex-trust] startup: registered {n} worktree path(s) as trusted");
+                }
+            }
             // Per-pane cline homes carry OAuth-token copies; sessions don't survive
             // restart (D7), so every home from a prior run is stale — sweep them all.
             let swept_cline = supervisor::sweep_stale_cline_homes(&state_root, |_| false);
@@ -14121,6 +14162,7 @@ pub fn run() {
             untrust_repo_cmd,
             trust_repo_cmd,
             config_file_locations,
+            sync_codex_trust,
             send_input,
             pause_pane,
             resume_pane,
