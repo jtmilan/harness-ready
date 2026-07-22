@@ -361,62 +361,85 @@ fn git_out(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
 ///
 /// `state_adapter::inject` writes the worktree's `.claude/settings.local.json` from a
 /// hooks-only template. A fresh worktree has no `.claude/` of its own (`.claude/` is
-/// gitignored → never in the checkout), so any per-repo `env` the operator keeps in the
-/// SOURCE repo's `.claude/settings.local.json` — the Bedrock switch
-/// (`CLAUDE_CODE_USE_BEDROCK` / `AWS_PROFILE` / `ANTHROPIC_DEFAULT_*`), proxies, etc. —
-/// would be dropped and the pane would silently fall back to the account default.
+/// gitignored → never in the checkout), so any `env` the operator keeps — whether in the
+/// global `~/.claude/settings.json` (e.g. `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
+/// `ANTHROPIC_MODEL` for proxy/reroute setups) or the SOURCE repo's
+/// `.claude/settings.local.json` (e.g. `CLAUDE_CODE_USE_BEDROCK` / `AWS_PROFILE` /
+/// `ANTHROPIC_DEFAULT_*`) — would be dropped and the pane would silently fall back to the
+/// account default (or hang trying to reach an unreachable API).
 ///
-/// Resolve the source repo (the worktree's main working tree = the parent of the common
-/// git dir, via `git rev-parse --git-common-dir`), read its `settings.local.json`, and
-/// return ONLY its top-level `env` object as a `,\n  "env": { … }` fragment ready to
-/// splice into the template's `{{ENV_BLOCK}}` slot. Returns `""` (the prior clobber
-/// behavior) when there is no source file, no `env` key, an empty `env`, or anything
-/// unparseable — never an error: a missing env must not fail a spawn. Only the `env`
-/// block is merged; the operator's permissions / MCP toggles stay the pane's own (the
-/// app intentionally sets its own hooks + `disabledMcpjsonServers`).
-fn source_repo_claude_env_block(worktree: &Path) -> String {
-    let Ok(out) = git_out(worktree, &["rev-parse", "--git-common-dir"]) else {
-        return String::new();
-    };
-    if !out.status.success() {
-        return String::new();
-    }
-    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if common.is_empty() {
-        return String::new();
-    }
-    // `--git-common-dir` is relative to the worktree when not absolute.
-    let common_path = {
-        let p = PathBuf::from(&common);
-        if p.is_absolute() {
-            p
-        } else {
-            worktree.join(p)
-        }
-    };
-    // main repo root = parent of `<root>/.git`
-    let Some(main_root) = common_path.parent() else {
-        return String::new();
-    };
-    let settings = main_root.join(".claude").join("settings.local.json");
-    let Ok(body) = std::fs::read_to_string(&settings) else {
-        return String::new();
+/// Two-layer merge (global base → repo override):
+/// 1. Read `~/.claude/settings.json` `env` as the base layer.
+/// 2. Read the source repo's `.claude/settings.local.json` `env` and overlay on top
+///    (repo-level keys win).
+/// Return the merged map as a `,\n  "env": { … }` fragment ready to splice into the
+/// template's `{{ENV_BLOCK}}` slot. Returns `""` (the prior clobber behavior) when
+/// neither source contributes any env — never an error: a missing env must not fail a
+/// spawn. Only the `env` block is merged; the operator's permissions / MCP toggles stay
+/// the pane's own (the app intentionally sets its own hooks + `disabledMcpjsonServers`).
+/// Read the `env` object from a Claude settings JSON file. Returns an empty map on
+/// any I/O or parse error — a missing or malformed settings file is never fatal.
+fn read_claude_env_from(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return serde_json::Map::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return String::new();
+        return serde_json::Map::new();
     };
-    let Some(env) = v.get("env").and_then(|e| e.as_object()) else {
-        return String::new();
-    };
-    if env.is_empty() {
+    v.get("env")
+        .and_then(|e| e.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Two-layer merge of Claude `env` blocks into a splice-ready JSON fragment.
+///
+/// `global_settings` is the base layer (typically `~/.claude/settings.json`);
+/// `repo_settings` overlays on top (typically the source repo's
+/// `.claude/settings.local.json`). Repo-level keys win on conflict. Returns `""`
+/// when neither source contributes any env vars.
+fn merge_claude_env_block(global_settings: &Path, repo_settings: &Path) -> String {
+    let mut merged = read_claude_env_from(global_settings);
+    for (k, v) in read_claude_env_from(repo_settings) {
+        merged.insert(k, v);
+    }
+    if merged.is_empty() {
         return String::new();
     }
-    let Ok(env_json) = serde_json::to_string_pretty(env) else {
+    let Ok(env_json) = serde_json::to_string_pretty(&merged) else {
         return String::new();
     };
     // indent nested lines two spaces so the object sits under the template's top level
     let indented = env_json.replace('\n', "\n  ");
     format!(",\n  \"env\": {indented}")
+}
+
+fn source_repo_claude_env_block(worktree: &Path) -> String {
+    // Layer 1 — global ~/.claude/settings.json (base).
+    let global = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".claude").join("settings.json"))
+        .unwrap_or_default();
+
+    // Layer 2 — source repo's .claude/settings.local.json (overrides global).
+    let repo_settings = git_out(worktree, &["rev-parse", "--git-common-dir"])
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let common = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if common.is_empty() {
+                return None;
+            }
+            let common_path = {
+                let p = PathBuf::from(&common);
+                if p.is_absolute() { p } else { worktree.join(p) }
+            };
+            common_path
+                .parent()
+                .map(|r| r.join(".claude").join("settings.local.json"))
+        })
+        .unwrap_or_default();
+
+    merge_claude_env_block(&global, &repo_settings)
 }
 
 /// Create an isolated git worktree for `selected`, scoped to only that folder.
@@ -1136,17 +1159,77 @@ fn remove_codex_mcp(pane_id: &str) {
     }
     let server_name = codex_mcp_server_name(pane_id);
     let Ok(content) = std::fs::read_to_string(&config) else { return };
+    let cleaned = strip_managed_codex_block(&content, &server_name);
+    if cleaned.len() != content.len() {
+        let _ = std::fs::write(&config, cleaned);
+    }
+}
+
+/// Pure: strip ONE `@agent-teams-managed:<server_name>` region (begin marker through
+/// end marker, plus one trailing newline) from `content`. Returns `content` unchanged
+/// when the block is absent. Shared by [`remove_codex_mcp`] (one pane) and
+/// [`strip_all_managed_codex_blocks`] (startup purge) so both stay in lock-step with
+/// the marker format [`inject_codex_mcp`] writes. No I/O → unit-testable without HOME.
+fn strip_managed_codex_block(content: &str, server_name: &str) -> String {
     let begin_marker = format!("# >>> @agent-teams-managed:{server_name} >>>");
     let end_marker = format!("# <<< @agent-teams-managed:{server_name} <<<");
-    let Some(start) = content.find(&begin_marker) else { return };
-    let Some(end_rel) = content[start..].find(&end_marker) else { return };
+    let Some(start) = content.find(&begin_marker) else { return content.to_string() };
+    let Some(end_rel) = content[start..].find(&end_marker) else { return content.to_string() };
     let end = start + end_rel + end_marker.len();
-    // consume trailing newline if present
     let end = if content[end..].starts_with('\n') { end + 1 } else { end };
     let mut cleaned = String::with_capacity(content.len());
     cleaned.push_str(&content[..start]);
     cleaned.push_str(&content[end..]);
-    let _ = std::fs::write(&config, cleaned);
+    cleaned
+}
+
+/// Pure: strip EVERY `@agent-teams-managed:*` region from `content` (the startup
+/// hygiene pass — see [`purge_all_managed_codex_mcp`]). Returns `(cleaned, removed)`.
+/// Discovers blocks by scanning begin markers, so it cleans whatever
+/// [`inject_codex_mcp`] wrote regardless of pane id. No I/O → unit-testable.
+fn strip_all_managed_codex_blocks(content: &str) -> (String, usize) {
+    const PREFIX: &str = "# >>> @agent-teams-managed:";
+    let mut out = content.to_string();
+    let mut removed = 0usize;
+    loop {
+        let Some(idx) = out.find(PREFIX) else { break };
+        let name_start = idx + PREFIX.len();
+        let Some(end_marker_rel) = out[name_start..].find(" >>>") else { break };
+        let server_name = &out[name_start..name_start + end_marker_rel];
+        if server_name.is_empty() {
+            break;
+        }
+        let before = out.len();
+        out = strip_managed_codex_block(&out, server_name);
+        if out.len() == before {
+            break; // marker present but malformed (no end) — stop, don't spin
+        }
+        removed += 1;
+    }
+    (out, removed)
+}
+
+/// Startup hygiene: drop EVERY per-pane `[mcp_servers.agent-teams-<pane>]` block we
+/// previously injected into `~/.codex/config.toml`. At process start NO codex pane of
+/// ours is live (panes are spawned AFTER setup), so any managed block on disk is a leak
+/// from a prior session that died without reaching [`Supervisor::kill`] (app/daemon
+/// crash, force-quit, external worktree reap) — codex's GLOBAL config otherwise
+/// accumulates one stale `agent-teams-<workspace>` server per dead pane (the "many
+/// workspaces" bloat). Best-effort + idempotent; live panes re-inject on spawn. Returns
+/// the number of blocks removed. Mirrors the fail-soft startup sweeps (orphan-worktree,
+/// codex-trust sync). Gated by the caller on single-instance so a second app instance
+/// never purges the first's live blocks.
+pub fn purge_all_managed_codex_mcp() -> usize {
+    let Some(config) = codex_config_path() else { return 0 };
+    if !config.is_file() {
+        return 0;
+    }
+    let Ok(content) = std::fs::read_to_string(&config) else { return 0 };
+    let (cleaned, removed) = strip_all_managed_codex_blocks(&content);
+    if removed > 0 {
+        let _ = std::fs::write(&config, cleaned);
+    }
+    removed
 }
 
 /// Deterministic per-pane MCP server name. Pane ids are `[a-zA-Z0-9-]` (e.g.
@@ -2584,9 +2667,11 @@ mod tests {
             .unwrap_or(0)
     }
 
-    // Fix-B: source_repo_claude_env_block lifts the SOURCE repo's `.claude/settings.local.json`
+    // Fix-B: merge_claude_env_block lifts the SOURCE repo's `.claude/settings.local.json`
     // `env` into a splice-ready fragment for a worktree pane — so Bedrock (and any per-repo env)
     // survives worktree isolation instead of being clobbered by the hooks-only template.
+    // Uses merge_claude_env_block directly with a nonexistent global path so the test
+    // is hermetic (not affected by the developer's real ~/.claude/settings.json).
     #[test]
     fn source_env_block_lifts_source_env_for_worktree() {
         let repo = std::env::temp_dir().join(format!("at-envblk-{}", test_nonce()));
@@ -2615,7 +2700,10 @@ mod tests {
             "worktree must NOT carry the source's untracked settings.local.json"
         );
 
-        let frag = source_repo_claude_env_block(&wt.root);
+        // Use merge_claude_env_block with a nonexistent global path (hermetic test).
+        let noglobal = repo.join("nonexistent-global-settings.json");
+        let repo_settings = repo.join(".claude").join("settings.local.json");
+        let frag = merge_claude_env_block(&noglobal, &repo_settings);
         assert!(
             frag.starts_with(",\n"),
             "leading comma to splice after hooks: {frag:?}"
@@ -2636,27 +2724,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    // Fix-B: no source settings (or no `env` key) → empty fragment = prior clobber behavior, never err.
+    // No source settings (or no `env` key) → empty fragment = prior clobber behavior, never err.
+    // Uses merge_claude_env_block with two nonexistent paths (hermetic).
     #[test]
     fn source_env_block_empty_when_no_source_settings() {
-        let repo = std::env::temp_dir().join(format!("at-envblk-none-{}", test_nonce()));
-        let _ = std::fs::remove_dir_all(&repo);
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q"]);
-        git(&repo, &["config", "user.email", "t@t"]);
-        git(&repo, &["config", "user.name", "t"]);
-        std::fs::write(repo.join("base.txt"), "v1").unwrap();
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-q", "-m", "base"]);
-
-        let wt = add_worktree(&repo, "envblk2").expect("add_worktree");
+        let base = std::env::temp_dir().join(format!("at-envblk-none-{}", test_nonce()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let noglobal = base.join("nonexistent-global.json");
+        let norepo = base.join("nonexistent-repo.json");
         assert_eq!(
-            source_repo_claude_env_block(&wt.root),
+            merge_claude_env_block(&noglobal, &norepo),
             "",
-            "no source env → empty fragment"
+            "no env from either source → empty fragment"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
-        let _ = std::fs::remove_dir_all(&repo);
+    // Global env inheritance: ~/.claude/settings.json env (e.g. ANTHROPIC_BASE_URL for
+    // proxy/reroute) must be inherited into worktree panes even when the repo has no env.
+    #[test]
+    fn merge_env_block_inherits_global_env() {
+        let base = std::env::temp_dir().join(format!("at-envblk-global-{}", test_nonce()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let global = base.join("global-settings.json");
+        std::fs::write(
+            &global,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://proxy.example.com","ANTHROPIC_MODEL":"qwen3.8-max-preview"}}"#,
+        )
+        .unwrap();
+        let norepo = base.join("nonexistent-repo.json");
+        let frag = merge_claude_env_block(&global, &norepo);
+        assert!(frag.starts_with(",\n"), "leading comma: {frag:?}");
+        let merged = format!("{{\n  \"hooks\": {{}}{frag}\n}}");
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        assert_eq!(
+            v["env"]["ANTHROPIC_BASE_URL"], "https://proxy.example.com",
+            "global ANTHROPIC_BASE_URL inherited"
+        );
+        assert_eq!(
+            v["env"]["ANTHROPIC_MODEL"], "qwen3.8-max-preview",
+            "global ANTHROPIC_MODEL inherited"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Two-layer merge: repo env overrides global env on key conflict.
+    #[test]
+    fn merge_env_block_repo_overrides_global() {
+        let base = std::env::temp_dir().join(format!("at-envblk-merge-{}", test_nonce()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let global = base.join("global-settings.json");
+        std::fs::write(
+            &global,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://global.example.com","ANTHROPIC_MODEL":"global-model","SHARED_KEY":"from-global"}}"#,
+        )
+        .unwrap();
+        let repo = base.join("repo-settings.json");
+        std::fs::write(
+            &repo,
+            r#"{"env":{"ANTHROPIC_MODEL":"repo-model","REPO_ONLY":"yes"}}"#,
+        )
+        .unwrap();
+        let frag = merge_claude_env_block(&global, &repo);
+        let merged = format!("{{\n  \"hooks\": {{}}{frag}\n}}");
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        // global-only key preserved
+        assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "https://global.example.com");
+        // repo overrides global on conflict
+        assert_eq!(v["env"]["ANTHROPIC_MODEL"], "repo-model", "repo overrides global");
+        // repo-only key present
+        assert_eq!(v["env"]["REPO_ONLY"], "yes");
+        // global-only key that repo doesn't touch is preserved
+        assert_eq!(v["env"]["SHARED_KEY"], "from-global");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // 07-03 / D41: freshen_worktree resets a diverged + dirty worktree back to the
@@ -2901,6 +3044,45 @@ mod tests {
         assert_eq!(count_second, 1, "still exactly one block (idempotent)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Pure strip helpers — no I/O, so no HOME/fixture needed. Guards the startup
+    // purge (`purge_all_managed_codex_mcp`) that cleans leaked per-pane codex blocks.
+    #[test]
+    fn strip_managed_codex_block_removes_one_preserves_rest() {
+        let content = "# user config\nmodel = \"o3\"\n\n# >>> @agent-teams-managed:agent-teams-ws1-p0 >>>\n[mcp_servers.agent-teams-ws1-p0]\ncommand = \"/bin/true\"\nenv = { AGENT_TEAMS_PANE_ID = \"ws1-p0\" }\n# <<< @agent-teams-managed:agent-teams-ws1-p0 <<<\n\n# trailing user comment\n";
+        let cleaned = strip_managed_codex_block(content, "agent-teams-ws1-p0");
+        assert!(!cleaned.contains("mcp_servers.agent-teams-ws1-p0"), "block gone");
+        assert!(!cleaned.contains("@agent-teams-managed:agent-teams-ws1-p0"), "markers gone");
+        assert!(cleaned.contains("model = \"o3\""), "user config preserved");
+        assert!(cleaned.contains("# trailing user comment"), "trailing content preserved");
+        // absent server name → unchanged
+        assert_eq!(
+            strip_managed_codex_block(content, "agent-teams-ws999-p0"),
+            content
+        );
+    }
+
+    #[test]
+    fn strip_all_managed_codex_blocks_purges_every_leak_keeps_user_config() {
+        let mut content = String::from("# user config\nmodel = \"o3\"\n");
+        for pane in ["ws10734x0-p0", "ws19723x0-p0", "ws83581x0-p0"] {
+            let sn = codex_mcp_server_name(pane);
+            content.push_str(&format!(
+                "\n# >>> @agent-teams-managed:{sn} >>>\n[mcp_servers.{sn}]\ncommand = \"/bin/true\"\nenv = {{ AGENT_TEAMS_PANE_ID = {pane:?} }}\n# <<< @agent-teams-managed:{sn} <<<\n"
+            ));
+        }
+        content.push_str("\n# trailing user comment\n");
+        let (cleaned, removed) = strip_all_managed_codex_blocks(&content);
+        assert_eq!(removed, 3, "all three leaked blocks purged");
+        assert!(!cleaned.contains("@agent-teams-managed"), "no managed markers remain");
+        assert!(!cleaned.contains("mcp_servers.agent-teams-"), "no managed server tables remain");
+        assert!(cleaned.contains("model = \"o3\""), "user config preserved");
+        assert!(cleaned.contains("# trailing user comment"), "trailing content preserved");
+        // idempotent: a second pass finds nothing
+        let (cleaned2, removed2) = strip_all_managed_codex_blocks(&cleaned);
+        assert_eq!(removed2, 0);
+        assert_eq!(cleaned2, cleaned);
     }
 
 }

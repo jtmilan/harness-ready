@@ -13889,6 +13889,19 @@ pub fn run() {
             // detected second instance so we don't clobber the first instance's state.
             if single_instance {
                 let _ = std::fs::remove_dir_all(&state_root);
+                // Codex MCP startup hygiene (mirrors the daemon): we are the sole instance
+                // and have spawned no panes yet, so any `[mcp_servers.agent-teams-<pane>]`
+                // block in ~/.codex/config.toml is a leak from a prior session that died
+                // without `Supervisor::kill`. Codex's GLOBAL config otherwise piles up one
+                // stale `agent-teams-<workspace>` server per dead pane (the "many workspaces"
+                // bloat in the MCP list). Purge them; live panes re-inject on spawn. Gated on
+                // single_instance so a second instance never wipes the first's live blocks.
+                let purged = supervisor::purge_all_managed_codex_mcp();
+                if purged > 0 {
+                    eprintln!(
+                        "[agent-teams] startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
+                    );
+                }
             } else {
                 eprintln!(
                     "[agent-teams] another instance holds {} — preserving state_root (skipping startup wipe)",
