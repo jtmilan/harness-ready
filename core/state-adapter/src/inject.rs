@@ -318,6 +318,61 @@ pub fn inject_commandcode_mcp(
     Ok(out)
 }
 
+/// Escape a string for safe embedding inside a TOML basic (double-quoted) string value.
+/// TOML basic strings require `"` → `\"` and `\` → `\\`; control chars are not expected in
+/// macOS paths or pane ids, so they are left to the TOML parser to reject (loud failure is
+/// better than a silently malformed config). PURE → unit-tested below.
+///
+/// The cursor/commandcode JSON templates wrap the sidecar in `/bin/sh -c "exec '…'"` which
+/// sidesteps this (JSON's escaping is simpler + the wrapper isolates the path). The Grok TOML
+/// template embeds the path directly in `command = "…"`, so the path MUST be TOML-escaped.
+/// On macOS the typical paths (`/Applications/Agent Teams.app/…`, `~/Library/Application
+/// Support/…`) contain spaces but no `"` or `\`, so this is a ROBUSTNESS guard — the prior
+/// code worked in practice but would produce invalid TOML for any path containing a quote or
+/// backslash (a live-verify-owed follow-up if such a path is ever observed).
+fn toml_basic_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Inject the Agent Teams MCP sidecar into an OpenCode pane's project-scoped config.
+/// OpenCode reads `opencode.json` at the project root (NOT `.mcp.json` — that format is
+/// Claude/Cursor-specific and OpenCode silently ignores it, GitHub issue #27809 "Closed
+/// as not planned"). The MCP key in `opencode.json` is `"mcp"` (not `"mcpServers"`),
+/// with `type: "local"`, `command` as a string array, and `environment` (not `env`).
+/// Same provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE).
+///
+/// OVERWRITES + git-excludes: the worktree is disposable, so a repo's own committed
+/// `opencode.json` is shadowed only inside this ephemeral pane. Additive sibling to
+/// [`inject_commandcode_mcp`] / [`inject_mcp_config`] — do NOT fold in. std-only.
+/// OpenCode merges project-level config with global (`~/.config/opencode/opencode.json`)
+/// so the pane's user-configured models/providers are preserved; only `mcp` is added.
+pub fn inject_opencode_mcp(
+    repo_dir: &Path,
+    templates_dir: &Path,
+    sidecar_bin: &Path,
+    state_root: &Path,
+    pane_id: &str,
+    repo_key: &str,
+) -> io::Result<PathBuf> {
+    const REL: &str = "opencode.json";
+    let tmpl = fs::read_to_string(templates_dir.join("opencode-mcp.tmpl.json"))?;
+    let rendered = tmpl
+        .replace("{{SIDECAR}}", &sidecar_bin.to_string_lossy())
+        .replace("{{STATE_DIR}}", &state_root.to_string_lossy())
+        .replace("{{PANE_ID}}", pane_id)
+        .replace("{{REPO_KEY}}", repo_key)
+        .replace("{{TASK_SCOPE}}", pane_id);
+
+    let out = repo_dir.join(REL);
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_config_guarded(repo_dir, &out, &rendered)?;
+    // keep `git status` clean — generated tooling, not project source (idempotent)
+    exclude_from_git(repo_dir, REL)?;
+    Ok(out)
+}
+
 /// Inject the Agent Teams MCP sidecar into a GROK pane's project-scoped config.
 /// Grok reads `.grok/config.toml` at the project root (discovered by path, like
 /// cursor's `.cursor/mcp.json`). The template is TOML (not JSON) — grok's native
@@ -336,9 +391,20 @@ pub fn inject_grok_mcp(
 ) -> io::Result<PathBuf> {
     const REL: &str = ".grok/config.toml";
     let tmpl = fs::read_to_string(templates_dir.join("grok-mcp.tmpl.toml"))?;
+    // TOML basic-string escape the path values (SIDECAR/STATE_DIR) — they land inside
+    // double-quoted TOML values, so an unescaped `"` or `\` would produce invalid TOML.
+    // PANE_ID/REPO_KEY/TASK_SCOPE are alphanumeric + hyphens by construction, so they
+    // are safe without escaping (but escaping them is a no-op and would be belt-and-
+    // suspenders if the id format ever changes).
     let rendered = tmpl
-        .replace("{{SIDECAR}}", &sidecar_bin.to_string_lossy())
-        .replace("{{STATE_DIR}}", &state_root.to_string_lossy())
+        .replace(
+            "{{SIDECAR}}",
+            &toml_basic_escape(&sidecar_bin.to_string_lossy()),
+        )
+        .replace(
+            "{{STATE_DIR}}",
+            &toml_basic_escape(&state_root.to_string_lossy()),
+        )
         .replace("{{PANE_ID}}", pane_id)
         .replace("{{REPO_KEY}}", repo_key)
         .replace("{{TASK_SCOPE}}", pane_id);
@@ -698,6 +764,74 @@ mod mcp_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // opencode: writes `opencode.json` (NOT `.mcp.json` — OpenCode ignores that format,
+    // anomalyco/opencode#27809). Uses OpenCode's native MCP schema: `"mcp"` key (not
+    // `"mcpServers"`), `type: "local"`, `command` as a string array, `environment` (not `env`).
+    // Git-excluded idempotently, like commandcode/cursor.
+    #[test]
+    fn opencode_config_at_worktree_root_and_excluded_idempotently() {
+        let root = scratch("opencode");
+        let repo = root.join("worktree");
+        let staged = root.join("staged-hooks");
+        let state = root.join("app-state");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::copy(
+            templates_dir().join("opencode-mcp.tmpl.json"),
+            staged.join("opencode-mcp.tmpl.json"),
+        )
+        .unwrap();
+
+        let sidecar = PathBuf::from("/abs/path/to/agent-teams-mcp");
+        let written =
+            inject_opencode_mcp(&repo, &staged, &sidecar, &state, "ws-oc-p0", "ws-oc")
+                .expect("inject opencode");
+
+        // project scope = `opencode.json` at the worktree ROOT
+        assert_eq!(written, repo.join("opencode.json"));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&written).unwrap()).expect("parseable JSON");
+        // OpenCode schema: "mcp" key (NOT "mcpServers")
+        assert!(
+            v.get("mcp").is_some(),
+            "opencode.json must use 'mcp' key, got: {v}"
+        );
+        assert!(
+            v.get("mcpServers").is_none(),
+            "opencode.json must NOT use 'mcpServers' key"
+        );
+        let srv = &v["mcp"]["agent-teams"];
+        // type: "local" for stdio servers
+        assert_eq!(srv["type"], "local");
+        // command as string array (not separate command + args)
+        assert_eq!(srv["command"][0], "/bin/sh");
+        assert_eq!(srv["command"][1], "-c");
+        assert_eq!(srv["command"][2], "exec '/abs/path/to/agent-teams-mcp'");
+        // environment (not env)
+        assert_eq!(
+            srv["environment"]["AGENT_TEAMS_STATE_DIR"],
+            state.to_string_lossy().as_ref()
+        );
+        assert_eq!(srv["environment"]["AGENT_TEAMS_PANE_ID"], "ws-oc-p0");
+        assert_eq!(srv["environment"]["AGENT_TEAMS_MEMORY_REPO_KEY"], "ws-oc");
+        assert_eq!(srv["environment"]["AGENT_TEAMS_TASK_SCOPE"], "ws-oc-p0");
+        // enabled
+        assert_eq!(srv["enabled"], true);
+
+        // excluded exactly once, idempotent on a second inject
+        inject_opencode_mcp(&repo, &staged, &sidecar, &state, "ws-oc-p0", "ws-oc")
+            .expect("inject opencode again");
+        let body = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            body.matches("opencode.json").count(),
+            1,
+            "exclude entry must be idempotent: {body:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // D70 follow-up: the bug only reproduces in a REAL linked worktree (`.git` is a FILE
     // → `<repo>/.git/info` doesn't exist), which the faked fixtures above mask. Use real
     // `git worktree add` and assert the exclude lands in the COMMON dir (what git reads).
@@ -851,5 +985,127 @@ mod mcp_tests {
                 "{name}: flat schema, no transport"
             );
         }
+    }
+
+    // TOML basic-string escaping: the Grok template embeds paths inside double-quoted
+    // TOML values, so `"` and `\` must be escaped. Pure → unit-pinned.
+    #[test]
+    fn toml_basic_escape_handles_quotes_and_backslashes() {
+        // normal macOS path (spaces OK, no escaping needed)
+        assert_eq!(
+            super::toml_basic_escape("/Applications/Agent Teams.app/bin/mcp"),
+            "/Applications/Agent Teams.app/bin/mcp"
+        );
+        // a path with a double-quote (unlikely but possible) → escaped
+        assert_eq!(
+            super::toml_basic_escape("/path/with\"quote"),
+            "/path/with\\\"quote"
+        );
+        // a path with a backslash (Windows-style, or unusual macOS) → escaped
+        assert_eq!(
+            super::toml_basic_escape("/path/with\\backslash"),
+            "/path/with\\\\backslash"
+        );
+        // both together
+        assert_eq!(
+            super::toml_basic_escape("a\"b\\c"),
+            "a\\\"b\\\\c"
+        );
+    }
+
+    // Grok MCP injection: renders the TOML template with real placeholders and applies
+    // TOML escaping to path values. Regression guard: a sidecar path containing `"` or `\`
+    // would have produced invalid TOML before the toml_basic_escape fix. The state-adapter
+    // crate stays std-only (no toml dev-dep), so validation is pattern-based rather than
+    // a full parse — sufficient to catch the escaping regression.
+    #[test]
+    fn grok_mcp_injection_carries_escaped_paths_and_provenance_env() {
+        let root = scratch("grok");
+        let repo = root.join("worktree");
+        let staged = root.join("staged-hooks");
+        let state = root.join("Application Support").join("agent-teams");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::copy(
+            templates_dir().join("grok-mcp.tmpl.toml"),
+            staged.join("grok-mcp.tmpl.toml"),
+        )
+        .unwrap();
+
+        // sidecar path with a space (common on macOS) — must survive TOML embedding
+        let sidecar =
+            PathBuf::from("/Applications/Agent Teams.app/Contents/MacOS/agent-teams-mcp");
+        let written =
+            super::inject_grok_mcp(&repo, &staged, &sidecar, &state, "ws-grok-p0", "ws-grok")
+                .expect("inject grok");
+
+        assert_eq!(written, repo.join(".grok/config.toml"));
+        let body = fs::read_to_string(&written).unwrap();
+        // The TOML section header + key structure is present.
+        assert!(
+            body.contains("[mcp_servers.agent-teams]"),
+            "TOML section header: {body}"
+        );
+        assert!(body.contains("enabled = true"), "enabled flag: {body}");
+        // The sidecar path is embedded (spaces preserved, no unescaped quotes).
+        assert!(
+            body.contains("Agent Teams.app"),
+            "spaced path preserved: {body}"
+        );
+        // The provenance env block carries the correct values.
+        assert!(
+            body.contains("AGENT_TEAMS_PANE_ID = \"ws-grok-p0\""),
+            "pane_id: {body}"
+        );
+        assert!(
+            body.contains("AGENT_TEAMS_MEMORY_REPO_KEY = \"ws-grok\""),
+            "repo_key: {body}"
+        );
+        assert!(
+            body.contains("AGENT_TEAMS_TASK_SCOPE = \"ws-grok-p0\""),
+            "task_scope: {body}"
+        );
+        assert!(
+            body.contains("AGENT_TEAMS_STATE_DIR = "),
+            "state_dir present: {body}"
+        );
+
+        // REGRESSION: a path with a double-quote must be escaped (the old code would have
+        // produced `command = "/path/with"quote"` which is invalid TOML).
+        let root2 = scratch("grok-quote");
+        let repo2 = root2.join("worktree");
+        let staged2 = root2.join("staged-hooks");
+        let state2 = root2.join("state");
+        fs::create_dir_all(&repo2).unwrap();
+        fs::create_dir_all(&staged2).unwrap();
+        fs::create_dir_all(repo2.join(".git/info")).unwrap();
+        fs::copy(
+            templates_dir().join("grok-mcp.tmpl.toml"),
+            staged2.join("grok-mcp.tmpl.toml"),
+        )
+        .unwrap();
+        let quoted_sidecar = PathBuf::from("/path/with\"quote/mcp");
+        super::inject_grok_mcp(&repo2, &staged2, &quoted_sidecar, &state2, "ws-q-p0", "ws-q")
+            .expect("inject grok with quoted path");
+        let body2 = fs::read_to_string(repo2.join(".grok/config.toml")).unwrap();
+        // The quote must be escaped: `\"` appears, never a bare `"` inside the value.
+        assert!(
+            body2.contains("with\\\"quote"),
+            "double-quote in path must be TOML-escaped: {body2}"
+        );
+
+        // excluded exactly once, idempotent on a second inject
+        super::inject_grok_mcp(&repo, &staged, &sidecar, &state, "ws-grok-p0", "ws-grok")
+            .expect("inject grok again");
+        let excl_body = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            excl_body.matches(".grok/config.toml").count(),
+            1,
+            "exclude entry must be idempotent: {excl_body:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
     }
 }

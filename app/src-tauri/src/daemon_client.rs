@@ -131,14 +131,24 @@ pub fn daemon_spawn(state_root: &Path, spec: &SpawnSpec) -> Result<(), String> {
     ok_or_err(resp)
 }
 
-/// Type into a daemon-owned pane via the daemon's gated `SendInput` op (the daemon owns the
-/// C7 claude prime + split-submit + D30 alive gate). Strips the app-appended trailing `\r`
-/// (the daemon's `normalize_input` re-appends the single CR submit); the body is sent as the
-/// one-line `text`.
+/// Type into a daemon-owned pane via the daemon's gated `WritePtyRaw` op (the daemon owns the
+/// C7 claude prime + split-submit + D30 alive gate). Sends raw bytes verbatim — the daemon
+/// writes them directly to the PTY master without running through `normalize_input` (which
+/// would reject control characters like ESC/arrows/backspace and append `\r` to every input,
+/// breaking raw terminal keystrokes). The daemon's `handle_write_pty_raw` still applies the
+/// D30 alive gate + per-pane write serializer via `handle_split_write`.
 pub fn daemon_send_input(state_root: &Path, id: &str, data: &[u8]) -> Result<(), String> {
-    let body = data.strip_suffix(b"\r").unwrap_or(data);
-    let text = String::from_utf8_lossy(body).into_owned();
-    let resp = dial(state_root, &SocketRequest::SendInput { id: id.to_string(), text })?;
+    // Send raw bytes as a String (lossy UTF-8). The daemon converts back to bytes on the
+    // other side. This is safe because xterm.js output is valid UTF-8, and the daemon's
+    // `handle_split_write` operates on &[u8] regardless.
+    let data_str = String::from_utf8_lossy(data).into_owned();
+    let resp = dial(
+        state_root,
+        &SocketRequest::WritePtyRaw {
+            id: id.to_string(),
+            data: data_str,
+        },
+    )?;
     ok_or_err(resp)
 }
 
@@ -252,19 +262,20 @@ mod tests {
     }
 
     #[test]
-    fn daemon_send_input_strips_trailing_cr_and_dials() {
+    fn daemon_send_input_uses_write_pty_raw_and_passes_bytes_verbatim() {
         let s = Scratch::new("send");
         let rx = serve_once(&s.state_root(), SocketResponse::ok("written"));
-        // write_to_pane hands us body + a single trailing \r; the daemon re-appends CR.
+        // daemon_send_input now uses WritePtyRaw to bypass normalize_input — raw
+        // xterm keystrokes (ESC sequences, backspace, etc.) must pass through verbatim.
         daemon_send_input(&s.state_root(), "ws-1", b"approve\r").unwrap();
         let line = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let req: SocketRequest = serde_json::from_str(line.trim_end()).unwrap();
         match req {
-            SocketRequest::SendInput { id, text } => {
+            SocketRequest::WritePtyRaw { id, data } => {
                 assert_eq!(id, "ws-1");
-                assert_eq!(text, "approve", "trailing CR stripped (daemon re-appends it)");
+                assert_eq!(data, "approve\r", "raw bytes sent verbatim (no CR stripping)");
             }
-            other => panic!("expected SendInput, got {other:?}"),
+            other => panic!("expected WritePtyRaw, got {other:?}"),
         }
     }
 

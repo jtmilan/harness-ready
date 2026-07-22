@@ -477,6 +477,16 @@ pub enum SocketRequest {
     /// [`normalize_input`] before any PTY write (a second line could inject a second
     /// TUI submission — the Model-A risk; a control byte could drive the TUI).
     SendInput { id: String, text: String },
+    /// Write raw bytes directly to a pane's PTY master — the GUI keyboard-input
+    /// path for daemon-owned panes. Unlike [`SendInput`] (which runs through
+    /// [`normalize_input`] for high-level line input), this bypasses normalization
+    /// entirely: raw xterm keystrokes (ESC sequences for arrows/function keys,
+    /// 0x7f for backspace, 0x03 for Ctrl-C, etc.) are valid terminal input and
+    /// must NOT be rejected or have `\r` appended. Security: this is only reachable
+    /// from the GUI's Tauri `send_input` command (the user's own keystrokes), NOT
+    /// from MCP socket peers — the daemon's `send_input_enabled` gate and the
+    /// `op_requires_mutations` check apply identically.
+    WritePtyRaw { id: String, data: String },
     /// Raise / jump to a workspace in the running app.
     Focus { id: String },
     /// Context Router (06-03): run the EXISTING in-app synthesizer (`orchestrate`,
@@ -911,6 +921,7 @@ pub fn op_requires_mutations(req: &SocketRequest) -> bool {
         // external-orchestrator admission on it in `handle_socket_request`.
         | SocketRequest::ReadOutput { .. } => false,
         SocketRequest::SendInput { .. }
+        | SocketRequest::WritePtyRaw { .. }
         | SocketRequest::Focus { .. }
         | SocketRequest::Orchestrate { .. }
         | SocketRequest::Broadcast { .. }
@@ -1186,6 +1197,7 @@ pub fn op_served_by_app(req: &SocketRequest) -> bool {
         | SocketRequest::ReadOutput { .. } => true,
         SocketRequest::ListLive
         | SocketRequest::SendInput { .. }
+        | SocketRequest::WritePtyRaw { .. }
         | SocketRequest::Focus { .. }
         | SocketRequest::Attach { .. }
         | SocketRequest::Detach { .. }
@@ -2727,6 +2739,20 @@ mod tests {
             SocketRequest::SendInput {
                 id: "w1".into(),
                 text: "approve".into()
+            }
+        );
+        // write_pty_raw → {"op":"write_pty_raw","id":..,"data":..}
+        let w = serde_json::to_string(&SocketRequest::WritePtyRaw {
+            id: "w1".into(),
+            data: "\x1b[A".into(),
+        })
+        .unwrap();
+        assert_eq!(w, "{\"op\":\"write_pty_raw\",\"id\":\"w1\",\"data\":\"\\u001b[A\"}");
+        assert_eq!(
+            serde_json::from_str::<SocketRequest>(&w).unwrap(),
+            SocketRequest::WritePtyRaw {
+                id: "w1".into(),
+                data: "\x1b[A".into()
             }
         );
         // response constructors carry the canonical codes
