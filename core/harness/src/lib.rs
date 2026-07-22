@@ -440,18 +440,24 @@ pub fn worker_spawn(
         Harness::Cursor => {
             let mut args: Vec<String> =
                 vec!["-p".into(), "--output-format".into(), "stream-json".into()];
+            // --trust: skip the workspace trust prompt in headless mode. ALWAYS needed for `-p`:
+            // without it cursor-agent blocks on the trust modal and there is no human to answer
+            // (the pane is headless → hang → the controller's deadline kills the worker). The
+            // supervisor's `preseed_cursor_trust` writes the trust marker to disk BEFORE the spawn,
+            // but --trust is the belt-and-suspenders: if the preseed fails (disk full, $HOME
+            // unset, permission error), the flag alone keeps the headless worker moving.
+            args.push("--trust".into());
             if write_mode {
-                // --force (run everything) + --trust (headless, no workspace-trust prompt). This is
-                // the FLOOR for headless auto-approve of `git commit` — but deep-verify proved it
-                // OVER-GRANTS and there is NO cursor flag/config that gives commit-yes / push-no:
-                // `--force` overrides a `.cursor/cli.json` `deny:[Shell(git:push)]`, and even an
-                // allow-list lets cursor compound-wrap (`cd .. && git push`) past the matcher → a
-                // bare `git push` to the network runs. ⚠️ Unlike the claude path (which DENIES push),
-                // a cursor worker CAN push. Push must be prevented ENVIRONMENTALLY (no push-capable
-                // remote / no creds in the worker env / OS network sandbox) — owed before any
-                // non-throwaway cursor use; the owed delegate-live security review must cover it.
+                // --force (run everything) is the FLOOR for headless auto-approve of `git commit` —
+                // but deep-verify proved it OVER-GRANTS and there is NO cursor flag/config that
+                // gives commit-yes / push-no: `--force` overrides a `.cursor/cli.json`
+                // `deny:[Shell(git:push)]`, and even an allow-list lets cursor compound-wrap
+                // (`cd .. && git push`) past the matcher → a bare `git push` to the network runs.
+                // ⚠️ Unlike the claude path (which DENIES push), a cursor worker CAN push. Push
+                // must be prevented ENVIRONMENTALLY (no push-capable remote / no creds in the
+                // worker env / OS network sandbox) — owed before any non-throwaway cursor use;
+                // the owed delegate-live security review must cover it.
                 args.push("--force".into());
-                args.push("--trust".into());
             }
             if let Some(m) = &m {
                 args.push("--model".into());
@@ -955,6 +961,40 @@ mod tests {
             oc.args.windows(2).any(|p| p[0] == "--dir" && p[1] == "/wt"),
             "opencode must pass --dir <worktree> so it stays inside the sandbox"
         );
+        // grok --cwd must carry the worktree cwd (same class as opencode --dir: grok's headless
+        // `agent` subcommand takes --cwd to scope its sandbox). UNVERIFIED headless, but the argv
+        // shape is the documented invocation; if grok ignores --cwd the failure is a contained
+        // escape (caught by the controller's non-committer guard), not a silent mis-dispatch.
+        let gk = worker_spawn(
+            Harness::Grok,
+            Some("grok-4"),
+            true,
+            &[],
+            std::path::Path::new("/wt-grok"),
+        );
+        assert!(
+            gk.args.windows(2).any(|p| p[0] == "--cwd" && p[1] == "/wt-grok"),
+            "grok must pass --cwd <worktree> so it stays inside the sandbox"
+        );
+        assert_eq!(
+            gk.args.first().map(String::as_str),
+            Some("agent"),
+            "grok headless subcommand is `agent`"
+        );
+        // pi: `-p` must be the FIRST arg (it is the headless-mode selector; the prompt follows
+        // as a trailing positional after --model). UNVERIFIED headless, but the documented shape.
+        let pi = worker_spawn(
+            Harness::Pi,
+            Some("anthropic/claude-sonnet-4"),
+            true,
+            &[],
+            std::path::Path::new("/wt-pi"),
+        );
+        assert_eq!(
+            pi.args.first().map(String::as_str),
+            Some("-p"),
+            "pi headless mode selector `-p` must be the first arg"
+        );
         // codex must NEVER carry `-a` (codex exec has no such flag → exit 2), in either mode.
         for wm in [true, false] {
             let c = worker_spawn(
@@ -1064,11 +1104,13 @@ mod tests {
         let cur = worker_spawn(Harness::Cursor, Some("auto"), false, &[], wt);
         assert!(
             !cur.args.iter().any(|a| a == "--force"),
-            "report-only cursor must not --force"
+            "report-only cursor must not --force (tool permission stays interactive)"
         );
+        // --trust IS present in report-only: the headless `-p` mode needs it regardless of
+        // write_mode to skip the workspace trust modal (no human to answer → hang).
         assert!(
-            !cur.args.iter().any(|a| a == "--trust"),
-            "report-only cursor must not --trust"
+            cur.args.iter().any(|a| a == "--trust"),
+            "report-only cursor MUST --trust (headless mode needs trust to avoid hanging)"
         );
         let oc = worker_spawn(Harness::OpenCode, Some("github-copilot/x"), false, &[], wt);
         assert!(
@@ -1099,7 +1141,8 @@ mod tests {
                 .any(|a| a == "--dangerously-skip-permissions"),
             "report-only opencode WITH a run dir must skip permissions to write the report"
         );
-        // write_mode flips both auto-approve postures ON (the push-capable §9.2 floor).
+        // write_mode flips the TOOL auto-approve posture ON (--force, the push-capable §9.2 floor).
+        // --trust is already present in BOTH modes (headless needs it regardless).
         let curw = worker_spawn(Harness::Cursor, Some("auto"), true, &[], wt);
         assert!(
             curw.args.iter().any(|a| a == "--force") && curw.args.iter().any(|a| a == "--trust"),
@@ -1112,6 +1155,44 @@ mod tests {
                 .any(|a| a == "--dangerously-skip-permissions"),
             "write-mode opencode carries --dangerously-skip-permissions"
         );
+    }
+
+    // Cursor headless (`-p`) ALWAYS needs --trust regardless of write_mode: without it the
+    // cursor-agent blocks on the workspace trust modal and there's no human to answer (headless
+    // → hang → the controller's deadline kills the worker). The supervisor's preseed_cursor_trust
+    // writes the marker to disk, but --trust is the belt-and-suspenders for preseed failures.
+    // --force (the push-capable tool auto-approve) stays write-mode-gated.
+    #[test]
+    fn worker_spawn_cursor_headless_always_carries_trust_only_force_is_write_mode_gated() {
+        let wt = std::path::Path::new("/wt");
+        // report-only: --trust present, --force absent.
+        let ro = worker_spawn(Harness::Cursor, Some("composer-2.5-fast"), false, &[], wt);
+        assert!(
+            ro.args.iter().any(|a| a == "--trust"),
+            "report-only cursor headless MUST carry --trust (avoids trust-modal hang)"
+        );
+        assert!(
+            !ro.args.iter().any(|a| a == "--force"),
+            "report-only cursor must NOT carry --force (tool permission stays interactive)"
+        );
+        // write-mode: both --trust and --force present.
+        let wm = worker_spawn(Harness::Cursor, Some("composer-2.5-fast"), true, &[], wt);
+        assert!(
+            wm.args.iter().any(|a| a == "--trust"),
+            "write-mode cursor headless MUST carry --trust"
+        );
+        assert!(
+            wm.args.iter().any(|a| a == "--force"),
+            "write-mode cursor headless MUST carry --force (auto-approve commit)"
+        );
+        // the headless floor is always present regardless of write_mode.
+        for s in [&ro, &wm] {
+            assert!(s.args.iter().any(|a| a == "-p"), "cursor headless always -p");
+            assert!(
+                s.args.windows(2).any(|p| p[0] == "--output-format" && p[1] == "stream-json"),
+                "cursor headless always --output-format stream-json"
+            );
+        }
     }
 
     // §9.2: the worker push-denial env denies BOTH transports (no credential.helper for HTTPS, no

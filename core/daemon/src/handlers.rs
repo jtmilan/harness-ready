@@ -113,6 +113,26 @@ pub fn handle_send_input<V: PaneWrite>(
     }
 }
 
+/// Write raw bytes directly to a pane's PTY master — the GUI keyboard-input path
+/// for daemon-owned panes. Unlike [`handle_send_input`] (which runs through
+/// [`normalize_input`]), this writes the bytes verbatim: raw xterm keystrokes
+/// (ESC sequences, backspace 0x7f, Ctrl-C 0x03, etc.) are valid terminal input
+/// and must NOT be rejected or have `\r` appended.
+///
+/// Security: reachable only from the GUI's Tauri `send_input` command (the user's
+/// own keystrokes), gated by `send_input_enabled` + `op_requires_mutations` upstream.
+/// The D30 alive gate and per-pane write serializer are inherited from
+/// [`handle_split_write`]. The data is written in a single shot (no split-submit
+/// settle) — the GUI's `write_to_pane` has already handled any split-submit logic
+/// on the app side before routing here.
+pub fn handle_write_pty_raw<V: PaneWrite>(
+    sups: &DaemonSups<V>,
+    id: &str,
+    data: &[u8],
+) -> SocketResponse {
+    handle_split_write(sups, id, data)
+}
+
 /// Handle a write through the gated split-submit two-phase path (08 Sub-build 3 /
 /// MF-E). `pub(crate)` — NOT a public entry: the only way in is [`handle_send_input`],
 /// which has ALREADY passed the bytes through [`normalize_input`]. This function owns the
@@ -583,5 +603,50 @@ mod tests {
         assert!(r.ok);
         let v: serde_json::Value = serde_json::from_str(&r.detail).unwrap();
         assert_eq!(v["ids"].as_array().unwrap().len(), 0);
+    }
+
+    // ── handle_write_pty_raw tests ──
+    // The raw PTY write path bypasses normalize_input — control characters (ESC,
+    // backspace 0x7f, etc.) are valid terminal input and must reach the PTY verbatim.
+
+    #[test]
+    fn write_pty_raw_passes_control_characters_verbatim() {
+        let sups: DaemonSups<FakePane> = DaemonSups::new();
+        sups.insert("ws", FakePane::new("claude"));
+        // ESC [ A = arrow up — normalize_input would REJECT this (ESC is control)
+        let r = handle_write_pty_raw(&sups, "ws", b"\x1b[A");
+        assert!(r.ok, "raw write must accept ESC sequences");
+        let writes = sups.with_snapshot("ws", |p| p.writes.clone()).unwrap();
+        assert_eq!(writes, vec![b"\x1b[A".to_vec()]);
+    }
+
+    #[test]
+    fn write_pty_raw_passes_backspace_verbatim() {
+        let sups: DaemonSups<FakePane> = DaemonSups::new();
+        sups.insert("ws", FakePane::new("claude"));
+        // 0x7f = DEL/backspace — normalize_input would REJECT this
+        let r = handle_write_pty_raw(&sups, "ws", b"\x7f");
+        assert!(r.ok);
+        let writes = sups.with_snapshot("ws", |p| p.writes.clone()).unwrap();
+        assert_eq!(writes, vec![b"\x7f".to_vec()]);
+    }
+
+    #[test]
+    fn write_pty_raw_does_not_append_cr() {
+        let sups: DaemonSups<FakePane> = DaemonSups::new();
+        sups.insert("ws", FakePane::new("claude"));
+        // Regular character 'a' — normalize_input would append \r (auto-submit!)
+        let r = handle_write_pty_raw(&sups, "ws", b"a");
+        assert!(r.ok);
+        let writes = sups.with_snapshot("ws", |p| p.writes.clone()).unwrap();
+        assert_eq!(writes, vec![b"a".to_vec()], "raw write must NOT append \\r");
+    }
+
+    #[test]
+    fn write_pty_raw_to_absent_pane_is_unknown_workspace() {
+        let sups: DaemonSups<FakePane> = DaemonSups::new();
+        let r = handle_write_pty_raw(&sups, "ghost", b"a");
+        assert!(!r.ok);
+        assert_eq!(r.code, response_code::UNKNOWN_WORKSPACE);
     }
 }
