@@ -2,7 +2,7 @@
 # ensure-dev-cert.sh — provisioning entry point for the stable "Agent Teams Dev"
 # code-signing identity. Closes the c3 cert gap: the in-app self-updater
 # (apply_update) and install-app.sh both PREFER signing with a fixed identity so
-# the microphone / Screen-Recording TCC grant survives updates, but that branch
+# the Screen-Recording TCC grant survives updates, but that branch
 # only fires when the identity actually exists. This script guarantees it does.
 #
 # WHAT IT DOES

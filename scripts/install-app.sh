@@ -72,8 +72,6 @@ if [[ "$TESTING" == "1" ]]; then
 fi
 DEST="/Applications/$DEST_NAME.app"
 
-MODEL_SRC="$REPO/app/src-tauri/models/ggml-tiny.en.bin"
-
 if [[ "$DO_BUILD" == "1" ]]; then
   # Sentry DSN (crash monitoring) is baked at BUILD time via option_env!("AGENT_TEAMS_SENTRY_DSN")
   # in app_lib::init_sentry — NEVER committed. Load it from a gitignored secrets file (or the
@@ -87,9 +85,6 @@ if [[ "$DO_BUILD" == "1" ]]; then
   else
     echo "==> Sentry: no DSN (.sentry-dsn / env) → building INERT (no crash reporting)"
   fi
-  # Plan 05-04: fetch the ~74 MB ggml-tiny.en whisper model (gitignored, NOT committed).
-  echo "==> fetching whisper model (build-time, not committed)…"
-  bash "$REPO/scripts/fetch-whisper-model.sh"
   if [[ "$LIVE" == "1" ]]; then
     echo "==> building WITH delegate-live (bun tauri build -f delegate-live)…"
     ( cd "$REPO/app" && bun tauri build -f delegate-live --bundles app )
@@ -112,24 +107,6 @@ if [[ ! -d "$SRC" ]]; then
   exit 1
 fi
 
-# Plan 05-04: stage the model into the BUILD-OUTPUT bundle ($SRC) at the exact path the
-# app resolves at runtime (`resolve("models/ggml-tiny.en.bin", Resource)`). Staging into
-# $SRC (not just $DEST) is load-bearing for the D34 self-updater: `apply_update` dittos
-# $SRC (the dev-source pointer) over /Applications on "Update Now", so the model MUST live
-# in $SRC to survive a self-update — else dictation silently degrades after the first
-# in-app update. The model is gitignored + NOT a declared tauri.conf resource (AC-5: never
-# committed, and declaring it would make `cargo build` require it → break fresh-clone
-# green); `tauri build` therefore does NOT copy it, so we stage it here. The $SRC→$DEST
-# ditto below then carries it into /Applications too.
-if [[ -f "$MODEL_SRC" ]]; then
-  mkdir -p "$SRC/Contents/Resources/models"
-  ditto "$MODEL_SRC" "$SRC/Contents/Resources/models/ggml-tiny.en.bin"
-  echo "==> staged whisper model into build-output bundle (survives D34 self-update)"
-else
-  echo "WARN: $MODEL_SRC absent — run scripts/fetch-whisper-model.sh; dictation will" >&2
-  echo "      degrade (typed replies still work) until the model is present." >&2
-fi
-
 # Quit ALL running instances first — two instances would collide on the shared
 # app-support state_root + WKWebView localStorage (same bundle id).
 # Quit only the SAME app we're installing over ("Harness Ready" vs "Harness Ready Dev" are distinct
@@ -144,10 +121,8 @@ sleep 1
 
 echo "==> installing -> $DEST"
 rm -rf "$DEST"
-ditto "$SRC" "$DEST"                       # bundle-correct copy (preserves perms/xattrs;
-                                           # carries the model staged into $SRC above).
-                                           # codesign --deep below covers the staged model
-                                           # + the unsigned whisper-cli externalBin.
+ditto "$SRC" "$DEST"                       # bundle-correct copy (preserves perms/xattrs).
+                                           # codesign --deep below covers the bundle.
 
 # --testing: rebrand the installed copy into a SEPARATE app (own bundle id + display name) and bake
 # the isolated state dir via LSEnvironment. MUST run BEFORE the codesign below — a post-sign plist
@@ -171,7 +146,7 @@ fi
 # the preferred-identity branch below actually fires. This closes the c3 cert gap:
 # previously install-app.sh only WARNed and asked the operator to run the cert
 # script by hand, so on any fresh box the identity never existed → it always fell
-# back to ad-hoc → the mic / Screen-Recording TCC grant reset on every rebuild.
+# back to ad-hoc → the Screen-Recording TCC grant reset on every rebuild.
 # ensure-dev-cert.sh is idempotent (a no-op when the identity already exists).
 # GUARDED with `|| echo …`: this script runs under `set -euo pipefail`, so an
 # unguarded non-zero exit here would abort the whole install and leave the bundle
@@ -196,12 +171,12 @@ IDENTITY_NAME="$SIGN_IDENTITY" bash "$REPO/scripts/ensure-dev-cert.sh" \
 # Re-sign the installed copy. Prefer a STABLE self-signed identity over ad-hoc
 # ('-'): with a fixed cert the Designated Requirement pins the certificate + the
 # bundle id (both stable across rebuilds) instead of the cdhash, so the
-# Screen-Recording / microphone TCC grant SURVIVES every `tauri build` + update.
+# Screen-Recording TCC grant SURVIVES every `tauri build` + update.
 # Ad-hoc re-hashes the bundle each build → cdhash churns → TCC forgets the grant.
 # The ensure-dev-cert.sh call above creates the identity when missing; this branch
 # then prefers it and falls back to ad-hoc only if provisioning was unavailable.
 # NOTE: --deep but deliberately NOT --options runtime — a hardened runtime without
-# capture entitlements would BLOCK the very mic/screen access we are preserving.
+# capture entitlements would BLOCK the screen access we are preserving.
 if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_IDENTITY\""; then
   echo "==> signing with stable identity: \"$SIGN_IDENTITY\" (TCC grants persist across updates)"
   # NON-FATAL: a stable-identity sign can still fail on a headless box (no GUI to click
@@ -216,13 +191,11 @@ if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGN_IDENTIT
   fi
 else
   echo "WARN: no \"$SIGN_IDENTITY\" code-signing identity found." >&2
-  echo "      ensure-dev-cert.sh could not provision it (see above); Screen-Recording /" >&2
-  echo "      mic TCC grants will reset on each rebuild. Falling back to ad-hoc for now." >&2
+  echo "      ensure-dev-cert.sh could not provision it (see above); Screen-Recording" >&2
+  echo "      TCC grants will reset on each rebuild. Falling back to ad-hoc for now." >&2
   codesign --force --deep -s - "$DEST"     # ad-hoc fallback
 fi
-xattr -dr com.apple.quarantine "$DEST"     # clear Gatekeeper quarantine (recursive →
-                                           # also de-quarantines the unsigned whisper-cli
-                                           # externalBin under Contents/MacOS, D17/05-04)
+xattr -dr com.apple.quarantine "$DEST"     # clear Gatekeeper quarantine (recursive)
 
 VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist" 2>/dev/null || echo '?')"
 echo "==> installed v$VER"

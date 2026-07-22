@@ -1185,32 +1185,6 @@ body.at-resizing.row-resize { cursor: row-resize !important; }
 #f-error { color: var(--danger); font-family: var(--font-mono); font-size: 11px; line-height: 1.45; letter-spacing: .04em; min-height: 16px; margin: var(--s-2) 0 0; }
 .modal-sub { color: var(--muted); font-size: 12px; line-height: 1.45; margin: -6px 0 var(--s-4); }
 
-/* ---- Push-to-talk dictation (Plan 05-04): on the Speak & Send surface ---- */
-.sp-dictate { display: flex; align-items: center; gap: var(--s-3); margin: var(--s-1) 0 var(--s-3); }
-#sp-mic {
-  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
-  background: transparent; color: var(--fg); border: 1px solid var(--line-strong);
-  border-radius: var(--r-pill); padding: var(--s-2) var(--s-3);
-  font-family: var(--font-mono); font-size: 11px; font-weight: 400; letter-spacing: .06em; text-transform: uppercase;
-  cursor: pointer; user-select: none;
-  transition: border-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
-}
-#sp-mic:hover:not(:disabled) { border-color: var(--display); color: var(--display); }
-#sp-mic:disabled { opacity: 0.5; cursor: not-allowed; }
-#sp-mic .icon { width: 14px; height: 14px; }
-/* RECORDING: an explicit "active" affordance — a deliberate danger-accent fill + a soft
-   pulse, NOT a status-queue color (per the lane rule: dictation is never a queue state). */
-#sp-mic.recording {
-  background: var(--danger); border-color: var(--danger); color: var(--on-accent);
-  animation: sp-mic-pulse 1.2s var(--ease-standard) infinite;
-}
-#sp-mic.busy { opacity: 0.7; }
-@keyframes sp-mic-pulse {
-  0%, 100% { border-color: var(--danger); }
-  50%      { border-color: var(--accent-hover); }
-}
-.sp-dictate-hint { color: var(--muted); font-size: 11px; line-height: 1.4; }
-@media (prefers-reduced-motion: reduce) { #sp-mic.recording { animation: none; } }
 #f-recents { display: flex; flex-wrap: wrap; gap: 6px; margin: -6px 0 var(--s-3); }
 .recent-chip {
   font-family: var(--font-mono); font-size: 10px; line-height: 1.45; letter-spacing: .06em; text-transform: uppercase;
@@ -4535,8 +4509,7 @@ label.modal-sub input[type="checkbox"]:focus-visible {
    modals/empty-states breathes without touching component-specific values. --- */
 .modal-sub,
 .dg-result-mean,
-.up-body,
-.sp-dictate-hint { line-height: 1.55; }
+.up-body { line-height: 1.55; }
 
 /* tabular numerals everywhere data/numbers render in Space Mono — columns of
    durations/costs/counts line up to the digit (instrument-panel discipline). */

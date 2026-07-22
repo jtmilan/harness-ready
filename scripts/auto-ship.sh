@@ -12,9 +12,9 @@
 #      unattended merge is not — see the REJECT drill that motivated this).
 #
 # WHY model-free manifests only: the integration tree is a fresh `git worktree
-# add`, so gitignored files (e.g. app/src-tauri/models/ggml-tiny.en.bin) are
-# ABSENT -> testing the app crate fails to BUILD -> a false REJECT regardless of
-# correctness. Scope the gate to crates under core/* that need no such fixture.
+# add`, so gitignored fixtures (if any) are ABSENT -> testing a crate that
+# required them would fail to BUILD -> a false REJECT regardless of correctness.
+# Scope the gate to crates under core/* that need no such fixture.
 #
 # Usage:
 #   scripts/auto-ship.sh \

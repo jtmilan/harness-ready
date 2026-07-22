@@ -7596,9 +7596,6 @@ async function openSpeak() {
   document.getElementById("sp-error").textContent = "";
   const ta = document.getElementById("sp-text");
   ta.value = "";
-  // reset push-to-talk to idle each open (unless the mic was permanently denied this
-  // session — keep it disabled so we don't re-prompt a known-denied device).
-  if (typeof setMicState === "function") setMicState(micDisabled ? "disabled" : "idle");
   speakEl.classList.remove("hidden");
   trapModalFocus(speakEl);
   requestAnimationFrame(() => ta.focus());
@@ -7682,102 +7679,6 @@ const spTextEl = document.getElementById("sp-text");
 if (spTextEl) spTextEl.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendSpeak(); }
 });
-
-// ---- Push-to-talk dictation (Plan 05-04): hold the mic → in-app capture → whisper →
-// FILL the reply field above. Model-A unchanged: the transcript only fills the field;
-// the human still reviews + presses Speak & Send (no auto-send, no new inject path).
-// Capture lives in the entitled APP (cpal/TCC); the file-only whisper sidecar needs no
-// TCC. Mic-denial degrades: the button disables + a toast, and typed replies keep
-// working (AC-4) — never a crash.
-const spMicEl = document.getElementById("sp-mic");
-const spMicLabelEl = document.getElementById("sp-mic-label");
-let micState = "idle"; // idle | recording | transcribing | disabled
-let micDisabled = false; // sticky once a deny/error is seen this session
-
-function setMicLabel(text) { if (spMicLabelEl) spMicLabelEl.textContent = text; }
-
-// reflect dictation state on the button (an explicit "active" affordance — the
-// recording class is a deliberate accent, NOT a status-queue color, per the lane rule).
-function setMicState(s) {
-  micState = s;
-  if (!spMicEl) return;
-  spMicEl.classList.toggle("recording", s === "recording");
-  spMicEl.classList.toggle("busy", s === "transcribing");
-  spMicEl.disabled = (s === "transcribing" || s === "disabled");
-  setMicLabel(
-    s === "recording" ? "Listening… release to transcribe" :
-    s === "transcribing" ? "Transcribing…" :
-    s === "disabled" ? "Mic unavailable" :
-    "Hold to talk"
-  );
-}
-
-// mic permission denied / device error → disable PTT for the session + toast. Typed
-// replies + Speak & Send still work (AC-4). DENY surfaces as a backend start error.
-function disableMic(reason) {
-  micDisabled = true;
-  setMicState("disabled");
-  showToast(reason || "Mic access needed for dictation — type your reply instead.");
-}
-
-let _micBusy = false; // guard against overlapping press/release races
-async function micPressStart() {
-  if (micDisabled || _micBusy || micState !== "idle") return;
-  if (!hasTauri()) { disableMic("Dictation needs the desktop app."); return; }
-  _micBusy = true;
-  try {
-    await invoke("start_dictation");
-    setMicState("recording");
-  } catch (e) {
-    // backend returns a typed error on mic DENY / no-device — degrade, never crash.
-    disableMic("Mic access needed for dictation — " + String(e).replace(/^.*?: /, ""));
-  } finally {
-    _micBusy = false;
-  }
-}
-
-async function micPressEnd() {
-  if (micState !== "recording" || _micBusy) return;
-  _micBusy = true;
-  setMicState("transcribing");
-  try {
-    const wav = await invoke("stop_dictation");
-    const text = await invoke("transcribe", { wavPath: wav });
-    const t = (text || "").trim();
-    if (t && spTextEl) {
-      // FILL the reply field — append to whatever the human already typed (Model-A:
-      // they review + send). Add a space if appending mid-text.
-      const cur = spTextEl.value;
-      spTextEl.value = cur && !/\s$/.test(cur) ? cur + " " + t : cur + t;
-      spTextEl.focus();
-    } else if (!t) {
-      showToast("Didn't catch that — try again or type your reply.");
-    }
-    setMicState("idle");
-  } catch (e) {
-    // transcription/convert failure → degrade to idle (typed reply still works).
-    setMicState("idle");
-    showToast("Dictation failed: " + String(e).replace(/^.*?: /, ""));
-  } finally {
-    _micBusy = false;
-  }
-}
-
-if (spMicEl) {
-  // hold = record, release/leave = transcribe. Pointer events cover mouse + touch +
-  // pen; releasing OUTSIDE the button (pointerleave while pressed) also stops, so a
-  // drag-off never leaves the mic stuck open.
-  spMicEl.addEventListener("pointerdown", (e) => { e.preventDefault(); micPressStart(); });
-  spMicEl.addEventListener("pointerup", (e) => { e.preventDefault(); micPressEnd(); });
-  spMicEl.addEventListener("pointerleave", () => { if (micState === "recording") micPressEnd(); });
-  // keyboard a11y: Space/Enter held on the focused button = press, keyup = release.
-  spMicEl.addEventListener("keydown", (e) => {
-    if ((e.key === " " || e.key === "Enter") && !e.repeat) { e.preventDefault(); micPressStart(); }
-  });
-  spMicEl.addEventListener("keyup", (e) => {
-    if (e.key === " " || e.key === "Enter") { e.preventDefault(); micPressEnd(); }
-  });
-}
 
 // ---- Settings → MCP loopback HTTP (advanced) ---------------------------------
 // DRAFT for human security review (06-02 Phase B). There is no pre-existing Settings

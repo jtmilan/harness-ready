@@ -89,12 +89,6 @@ agent-teams-agent = { path = "../../core/agent" }
 # (euid) check on the Unix-domain mutation socket. macOS uses getpeereid (not the
 # Linux SO_PEERCRED). libc (not nix) keeps the dep surface minimal.
 libc = "0.2"
-# Plan 05-04 (voice INPUT): in-app mic capture. cpal = raw CoreAudio input stream
-# (NOT a Tauri plugin → no capability entry; TCC is owned by the entitled app bundle,
-# the 05-03 lesson). hound writes the captured PCM to a WAV; afconvert (system bin)
-# downsamples to whisper's 16 kHz s16le (cpal+hound do NOT resample).
-cpal = "0.16"
-hound = "3.5"
 # 06-02 Phase-B HTTP transport (DRAFT — security review; not shipped). A blocking
 # HTTP/1.1 server (no tokio — the app has no async runtime in setup(), the same
 # constraint that put the UDS listener on a dedicated std thread). The Bearer-token
