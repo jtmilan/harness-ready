@@ -10,7 +10,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use state_adapter::inject::{
-    inject, inject_commandcode_mcp, inject_cursor_role, inject_grok_mcp, inject_mcp_config, InjectConfig,
+    inject, inject_commandcode_mcp, inject_cursor_role, inject_grok_mcp, inject_mcp_config,
+    inject_opencode_mcp, InjectConfig,
     InjectHarness,
 };
 use std::io::{Read, Write};
@@ -986,6 +987,167 @@ fn iso8601_utc_now() -> String {
 /// pane spawns can't corrupt the operator's real config.
 static CLAUDE_JSON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes the read-modify-write of the SHARED `~/.codex/config.toml` so concurrent
+/// codex pane spawns can't corrupt the operator's real config. Without this, two
+/// `inject_codex_mcp` calls racing on the same file both see the per-pane header absent
+/// and each append a DUPLICATE block — the first pane to be removed strips ONE of the
+/// two, leaving a leaked block that pollutes every subsequent codex spawn (it registers
+/// two MCP servers sharing the sidecar endpoint, the second one failing setup and showing
+/// "N setup issues: MCP"). The lock + idempotent strip-before-append (see
+/// [`inject_codex_mcp`]) is the belt-and-suspenders: even under contention only ONE
+/// block per pane exists at any moment. Sibling lock to [`CLAUDE_JSON_LOCK`].
+static CODEX_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes the read-modify-write of the SHARED `~/.commandcode/mcp.json` (the global
+/// MCP registry — distinct from the per-worktree `.mcp.json`). Same corruption class as
+/// [`CODEX_CONFIG_LOCK`]; CommandCode's file is JSON(C) rather than TOML but the race +
+/// fix shape are identical. Sibling lock to [`CLAUDE_JSON_LOCK`] / [`CODEX_CONFIG_LOCK`].
+static COMMANDCODE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Managed MCP block mechanics shared by the codex and commandcode global-config paths.
+/// Both configs are SHARED (operator-owned, global to the user — `~/.codex/config.toml`
+/// and `~/.commandcode/mcp.json` respectively), both need a per-pane block injected and
+/// later stripped cleanly, both tolerate line comments (TOML natively, JSONC via the
+/// `//` and `#` comment extensions commandcode accepts). The marker format is the SAME
+/// across both so a future unified audit/purge tool can scan either.
+///
+/// Format per block (the body is TOML for codex, JSONC fragment for commandcode — the
+/// helpers do not care; the CALLER supplies a body that is syntactically valid for the
+/// target file):
+///
+/// ```text
+/// # >>> @agent-teams-managed:{server_name} >>>
+/// <body>
+/// # <<< @agent-teams-managed:{server_name} <<<
+/// ```
+///
+/// The `@agent-teams-managed:` prefix is a GLOBALLY UNIQUE marker so a future purge can
+/// find-and-strip EVERY block this crate ever injected without false positives against
+/// the operator's own comments. Pane ids are constrained at construction to
+/// `[a-zA-Z0-9-]` (see [`assert_managed_pane_id`]), so the marker never contains
+/// characters that would break a TOML comment, a JSONC comment, or a `String::find`.
+mod managed_mcp {
+    use std::io::{self, ErrorKind};
+
+    /// Marker prefix used to locate managed blocks in a shared config file. The colon
+    /// after the prefix is intentional — it disambiguates from any future marker that
+    /// might share the prefix (none today) and keeps `find` O(1)-safe.
+    pub const MARKER_PREFIX: &str = "@agent-teams-managed:";
+
+    /// Pane ids ride in markers, server names, TOML bare keys, and JSON object keys.
+    /// Reject anything outside `[a-zA-Z0-9-]` at the boundary — a malformed id would
+    /// either (a) produce an invalid TOML bare key (`ws$-p0`), (b) let a crafted id
+    /// smuggle a marker substring into the body and confuse `strip_block`, or (c) let
+    /// a newline in the id split the marker across lines and break removal.
+    /// `[a-zA-Z0-9-]` is exactly the alphabet the daemon's id minting already uses, so
+    /// this is a redundant-belt check that costs O(n) and fails closed.
+    pub fn assert_managed_pane_id(pane_id: &str) -> io::Result<()> {
+        if pane_id.is_empty() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "pane_id empty"));
+        }
+        if !pane_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("pane_id contains forbidden chars: {pane_id:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn server_name(pane_id: &str) -> String {
+        format!("agent-teams-{pane_id}")
+    }
+
+    pub fn begin_marker(server_name: &str) -> String {
+        format!("# >>> {MARKER_PREFIX}{server_name} >>>")
+    }
+
+    pub fn end_marker(server_name: &str) -> String {
+        format!("# <<< {MARKER_PREFIX}{server_name} <<<")
+    }
+
+    /// Wrap a per-pane body in the managed markers. The body is NOT inspected — it is
+    /// the caller's job to make it valid for the target file (TOML section or JSONC
+    /// fragment). A leading `\n` is prepended so the block always starts on its own
+    /// line, regardless of whether the previous writer left a trailing newline.
+    pub fn build_block(server_name: &str, body: &str) -> String {
+        format!(
+            "\n{}\n{}\n{}\n",
+            begin_marker(server_name),
+            body,
+            end_marker(server_name)
+        )
+    }
+
+    /// Strip the managed block for `server_name` from `content`. Idempotent: a missing
+    /// block returns `content` unchanged. If begin exists but end is absent (a
+    /// half-written block from a prior crash), strip from begin to EOF so the next
+    /// inject sees a clean file — the block is recoverable from the source of truth
+    /// (the live pane registry), so partial blocks are never authoritative.
+    pub fn strip_block(content: &str, server_name: &str) -> String {
+        let begin = begin_marker(server_name);
+        let end = end_marker(server_name);
+        let Some(start) = content.find(&begin) else {
+            return content.to_string();
+        };
+        let end_idx = match content[start..].find(&end) {
+            Some(rel) => start + rel + end.len(),
+            // half-written block: drop from begin to EOF
+            None => content.len(),
+        };
+        // consume trailing newline so a strip leaves no blank gap
+        let end_idx = if content[end_idx..].starts_with('\n') {
+            end_idx + 1
+        } else {
+            end_idx
+        };
+        let mut out = String::with_capacity(content.len());
+        out.push_str(&content[..start]);
+        out.push_str(&content[end_idx..]);
+        out
+    }
+
+    /// Strip EVERY managed block (any pane id) from `content`. Used at startup to
+    /// recover from a daemon crash that left orphan blocks in the global config. The
+    /// prefix scan is intentionally broad — it finds blocks this crate wrote for ANY
+    /// pane id, not just the one the caller knows about.
+    pub fn strip_all_blocks(content: &str) -> String {
+        let mut out = content.to_string();
+        loop {
+            let Some(prefix_pos) = out.find(MARKER_PREFIX) else {
+                return out;
+            };
+            // walk back to the `# >>> ` that starts the begin marker line. `rfind` on
+            // the slice BEFORE the prefix keeps the search bounded and correct even
+            // when the prefix sits at the start of the file (returns None → fall back
+            // to 0).
+            let line_start = out[..prefix_pos]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            // extract the server name from `@agent-teams-managed:<name> >>>`
+            let after_prefix = &out[prefix_pos + MARKER_PREFIX.len()..];
+            let Some(name_end) = after_prefix.find(" >>>") else {
+                // malformed marker — skip past it to avoid an infinite loop (the
+                // prefix_pos+1 advance guarantees progress).
+                out.replace_range(line_start..prefix_pos + MARKER_PREFIX.len(), "");
+                continue;
+            };
+            let server_name = &after_prefix[..name_end];
+            let stripped = strip_block(&out, server_name);
+            if stripped == out {
+                // strip_block couldn't find the begin marker — defensive advance so we
+                // don't loop forever. Should never happen (we just `find`-ed it).
+                return out;
+            }
+            out = stripped;
+        }
+    }
+}
+
 /// Pure: given the existing `~/.claude.json` text + an absolute project path, return the
 /// patched JSON with `projects[path]` carrying the trust/onboarding keys claude gates on.
 /// Preserves all other content losslessly (serde round-trip). Errs if the input is not a
@@ -1093,16 +1255,20 @@ fn codex_notify_args(
 /// carrying the provenance vars the sidecar needs. The block is REMOVED on pane
 /// kill ([`remove_codex_mcp`]) so the global config stays clean.
 ///
-/// Append-only (like `codex_trust.rs`): we never parse+re-serialize the TOML
-/// (that would lose comments/ordering). Idempotent: skips if the block already
-/// exists. Best-effort: a failure degrades to "no MCP in the pane", never a
-/// failed spawn (AC-6). Gated on `!is_worker` to mirror the other MCP gates.
+/// Serialized under [`CODEX_CONFIG_LOCK`]: two concurrent spawns racing on the same
+/// file would otherwise both see the header absent and each append a DUPLICATE block.
+/// Strip-before-append under the lock is the belt-and-suspenders — a stale half-written
+/// block from a prior crash is also recovered (see [`managed_mcp::strip_block`]).
+/// Idempotent: re-injecting the same pane rewrites its one block, never a second one.
+/// Best-effort: a failure degrades to "no MCP in the pane", never a failed spawn
+/// (AC-6). Gated on `!is_worker` to mirror the other MCP gates.
 fn inject_codex_mcp(
     sidecar_bin: &Path,
     state_root: &Path,
     pane_id: &str,
     repo_key: &str,
 ) -> std::io::Result<()> {
+    managed_mcp::assert_managed_pane_id(pane_id)?;
     let config = match codex_config_path() {
         Some(c) => c,
         None => return Ok(()), // no HOME → nothing to inject
@@ -1110,49 +1276,99 @@ fn inject_codex_mcp(
     if !config.is_file() {
         return Ok(()); // no codex config yet — user hasn't run codex
     }
-    let server_name = codex_mcp_server_name(pane_id);
-    let header = format!("[mcp_servers.{server_name}]");
-    let existing = std::fs::read_to_string(&config)?;
-    if existing.contains(&header) {
-        return Ok(()); // already injected (idempotent)
-    }
+    let server_name = managed_mcp::server_name(pane_id);
     let sidecar_str = sidecar_bin.to_string_lossy();
     let state_str = state_root.to_string_lossy();
-    let block = format!(
-        "\n# >>> @agent-teams-managed:{server_name} >>>\n         {header}\n         command = {sidecar_str:?}\n         args = []\n         env = {{ AGENT_TEAMS_STATE_DIR = {state_str:?}, AGENT_TEAMS_PANE_ID = {pane_id:?}, AGENT_TEAMS_MEMORY_REPO_KEY = {repo_key:?}, AGENT_TEAMS_TASK_SCOPE = {pane_id:?} }}\n         # <<< @agent-teams-managed:{server_name} <<<\n"
+    // TOML section body (the header opens a new section; `command`/`args`/`env` ride
+    // under it until the next `[section]`). `{:?}` double-quotes every env value so
+    // paths with spaces/special chars stay valid TOML basic strings.
+    let body = format!(
+        "[mcp_servers.{server_name}]\n\
+         command = {sidecar_str:?}\n\
+         args = []\n\
+         env = {{ AGENT_TEAMS_STATE_DIR = {state_str:?}, AGENT_TEAMS_PANE_ID = {pane_id:?}, \
+         AGENT_TEAMS_MEMORY_REPO_KEY = {repo_key:?}, AGENT_TEAMS_TASK_SCOPE = {pane_id:?} }}",
     );
-    let mut f = std::fs::OpenOptions::new().append(true).open(&config)?;
-    use std::io::Write;
-    f.write_all(block.as_bytes())
+    let block = managed_mcp::build_block(&server_name, &body);
+    let _guard = CODEX_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let existing = std::fs::read_to_string(&config)?;
+    // idempotent short-circuit: if the EXACT block (including the env table, which
+    // carries the per-pane vars) is already present, nothing to do. When the block is
+    // absent OR stale (e.g. sidecar path changed between daemon restarts) we strip and
+    // re-append. `contains(&block)` is a full equality check, so a half-match (stale
+    // sidecar path) falls through to the rewrite.
+    if existing.contains(&block) {
+        return Ok(());
+    }
+    let stripped = managed_mcp::strip_block(&existing, &server_name);
+    let mut new = stripped;
+    new.push_str(&block);
+    std::fs::write(&config, new)
 }
 
-/// Remove the per-pane MCP block injected by [`inject_codex_mcp`]. Best-effort:
-/// a missing config or block is Ok(()). Called from [`Supervisor::kill`] so the
-/// global config stays clean after a pane closes.
+/// Remove the per-pane MCP block injected by [`inject_codex_mcp`]. Serialized under
+/// [`CODEX_CONFIG_LOCK`] (sibling to the inject) so a concurrent inject+remove on the
+/// same file doesn't lose writes. Best-effort: a missing config or block is Ok(()).
+/// Called from [`Supervisor::kill`] so the global config stays clean after a pane
+/// closes.
 fn remove_codex_mcp(pane_id: &str) {
+    if managed_mcp::assert_managed_pane_id(pane_id).is_err() {
+        return; // malformed id → nothing we could safely locate
+    }
     let Some(config) = codex_config_path() else { return };
     if !config.is_file() {
         return;
     }
-    let server_name = codex_mcp_server_name(pane_id);
+    let server_name = managed_mcp::server_name(pane_id);
+    let _guard = CODEX_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let Ok(content) = std::fs::read_to_string(&config) else { return };
-    let begin_marker = format!("# >>> @agent-teams-managed:{server_name} >>>");
-    let end_marker = format!("# <<< @agent-teams-managed:{server_name} <<<");
-    let Some(start) = content.find(&begin_marker) else { return };
-    let Some(end_rel) = content[start..].find(&end_marker) else { return };
-    let end = start + end_rel + end_marker.len();
-    // consume trailing newline if present
-    let end = if content[end..].starts_with('\n') { end + 1 } else { end };
-    let mut cleaned = String::with_capacity(content.len());
-    cleaned.push_str(&content[..start]);
-    cleaned.push_str(&content[end..]);
+    let cleaned = managed_mcp::strip_block(&content, &server_name);
+    if cleaned == content {
+        return; // nothing to remove
+    }
+    let _ = std::fs::write(&config, cleaned);
+}
+
+/// Strip EVERY managed `[mcp_servers.agent-teams-*]` block from `~/.codex/config.toml`.
+/// Called at daemon/app startup to recover from a prior crash that left orphan blocks
+/// behind (the per-pane [`remove_codex_mcp`] runs on clean kill, but a SIGKILL / panic /
+/// power loss leaves the block in place — and a leaked block for a dead pane registers
+/// a ghost MCP server that fails setup and shows "N setup issues: MCP" on every
+/// subsequent codex launch). Idempotent (no-op when the file is clean) + serialized
+/// under [`CODEX_CONFIG_LOCK`] so it can't race with a concurrent inject. Best-effort:
+/// a missing config or unreadable file is Ok(()).
+pub fn purge_all_managed_codex_mcp() {
+    let Some(config) = codex_config_path() else { return };
+    if !config.is_file() {
+        return;
+    }
+    let _guard = CODEX_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(content) = std::fs::read_to_string(&config) else { return };
+    if !content.contains(managed_mcp::MARKER_PREFIX) {
+        return; // fast path: nothing managed here
+    }
+    let cleaned = managed_mcp::strip_all_blocks(&content);
+    if cleaned == content {
+        return;
+    }
     let _ = std::fs::write(&config, cleaned);
 }
 
 /// Deterministic per-pane MCP server name. Pane ids are `[a-zA-Z0-9-]` (e.g.
 /// `ws123-p0`), so the result is a valid TOML bare key.
+///
+/// Retained as a test seam — production code now goes through
+/// [`managed_mcp::server_name`], but the round-trip/idempotency tests predate that
+/// refactor and still use this symbol to exercise the invariant.
+#[cfg(test)]
 fn codex_mcp_server_name(pane_id: &str) -> String {
-    format!("agent-teams-{pane_id}")
+    managed_mcp::server_name(pane_id)
 }
 
 /// `~/.codex/config.toml` path (mirrors `codex_trust.rs`).
@@ -1160,6 +1376,132 @@ fn codex_config_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".codex").join("config.toml"))
+}
+
+/// `~/.commandcode/mcp.json` path — the GLOBAL MCP registry commandcode consults in
+/// addition to any per-cwd `.mcp.json`. Mirror of [`codex_config_path`]. `None` when
+/// `$HOME` is unset (best-effort: caller skips rather than writing anywhere weird).
+fn commandcode_config_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".commandcode").join("mcp.json"))
+}
+
+/// CommandCode global MCP injection. Sibling to [`inject_codex_mcp`]: same marker-based
+/// strip+append pattern, same serialization lock ([`COMMANDCODE_CONFIG_LOCK`]), different
+/// file format (JSONC fragment inside `~/.commandcode/mcp.json` instead of a TOML section
+/// inside `~/.codex/config.toml`). CommandCode reads MCP from BOTH the per-cwd
+/// `.mcp.json` (already injected by [`inject_commandcode_mcp`] in the state-adapter) AND
+/// this global file, so injecting here gives a pane MCP even when its cwd is not the
+/// worktree root (and gives the startup-purge path a place to clean after a daemon
+/// crash).
+///
+/// The injected block is a JSONC fragment — commandcode's MCP config parser accepts
+/// line comments (verified: `#` and `//` are both tolerated), so a marked block appended
+/// after the closing `}` of the operator's JSON does not break parse. Each block is
+/// self-contained (the `mcpServers` key is redeclared inside the block) so strip+append
+/// stays a local operation and never needs a full JSON parse (which would lose the
+/// operator's comments/ordering).
+///
+/// Idempotent (re-inject rewrites the one block, never a second one), serialized under
+/// the global lock, best-effort on failure. Creates the file + parent dir when absent
+/// (commandcode's first-run may not have written it yet — the operator still deserves a
+/// working MCP pane).
+fn inject_commandcode_global_mcp(
+    sidecar_bin: &Path,
+    state_root: &Path,
+    pane_id: &str,
+    repo_key: &str,
+) -> std::io::Result<()> {
+    managed_mcp::assert_managed_pane_id(pane_id)?;
+    let config = match commandcode_config_path() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let server_name = managed_mcp::server_name(pane_id);
+    // JSONC fragment: a complete `{"mcpServers": {<name>: <server>}}` payload that
+    // commandcode's parser accepts AS A COMMENT-BOUNDED block appended after the
+    // operator's JSON. `{:?}` double-quotes every env value (handles spaces/backslashes
+    // in paths). `{{`/`}}` in the format string are literal braces (escaped so they
+    // don't interpolate).
+    let sidecar_str = sidecar_bin.to_string_lossy();
+    let state_str = state_root.to_string_lossy();
+    let body = format!(
+        "{{\n  \"mcpServers\": {{\n    {server_name:?}: {{\n      \"command\": {sidecar_str:?},\n      \
+         \"args\": [],\n      \"env\": {{\n        \"AGENT_TEAMS_STATE_DIR\": {state_str:?},\n        \
+         \"AGENT_TEAMS_PANE_ID\": {pane_id:?},\n        \
+         \"AGENT_TEAMS_MEMORY_REPO_KEY\": {repo_key:?},\n        \
+         \"AGENT_TEAMS_TASK_SCOPE\": {pane_id:?}\n      }}\n    }}\n  }}\n}}",
+    );
+    let block = managed_mcp::build_block(&server_name, &body);
+    let _guard = COMMANDCODE_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Create the file + parent dir if absent — commandcode's first run may not have
+    // materialized ~/.commandcode/mcp.json yet, but the operator has opted into a pane
+    // and deserves a working MCP. An empty JSON object is a valid base for the append.
+    if let Some(parent) = config.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = match std::fs::read_to_string(&config) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::from("{ \"mcpServers\": {} }\n"),
+        Err(e) => return Err(e),
+    };
+    if existing.contains(&block) {
+        return Ok(()); // exact block already present
+    }
+    let stripped = managed_mcp::strip_block(&existing, &server_name);
+    let mut new = stripped;
+    new.push_str(&block);
+    std::fs::write(&config, new)
+}
+
+/// Remove the per-pane MCP block injected by [`inject_commandcode_global_mcp`].
+/// Serialized under [`COMMANDCODE_CONFIG_LOCK`]; best-effort on missing config/block.
+/// Called from [`Supervisor::kill`] so the global registry stays clean after a pane
+/// closes.
+fn remove_commandcode_mcp(pane_id: &str) {
+    if managed_mcp::assert_managed_pane_id(pane_id).is_err() {
+        return;
+    }
+    let Some(config) = commandcode_config_path() else { return };
+    if !config.is_file() {
+        return;
+    }
+    let server_name = managed_mcp::server_name(pane_id);
+    let _guard = COMMANDCODE_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(content) = std::fs::read_to_string(&config) else { return };
+    let cleaned = managed_mcp::strip_block(&content, &server_name);
+    if cleaned == content {
+        return;
+    }
+    let _ = std::fs::write(&config, cleaned);
+}
+
+/// Strip EVERY managed commandcode MCP block from `~/.commandcode/mcp.json`. Mirror of
+/// [`purge_all_managed_codex_mcp`]; same crash-recovery purpose. Called at daemon/app
+/// startup so a prior SIGKILL/panic doesn't leave ghost MCP servers that fail setup on
+/// every subsequent commandcode launch.
+pub fn purge_all_managed_commandcode_mcp() {
+    let Some(config) = commandcode_config_path() else { return };
+    if !config.is_file() {
+        return;
+    }
+    let _guard = COMMANDCODE_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(content) = std::fs::read_to_string(&config) else { return };
+    if !content.contains(managed_mcp::MARKER_PREFIX) {
+        return;
+    }
+    let cleaned = managed_mcp::strip_all_blocks(&content);
+    if cleaned == content {
+        return;
+    }
+    let _ = std::fs::write(&config, cleaned);
 }
 
 /// opencode turn-end wiring. opencode has no hook config, but it AUTO-LOADS plugins from
@@ -1321,15 +1663,26 @@ impl Supervisor {
             }
         }
 
-        // commandcode + opencode are state-blind (no InjectHarness, so they skip the block
-        // above) but first-class MCP CLIENTS: both read a project-local `.mcp.json` at the
-        // pane cwd (auto-discovered) so they get the queue + the gated memory/task tools like
-        // cursor (D56/D60). SEPARATE from hook injection: a state-blind harness can still be
-        // a first-class MCP client via a project-local `.mcp.json`. Best-effort — a write
-        // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
+        // commandcode is state-blind (no InjectHarness, so it skips the block above) but
+        // a first-class MCP CLIENT: it reads a project-local `.mcp.json` at the pane cwd
+        // (auto-discovered) so it gets the queue + the gated memory/task tools like cursor
+        // (D56/D60). SEPARATE from hook injection: a state-blind harness can still be a
+        // first-class MCP client via a project-local config. Best-effort — a write failure
+        // degrades to "no MCP in the pane", never a failed spawn (AC-6).
         // Gated on `!is_worker` to mirror the inject_mcp_config gate above (PR #137 —
         // autonomous workers skip the sidecar).
-        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode | Harness::OpenCode) {
+        // CommandCode + Pi share the `.mcp.json` project-root discovery (the standard MCP
+        // project config format). OpenCode is NOT here — it ignores `.mcp.json` and gets its
+        // sidecar via `inject_opencode_mcp` (`opencode.json`) in the dedicated gate below.
+        // UNVERIFIED: pi's MCP auto-discovery is not yet confirmed (the codebase says "ALL
+        // headless pi behavior is UNVERIFIED"). This injection is best-effort: if pi does not
+        // discover `.mcp.json`, the file is simply ignored and the pane runs without MCP
+        // (never a failed spawn, AC-6). If it DOES discover it, pi gains the queue + memory +
+        // task tools for free. TODO(live-verify): confirm pi reads `.mcp.json` at the project
+        // root before claiming this works.
+        if !spec.is_worker
+            && matches!(spec.harness, Harness::CommandCode | Harness::Pi)
+        {
             if let Err(e) = inject_commandcode_mcp(
                 &spec.worktree,
                 hooks_dir,
@@ -1339,8 +1692,48 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_mcp failed ({:?} pane will have no MCP): {e}",
-                    spec.harness
+                    "[agent-teams] inject_commandcode_mcp failed (commandcode pane will have no MCP): {e}"
+                );
+            }
+        }
+
+        // opencode is state-blind but a first-class MCP CLIENT like commandcode. However
+        // OpenCode does NOT read `.mcp.json` (the Claude/Cursor format — GitHub issue
+        // anomalyco/opencode#27809 closed as not planned). It reads `opencode.json` at the
+        // project root with MCP servers under the `"mcp"` key (not `"mcpServers"`), using
+        // `type: "local"`, `command` as a string array, and `environment` (not `env`).
+        // OpenCode merges project-level config with global (~/.config/opencode/opencode.json)
+        // so the user's models/providers are preserved; only `mcp` is added here.
+        if !spec.is_worker && matches!(spec.harness, Harness::OpenCode) {
+            if let Err(e) = inject_opencode_mcp(
+                &spec.worktree,
+                hooks_dir,
+                sidecar_bin,
+                state_root,
+                &spec.id,
+                &mem_key,
+            ) {
+                eprintln!(
+                    "[agent-teams] inject_opencode_mcp failed (opencode pane will have no MCP): {e}"
+                );
+            }
+        }
+        // CommandCode GLOBAL MCP injection (sibling to the project-local inject above).
+        // CommandCode reads MCP from BOTH the per-cwd `.mcp.json` AND `~/.commandcode/
+        // mcp.json`; injecting the global file gives the pane MCP even when its cwd is
+        // not the worktree root, and gives the startup-purge path a place to clean
+        // after a daemon crash. Serialized under COMMANDCODE_CONFIG_LOCK + idempotent
+        // strip-before-append, mirroring the codex path. The block is stripped on
+        // Supervisor::kill (see `remove_commandcode_mcp`).
+        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode) {
+            if let Err(e) = inject_commandcode_global_mcp(
+                sidecar_bin,
+                state_root,
+                &spec.id,
+                &mem_key,
+            ) {
+                eprintln!(
+                    "[agent-teams] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
                 );
             }
         }
@@ -1372,7 +1765,14 @@ impl Supervisor {
         // The block is removed on pane kill (remove_codex_mcp). Best-effort — a write
         // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
         // Gated on `!is_worker` to mirror the other MCP injection gates.
+        //
+        // STARTUP PURGE (idempotent, cheap — `contains(MARKER_PREFIX)` short-circuits on
+        // a clean file). Recover any orphan blocks left by a prior daemon crash before
+        // we inject this pane's own block. A leaked block for a dead pane would register
+        // a ghost MCP server that fails setup and shows "N setup issues: MCP" on every
+        // subsequent codex launch.
         if !spec.is_worker && matches!(spec.harness, Harness::Codex) {
+            purge_all_managed_codex_mcp();
             if let Err(e) = inject_codex_mcp(
                 sidecar_bin,
                 state_root,
@@ -1383,6 +1783,11 @@ impl Supervisor {
                     "[agent-teams] inject_codex_mcp failed (codex pane will have no MCP): {e}"
                 );
             }
+        }
+        // CommandCode STARTUP PURGE: mirror of the codex branch, same recovery purpose.
+        // Runs once per spawn (idempotent + fast on a clean file).
+        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode) {
+            purge_all_managed_commandcode_mcp();
         }
 
         // State-blind harnesses (codex/commandcode/opencode/pi/grok) have no native SessionStart
@@ -1672,6 +2077,13 @@ impl Supervisor {
         // Best-effort: a missing block or config is a no-op.
         if matches!(self.harness, Harness::Codex) {
             remove_codex_mcp(&self.id);
+        }
+        // CommandCode MCP cleanup: mirror of the codex branch — strip the per-pane
+        // JSONC block from `~/.commandcode/mcp.json` (the global registry; the
+        // project-local `.mcp.json` lives inside the disposable worktree and is
+        // cleaned up with the worktree itself on close). Best-effort.
+        if matches!(self.harness, Harness::CommandCode) {
+            remove_commandcode_mcp(&self.id);
         }
         let _ = self.child.kill();
         // REAP: `kill()` alone never waits — the SIGKILLed child stays a ZOMBIE until
@@ -2900,6 +3312,551 @@ mod tests {
         let count_second = after_second.matches(&header).count();
         assert_eq!(count_second, 1, "still exactly one block (idempotent)");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── managed_mcp module (shared codex + commandcode mechanics) ─────────────
+
+    #[test]
+    fn managed_mcp_pane_id_validation_rejects_forbidden_chars() {
+        use super::managed_mcp::assert_managed_pane_id;
+        // happy path: the alphabet the daemon's id minting uses
+        assert!(assert_managed_pane_id("ws42-p0").is_ok());
+        assert!(assert_managed_pane_id("ws9-p1").is_ok());
+        assert!(assert_managed_pane_id("a-b-c-0-1").is_ok());
+        // failure paths: each is a different class of marker-injection / TOML-key
+        // corruption that the belt-and-suspenders check rejects at the boundary.
+        assert!(assert_managed_pane_id("").is_err(), "empty id");
+        assert!(
+            assert_managed_pane_id("ws$-p0").is_err(),
+            "shell metachar ($ would corrupt a TOML bare key)"
+        );
+        assert!(
+            assert_managed_pane_id("ws p0").is_err(),
+            "space (would break the marker line)"
+        );
+        assert!(
+            assert_managed_pane_id("ws\n-p0").is_err(),
+            "newline (would split the marker across lines)"
+        );
+        assert!(
+            assert_managed_pane_id("ws:-p0").is_err(),
+            "colon (would confuse MARKER_PREFIX scan)"
+        );
+        assert!(
+            assert_managed_pane_id("ws>-p0").is_err(),
+            "angle bracket (would collide with >>> / <<< markers)"
+        );
+    }
+
+    #[test]
+    fn managed_mcp_strip_block_round_trips_and_is_idempotent() {
+        use super::managed_mcp::{build_block, strip_block};
+        let name = "agent-teams-ws7-p0";
+        let body = "[mcp_servers.agent-teams-ws7-p0]\ncommand = \"/bin/true\"\nargs = []";
+        let block = build_block(name, body);
+        // block carries both markers AND the body
+        assert!(block.contains("# >>> @agent-teams-managed:agent-teams-ws7-p0 >>>"));
+        assert!(block.contains("# <<< @agent-teams-managed:agent-teams-ws7-p0 <<<"));
+        assert!(block.contains("command = \"/bin/true\""));
+        // prepend user content, append the block. `build_block` leads with `\n` so
+        // the block always starts on its own line; `strip_block` consumes the
+        // post-end-marker `\n` but leaves the pre-block `\n` (which now becomes a
+        // trailing newline on the user content).
+        let user_content = "# my config\nmodel = \"o3\"";
+        let combined = user_content.to_string() + &block;
+        let stripped = strip_block(&combined, name);
+        assert_eq!(
+            stripped,
+            format!("{user_content}\n"),
+            "user content recovered (plus the pre-block newline)"
+        );
+        // strip_block is idempotent — stripping again is a no-op
+        assert_eq!(strip_block(&stripped, name), stripped);
+    }
+
+    #[test]
+    fn managed_mcp_strip_block_handles_half_written_block() {
+        use super::managed_mcp::strip_block;
+        // Crash mid-write left only the begin marker (the body + end marker were
+        // never flushed). strip_block drops from begin to EOF so the next inject
+        // sees a clean file — the source of truth is the live pane registry, not
+        // the partial block.
+        let corrupted = "# my config\nmodel = \"o3\"\n\n# >>> @agent-teams-managed:X >>>\n[mcp_servers.X]\ncommand = \"/bin";
+        let stripped = strip_block(corrupted, "X");
+        assert_eq!(stripped, "# my config\nmodel = \"o3\"\n\n");
+    }
+
+    #[test]
+    fn managed_mcp_strip_all_blocks_removes_every_pane() {
+        use super::managed_mcp::{build_block, strip_all_blocks};
+        let user = "# my config\nmodel = \"o3\"\n";
+        let mut combined = user.to_string();
+        // append three different pane blocks (simulating a daemon that crashed after
+        // injecting three panes but before the per-kill remove could run).
+        for pane in ["ws1-p0", "ws1-p1", "ws2-p0"] {
+            let name = format!("agent-teams-{pane}");
+            combined.push_str(&build_block(&name, &format!("[mcp_servers.{name}]\ncommand = \"/x\"")));
+        }
+        // append some trailing user content AFTER the managed blocks
+        combined.push_str("\n# tail comment\n");
+        let stripped = strip_all_blocks(&combined);
+        // all three managed blocks gone
+        assert!(!stripped.contains("@agent-teams-managed:"));
+        assert!(!stripped.contains("[mcp_servers.agent-teams-ws"));
+        // user head + tail preserved
+        assert!(stripped.contains("# my config"));
+        assert!(stripped.contains("model = \"o3\""));
+        assert!(stripped.contains("# tail comment"));
+        // idempotent — stripping again is a no-op
+        assert_eq!(strip_all_blocks(&stripped), stripped);
+    }
+
+    #[test]
+    fn managed_mcp_strip_all_handles_malformed_marker_without_looping() {
+        use super::managed_mcp::strip_all_blocks;
+        // A manually-edited / corrupted file with the prefix but no valid `>>>`/`<<<`
+        // pair must NOT loop forever and must NOT corrupt the rest of the file.
+        let content = "# user top\n# >>> @agent-teams-managed:BROKEN (no end)\nsome orphan body\n# user bottom\n";
+        let stripped = strip_all_blocks(content);
+        assert!(
+            !stripped.contains("@agent-teams-managed:"),
+            "malformed marker region removed: {stripped}"
+        );
+        assert!(stripped.contains("# user top"));
+        assert!(stripped.contains("# user bottom"));
+    }
+
+    // ───────────── CommandCode global MCP injection (parity with codex) ─────────────
+
+    /// Test helper that runs the CommandCode inject + remove logic against an
+    /// arbitrary config path (so tests don't have to mutate `$HOME`). The logic
+    /// is byte-identical to [`super::inject_commandcode_global_mcp`] /
+    /// [`super::remove_commandcode_mcp`] — the only difference is the path
+    /// argument. If this test drifts from the production functions, the
+    /// production functions should be refactored to take a path argument too.
+    mod commandcode_at_path {
+        use super::super::managed_mcp;
+        use std::io;
+        use std::path::Path;
+
+        fn build_body(
+            sidecar_bin: &Path,
+            state_root: &Path,
+            pane_id: &str,
+            repo_key: &str,
+        ) -> String {
+            let server_name = managed_mcp::server_name(pane_id);
+            let sidecar_str = sidecar_bin.to_string_lossy();
+            let state_str = state_root.to_string_lossy();
+            format!(
+                "{{\n  \"mcpServers\": {{\n    {server_name:?}: {{\n      \"command\": {sidecar_str:?},\n      \
+                 \"args\": [],\n      \"env\": {{\n        \"AGENT_TEAMS_STATE_DIR\": {state_str:?},\n        \
+                 \"AGENT_TEAMS_PANE_ID\": {pane_id:?},\n        \
+                 \"AGENT_TEAMS_MEMORY_REPO_KEY\": {repo_key:?},\n        \
+                 \"AGENT_TEAMS_TASK_SCOPE\": {pane_id:?}\n      }}\n    }}\n  }}\n}}"
+            )
+        }
+
+        pub(super) fn inject(
+            config: &Path,
+            sidecar_bin: &Path,
+            state_root: &Path,
+            pane_id: &str,
+            repo_key: &str,
+        ) -> io::Result<()> {
+            managed_mcp::assert_managed_pane_id(pane_id)?;
+            let server_name = managed_mcp::server_name(pane_id);
+            let body = build_body(sidecar_bin, state_root, pane_id, repo_key);
+            let block = managed_mcp::build_block(&server_name, &body);
+            let _guard = super::super::COMMANDCODE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(parent) = config.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let existing = match std::fs::read_to_string(config) {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    String::from("{ \"mcpServers\": {} }\n")
+                }
+                Err(e) => return Err(e),
+            };
+            if existing.contains(&block) {
+                return Ok(());
+            }
+            let stripped = managed_mcp::strip_block(&existing, &server_name);
+            let mut new = stripped;
+            new.push_str(&block);
+            std::fs::write(config, new)
+        }
+
+        pub(super) fn remove(config: &Path, pane_id: &str) {
+            if managed_mcp::assert_managed_pane_id(pane_id).is_err() {
+                return;
+            }
+            if !config.is_file() {
+                return;
+            }
+            let server_name = managed_mcp::server_name(pane_id);
+            let _guard = super::super::COMMANDCODE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Ok(content) = std::fs::read_to_string(config) else { return };
+            let cleaned = managed_mcp::strip_block(&content, &server_name);
+            if cleaned == content {
+                return;
+            }
+            let _ = std::fs::write(config, cleaned);
+        }
+
+        pub(super) fn purge(config: &Path) {
+            if !config.is_file() {
+                return;
+            }
+            let _guard = super::super::COMMANDCODE_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Ok(content) = std::fs::read_to_string(config) else { return };
+            if !content.contains(managed_mcp::MARKER_PREFIX) {
+                return;
+            }
+            let cleaned = managed_mcp::strip_all_blocks(&content);
+            if cleaned == content {
+                return;
+            }
+            let _ = std::fs::write(config, cleaned);
+        }
+    }
+
+    fn commandcode_scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("at-cc-mcp-{tag}-{nonce}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("agent-teams-mcp-coordinator");
+        std::fs::write(&sidecar, "#!/bin/true\n").unwrap();
+        (dir, sidecar)
+    }
+
+    #[test]
+    fn commandcode_global_mcp_inject_and_remove_round_trips() {
+        let (dir, sidecar) = commandcode_scratch("cc-roundtrip");
+        let config = dir.join("mcp.json");
+        std::fs::write(&config, "{ \"mcpServers\": { \"user-kept\": {} } }\n").unwrap();
+        let state = dir.join("state");
+        let pane_id = "ws42-p0";
+        commandcode_at_path::inject(&config, &sidecar, &state, pane_id, "global").unwrap();
+        let after_inject = std::fs::read_to_string(&config).unwrap();
+        // the injected block carries both the server AND the provenance env vars
+        assert!(
+            after_inject.contains("agent-teams-ws42-p0"),
+            "server name injected"
+        );
+        assert!(
+            after_inject.contains("AGENT_TEAMS_PANE_ID"),
+            "provenance env carried"
+        );
+        assert!(
+            after_inject.contains("AGENT_TEAMS_TASK_SCOPE"),
+            "task scope carried"
+        );
+        // user's own server is preserved (the append-only format leaves the head alone)
+        assert!(
+            after_inject.contains("\"user-kept\""),
+            "operator's own MCP server preserved: {after_inject}"
+        );
+        // kill path: remove strips the block
+        commandcode_at_path::remove(&config, pane_id);
+        let after_remove = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !after_remove.contains("agent-teams-ws42-p0"),
+            "managed block removed"
+        );
+        assert!(
+            after_remove.contains("\"user-kept\""),
+            "operator's MCP server still present after remove"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_global_mcp_inject_is_idempotent() {
+        let (dir, sidecar) = commandcode_scratch("cc-idem");
+        let config = dir.join("mcp.json");
+        let state = dir.join("state");
+        let pane_id = "ws7-p0";
+        // inject three times — must still be exactly ONE block.
+        for _ in 0..3 {
+            commandcode_at_path::inject(&config, &sidecar, &state, pane_id, "global").unwrap();
+        }
+        let content = std::fs::read_to_string(&config).unwrap();
+        let count = content.matches("agent-teams-ws7-p0").count();
+        // server name appears inside the body (object key + env value) exactly a
+        // fixed number of times per block — multiplying by 3 would prove duplication.
+        // Use a marker count instead (unique per block, never inside the body).
+        let begin_count = content
+            .matches("# >>> @agent-teams-managed:agent-teams-ws7-p0 >>>")
+            .count();
+        assert_eq!(begin_count, 1, "exactly one managed block after 3 injects");
+        // and the body is present
+        assert!(count >= 2, "server name carried in the body: {content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_global_mcp_purge_cleans_orphan_blocks() {
+        // Simulate a daemon crash that left three orphan blocks behind — startup
+        // purge must strip ALL of them before the next pane's inject runs.
+        let (dir, sidecar) = commandcode_scratch("cc-purge");
+        let config = dir.join("mcp.json");
+        let state = dir.join("state");
+        std::fs::write(&config, "{ \"mcpServers\": { \"user-kept\": {} } }\n").unwrap();
+        for orphan_pane in ["ws1-p0", "ws1-p1", "ws2-p0"] {
+            commandcode_at_path::inject(&config, &sidecar, &state, orphan_pane, "global").unwrap();
+        }
+        let pre_purge = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            pre_purge
+                .matches("# >>> @agent-teams-managed:agent-teams-ws")
+                .count(),
+            3,
+            "precondition: three orphan blocks before purge"
+        );
+        // the daemon restarts → startup purge runs
+        commandcode_at_path::purge(&config);
+        let post_purge = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !post_purge.contains("@agent-teams-managed:"),
+            "every orphan block stripped"
+        );
+        assert!(
+            post_purge.contains("\"user-kept\""),
+            "operator's MCP server preserved across purge"
+        );
+        // idempotent: purging again is a no-op
+        commandcode_at_path::purge(&config);
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            post_purge,
+            "purge is idempotent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_global_mcp_concurrent_injects_produce_one_block_each() {
+        // THE TOCTOU FIX TEST. Simulate 4 parallel pane spawns racing on the same
+        // config. Without the COMMANDCODE_CONFIG_LOCK + strip-before-append, at
+        // least one pane would end up with a DUPLICATE block (both threads see the
+        // block absent, both append). With the fix, exactly one block per pane.
+        let (dir, sidecar) = commandcode_scratch("cc-concurrent");
+        let config = dir.join("mcp.json");
+        std::fs::write(&config, "{ \"mcpServers\": {} }\n").unwrap();
+        let state = dir.join("state");
+        let pane_ids: Vec<&'static str> = vec!["ws1-p0", "ws1-p1", "ws2-p0", "ws2-p1"];
+        let handles: Vec<_> = pane_ids
+            .iter()
+            .map(|pane_id| {
+                let config = config.clone();
+                let sidecar = sidecar.clone();
+                let state = state.clone();
+                let pane_id = (*pane_id).to_string();
+                std::thread::spawn(move || {
+                    // each thread does 3 back-to-back injects (to simulate pane
+                    // churn: inject → kill → inject → kill) — the fix must keep
+                    // exactly one block per pane across all of them.
+                    for _ in 0..3 {
+                        commandcode_at_path::inject(&config, &sidecar, &state, &pane_id, "global")
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let content = std::fs::read_to_string(&config).unwrap();
+        for pane_id in pane_ids {
+            let server = format!("agent-teams-{pane_id}");
+            let begin_count = content
+                .matches(&format!("# >>> @agent-teams-managed:{server} >>>"))
+                .count();
+            assert_eq!(
+                begin_count, 1,
+                "exactly one block for {pane_id} despite 4 threads × 3 injects each; got {begin_count}. Content: {content}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_global_mcp_creates_file_when_absent() {
+        // First-ever pane, operator has never run commandcode → the global config
+        // does not exist. inject must create it (with the parent dir) rather than
+        // silently skip (which would leave the pane without MCP on first use).
+        let (dir, sidecar) = commandcode_scratch("cc-create");
+        let config = dir.join("nested").join("deeply").join("mcp.json");
+        assert!(!config.exists());
+        let state = dir.join("state");
+        commandcode_at_path::inject(&config, &sidecar, &state, "ws1-p0", "global").unwrap();
+        assert!(config.exists(), "config + parent dirs created");
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains("agent-teams-ws1-p0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commandcode_global_mcp_malformed_pane_id_rejected_at_boundary() {
+        // Belt-and-suspenders: a malformed pane id MUST fail the inject rather than
+        // produce a marker that strip_block could not later locate (which would
+        // leak the block permanently).
+        let (dir, sidecar) = commandcode_scratch("cc-malformed");
+        let config = dir.join("mcp.json");
+        let state = dir.join("state");
+        let err = commandcode_at_path::inject(&config, &sidecar, &state, "ws$-bad", "global")
+            .expect_err("malformed id rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // nothing written
+        assert!(!config.exists(), "no config file created for malformed id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── Codex TOCTOU fix (concurrent injects) ─────────────
+
+    /// Test helper that runs the codex inject + remove logic against an arbitrary
+    /// config path (so tests don't have to mutate `$HOME`). Mirrors
+    /// [`commandcode_at_path`] for the TOML side.
+    mod codex_at_path {
+        use super::super::managed_mcp;
+        use std::io;
+        use std::path::Path;
+
+        pub(super) fn inject(
+            config: &Path,
+            sidecar_bin: &Path,
+            state_root: &Path,
+            pane_id: &str,
+            repo_key: &str,
+        ) -> io::Result<()> {
+            managed_mcp::assert_managed_pane_id(pane_id)?;
+            if !config.is_file() {
+                return Ok(());
+            }
+            let server_name = managed_mcp::server_name(pane_id);
+            let sidecar_str = sidecar_bin.to_string_lossy();
+            let state_str = state_root.to_string_lossy();
+            let body = format!(
+                "[mcp_servers.{server_name}]\n\
+                 command = {sidecar_str:?}\n\
+                 args = []\n\
+                 env = {{ AGENT_TEAMS_STATE_DIR = {state_str:?}, AGENT_TEAMS_PANE_ID = {pane_id:?}, \
+                 AGENT_TEAMS_MEMORY_REPO_KEY = {repo_key:?}, AGENT_TEAMS_TASK_SCOPE = {pane_id:?} }}",
+            );
+            let block = managed_mcp::build_block(&server_name, &body);
+            let _guard = super::super::CODEX_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let existing = std::fs::read_to_string(config)?;
+            if existing.contains(&block) {
+                return Ok(());
+            }
+            let stripped = managed_mcp::strip_block(&existing, &server_name);
+            let mut new = stripped;
+            new.push_str(&block);
+            std::fs::write(config, new)
+        }
+
+        pub(super) fn purge(config: &Path) {
+            if !config.is_file() {
+                return;
+            }
+            let _guard = super::super::CODEX_CONFIG_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Ok(content) = std::fs::read_to_string(config) else { return };
+            if !content.contains(managed_mcp::MARKER_PREFIX) {
+                return;
+            }
+            let cleaned = managed_mcp::strip_all_blocks(&content);
+            if cleaned == content {
+                return;
+            }
+            let _ = std::fs::write(config, cleaned);
+        }
+    }
+
+    #[test]
+    fn codex_concurrent_injects_produce_one_block_each() {
+        // THE TOCTOU FIX TEST (codex side). Same shape as the commandcode one —
+        // proves CODEX_CONFIG_LOCK + strip-before-append prevents duplicate blocks
+        // under contention.
+        let (dir, sidecar) = commandcode_scratch("codex-concurrent");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "# base\nmodel = \"o3\"\n").unwrap();
+        let state = dir.join("state");
+        let pane_ids: Vec<&'static str> = vec!["ws1-p0", "ws1-p1", "ws2-p0", "ws2-p1"];
+        let handles: Vec<_> = pane_ids
+            .iter()
+            .map(|pane_id| {
+                let config = config.clone();
+                let sidecar = sidecar.clone();
+                let state = state.clone();
+                let pane_id = (*pane_id).to_string();
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        codex_at_path::inject(&config, &sidecar, &state, &pane_id, "global")
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let content = std::fs::read_to_string(&config).unwrap();
+        for pane_id in pane_ids {
+            let server = format!("agent-teams-{pane_id}");
+            let header = format!("[mcp_servers.{server}]");
+            let count = content.matches(&header).count();
+            assert_eq!(
+                count, 1,
+                "exactly one {header} despite 4 threads × 3 injects; got {count}. Content: {content}"
+            );
+        }
+        assert!(content.contains("model = \"o3\""), "user config preserved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_purge_cleans_orphan_blocks() {
+        // Mirror of the commandcode purge test — same crash-recovery purpose.
+        let (dir, sidecar) = commandcode_scratch("codex-purge");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "# base\nmodel = \"o3\"\n").unwrap();
+        let state = dir.join("state");
+        for orphan_pane in ["ws1-p0", "ws1-p1", "ws2-p0"] {
+            codex_at_path::inject(&config, &sidecar, &state, orphan_pane, "global").unwrap();
+        }
+        let pre_purge = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            pre_purge.matches("[mcp_servers.agent-teams-").count(),
+            3,
+            "precondition: three orphan blocks"
+        );
+        codex_at_path::purge(&config);
+        let post_purge = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !post_purge.contains("[mcp_servers.agent-teams-"),
+            "every orphan block stripped"
+        );
+        assert!(
+            post_purge.contains("model = \"o3\""),
+            "user config preserved across purge"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

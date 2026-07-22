@@ -77,6 +77,18 @@ fn main() {
     #[cfg(feature = "daemon-spawn")]
     agent_teams_daemon::spawn::cold_start_sweep(&state_root);
 
+    // Codex + CommandCode MCP startup hygiene: a fresh daemon process owns no live panes
+    // yet, so any `@agent-teams-managed` block in the global `~/.codex/config.toml` /
+    // `~/.commandcode/mcp.json` is a leak from a prior session that died without
+    // `Supervisor::kill` (crash/force-quit) — those global configs otherwise accumulate one
+    // stale `agent-teams-<workspace>` server per dead pane (the "many workspaces" bloat).
+    // Purge at boot; live panes re-inject on spawn (the spawn path also purges, as a
+    // per-spawn belt-and-suspenders). Best-effort + idempotent (no-op when no config /
+    // no markers). Mirrors the fail-soft cold-start sweep above.
+    // Best-effort + idempotent (no-op when no config / no markers); returns () by design.
+    supervisor::purge_all_managed_codex_mcp();
+    supervisor::purge_all_managed_commandcode_mcp();
+
     // Empty map until a gated `Spawn` populates it (default build serves it empty exactly
     // as before). The production stored value is the real `Supervisor` (the PTY-owning pane).
     let sups: Arc<DaemonSups<supervisor::Supervisor>> = Arc::new(DaemonSups::new());

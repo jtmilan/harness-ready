@@ -142,6 +142,11 @@ fn non_claude_harness(name: &str) -> Option<harness::Harness> {
         "opencode" => Some(harness::Harness::OpenCode),
         "commandcode" => Some(harness::Harness::CommandCode),
         "pi" => Some(harness::Harness::Pi),
+        // Grok was silently missing here → fell through to the claude fallback, so a Grok
+        // worker dispatched by the flywheel actually ran as a claude worker (wrong binary,
+        // wrong argv, wrong prompt delivery). The harness variant exists in worker_spawn
+        // (grok agent --cwd …) — this mapping just wasn't wired.
+        "grok" => Some(harness::Harness::Grok),
         _ => None,
     }
 }
@@ -251,7 +256,9 @@ mod tests {
         // + the CLI's apply_git_deny_env). The deny env is the CLI's responsibility (harness returns
         // program+args only), so this guards that the adapter still applies it on every harness.
         let builders: Vec<(&str, Command)> =
-            ["cursor", "codex", "opencode", "commandcode", "pi"]
+            // grok was silently missing from non_claude_harness (BUG-1) → was never built here,
+            // so its deny env was untested. Added alongside pi.
+            ["cursor", "codex", "opencode", "commandcode", "pi", "grok"]
                 .into_iter()
                 .map(|h| (h, worker_command(h, repo, Some("m"), true, wt).cmd))
                 .collect();

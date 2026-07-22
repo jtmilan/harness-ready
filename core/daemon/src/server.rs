@@ -315,6 +315,17 @@ impl<V: PaneWrite + PaneStream + SpawnRouteCap> ConnRouter for SupRouter<V> {
                 );
                 route_request(&self.sups, SocketRequest::SendInput { id, text })
             }
+            SocketRequest::WritePtyRaw { id, data } => {
+                // The GUI keyboard path for raw PTY bytes also needs the claude
+                // banner-prime on the FIRST write — the prime dismisses the MCP
+                // setup banner BEFORE raw keystrokes reach the TUI.
+                crate::handlers::maybe_prime_claude(
+                    &self.sups,
+                    self.spawn_state.primed_handle(),
+                    &id,
+                );
+                route_request(&self.sups, SocketRequest::WritePtyRaw { id, data })
+            }
             other => route_request(&self.sups, other),
         };
         #[cfg(not(feature = "daemon-spawn"))]
@@ -562,7 +573,7 @@ fn handle_request_line<R: ConnRouter>(
     // app-side handler in app/src-tauri/src/lib.rs so the two fresh-reads can never drift.
     if op_requires_mutations(&req) {
         let cfg = read_mcp_config(state_root);
-        if matches!(req, SocketRequest::SendInput { .. }) {
+        if matches!(req, SocketRequest::SendInput { .. } | SocketRequest::WritePtyRaw { .. }) {
             if !cfg.send_input_enabled {
                 return write_resp(
                     stream,
@@ -774,6 +785,9 @@ fn route_request<V: PaneWrite>(sups: &DaemonSups<V>, req: SocketRequest) -> Sock
             })
         }
         SocketRequest::SendInput { id, text } => handle_send_input(sups, &id, &text),
+        SocketRequest::WritePtyRaw { id, data } => {
+            crate::handlers::handle_write_pty_raw(sups, &id, data.as_bytes())
+        }
         SocketRequest::Focus { id } => {
             if sups.contains(&id) {
                 SocketResponse::ok("focused")

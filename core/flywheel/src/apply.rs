@@ -1580,6 +1580,9 @@ diff --git a/k b/k
             ("opencode", "opencode"),
             ("commandcode", "commandcode"),
             ("pi", "pi"),
+            // grok was silently missing from non_claude_harness → fell through to claude
+            // (BUG-1 regression guard: the mapping now carries it, so this pins the dispatch).
+            ("grok", "grok"),
             // unknown harness → claude fallback (preserves today's behavior, never a silent push path)
             ("totally-unknown", "claude"),
         ];
