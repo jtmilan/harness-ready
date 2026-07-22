@@ -2135,6 +2135,56 @@ async fn capture_region() -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Read the macOS clipboard for image data (PNG/TIFF) and save to a temp file.
+/// Returns the file path so the frontend can send it to the PTY. Called when the
+/// operator pastes (⌘V) with an image on the clipboard — the xterm textarea cannot
+/// handle binary clipboard items, so we go through AppleScript for the disk round-trip.
+/// Returns Err if the clipboard has no image data.
+#[tauri::command]
+fn paste_clipboard_image() -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("clipboard-{ts}.png"));
+    let script = format!(
+        r#"set theFile to POSIX file "{}"
+try
+    set imgData to the clipboard as «class PNGf»
+    set fp to open for access theFile with write permission
+    set eof fp to 0
+    write imgData to fp
+    close access fp
+    return "ok"
+on error
+    try
+        set imgData to the clipboard as TIFF picture
+        set fp to open for access theFile with write permission
+        set eof fp to 0
+        write imgData to fp
+        close access fp
+        return "ok"
+    on error
+        return "no_image"
+    end try
+end try"#,
+        path.display()
+    );
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| format!("osascript: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim() == "ok" && path.exists() {
+        Ok(path.to_string_lossy().into_owned())
+    } else {
+        Err("no image on clipboard".into())
+    }
+}
+
+
 /// Open a URL in the user's default browser (escape hatch for sites that refuse
 /// framing via X-Frame-Options). Direct `open` spawn → no extra Tauri capability.
 /// Validated: only `http(s)://` URLs or an EXISTING non-flag file path — `open` can
@@ -14146,6 +14196,7 @@ pub fn run() {
             default_folder,
             path_is_dir,
             capture_region,
+            paste_clipboard_image,
             open_external,
             reveal_path,
             read_text_file,

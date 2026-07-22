@@ -628,10 +628,47 @@ function ensureSession(id) {
           maximizePane(id);
           return false;
         }
+        // Ctrl+V (no ⌘) → forward raw 0x16 to the PTY so harness TUIs (Codex CLI)
+        // can handle image-paste natively (they read the OS clipboard themselves).
+        // Without this, WKWebView intercepts Ctrl+V as "paste" and the keystroke
+        // never reaches the terminal application.
+        if (e.type === "keydown" && e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+            && (e.key === "v" || e.key === "V")) {
+          e.preventDefault();
+          if (hasTauri()) {
+            if (broadcast) { for (const pid of broadcastTargets()) invoke("send_input", { id: pid, data: "\x16" }).catch(() => {}); }
+            else invoke("send_input", { id, data: "\x16" }).catch((e) => { if (DEAD_RE.test(String(e))) noteDeadPanes([id]); });
+          }
+          return false;
+        }
         return true;
       });
     }
   } catch (_) { /* Shift+Enter newline degrades gracefully; the pane still registers */ }
+  // ⌘V image paste: WKWebView fires a `paste` event on xterm's helper textarea.
+  // Text pastes work natively (xterm reads clipboardData text), but IMAGE items are
+  // silently dropped. Intercept: if the clipboard holds an image, save it to a temp
+  // file via the backend (osascript clipboard read) and send the path to the PTY.
+  mount.addEventListener("paste", (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    let hasImage = false;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith("image/")) { hasImage = true; break; }
+    }
+    if (!hasImage) return; // text-only paste → let xterm handle it
+    e.preventDefault();
+    e.stopPropagation();
+    invoke("paste_clipboard_image").then((path) => {
+      if (!path) return;
+      const quoted = "'" + path.replace(/'/g, "'\\''") + "'";
+      if (broadcast) { for (const pid of broadcastTargets()) invoke("send_input", { id: pid, data: quoted + " " }).catch(() => {}); }
+      else invoke("send_input", { id, data: quoted + " " }).catch(() => {});
+      showToast("Image pasted → " + path.split("/").pop());
+    }).catch(() => {
+      showToast("No image on clipboard (text-only paste)");
+    });
+  }, true);
   term.onData((d) => {
     if (!hasTauri()) return;
     // KNOWN-dead pane: don't type into the void — send_input would just reject backend-side
