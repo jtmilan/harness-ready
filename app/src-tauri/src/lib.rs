@@ -2135,11 +2135,89 @@ async fn capture_region() -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Swift source for the clipboard-image helper binary. Reads NSPasteboard for
+/// PNG (or TIFF → PNG conversion) and writes the result to the path given as
+/// argv[1]. Prints "ok" on success, "no_image" when the clipboard holds no
+/// image data. Compiled once with `swiftc -O` and cached in the system temp
+/// directory; subsequent pastes reuse the cached binary (~5 ms).
+///
+/// Replaces the former AppleScript approach whose `«class PNGf»` raw-four-char
+/// syntax broke on macOS 26 (Tahoe) — the AppleScript parser now rejects the
+/// guillemet class identifier with "Expected class name but found identifier".
+const CLIPBOARD_PASTE_SWIFT: &str = r#"import AppKit
+import Foundation
+
+let args = CommandLine.arguments
+guard args.count > 1 else {
+    fputs("usage: clipboard-paste <output-path>\n", stderr)
+    exit(1)
+}
+let destPath = args[1]
+let pb = NSPasteboard.general
+
+if let data = pb.data(forType: .png) {
+    do {
+        try data.write(to: URL(fileURLWithPath: destPath))
+        print("ok")
+    } catch {
+        fputs("write error: \(error)\n", stderr)
+        exit(1)
+    }
+} else if let tiffData = pb.data(forType: .tiff) {
+    if let rep = NSBitmapImageRep(data: tiffData),
+       let pngData = rep.representation(using: .png, properties: [:]) {
+        do {
+            try pngData.write(to: URL(fileURLWithPath: destPath))
+            print("ok")
+        } catch {
+            fputs("write error: \(error)\n", stderr)
+            exit(1)
+        }
+    } else {
+        print("no_image")
+    }
+} else {
+    print("no_image")
+}
+"#;
+
+/// Find (or compile + cache) the Swift clipboard-image helper binary.
+/// The binary is cached at `$TMPDIR/harness-ready-helpers/clipboard-paste`
+/// so the ~5 s `swiftc` compilation only runs once per boot cycle.
+fn ensure_clipboard_helper() -> Result<std::path::PathBuf, String> {
+    let cache_dir = std::env::temp_dir().join("harness-ready-helpers");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("mkdir: {e}"))?;
+    let binary = cache_dir.join("clipboard-paste");
+
+    if binary.exists() {
+        return Ok(binary);
+    }
+
+    let source = cache_dir.join("clipboard-paste.swift");
+    std::fs::write(&source, CLIPBOARD_PASTE_SWIFT).map_err(|e| format!("write swift src: {e}"))?;
+
+    let output = std::process::Command::new("swiftc")
+        .arg("-O")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .map_err(|e| format!("swiftc: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&binary);
+        return Err(format!("swiftc failed: {stderr}"));
+    }
+
+    Ok(binary)
+}
+
 /// Read the macOS clipboard for image data (PNG/TIFF) and save to a temp file.
 /// Returns the file path so the frontend can send it to the PTY. Called when the
 /// operator pastes (⌘V) with an image on the clipboard — the xterm textarea cannot
-/// handle binary clipboard items, so we go through AppleScript for the disk round-trip.
-/// Returns Err if the clipboard has no image data.
+/// handle binary clipboard items, so we go through a compiled Swift helper that
+/// reads NSPasteboard directly. Returns Err if the clipboard has no image data.
 #[tauri::command]
 fn paste_clipboard_image() -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2147,40 +2225,35 @@ fn paste_clipboard_image() -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("clipboard-{ts}.png"));
-    let script = format!(
-        r#"set theFile to POSIX file "{}"
-try
-    set imgData to the clipboard as «class PNGf»
-    set fp to open for access theFile with write permission
-    set eof fp to 0
-    write imgData to fp
-    close access fp
-    return "ok"
-on error
-    try
-        set imgData to the clipboard as TIFF picture
-        set fp to open for access theFile with write permission
-        set eof fp to 0
-        write imgData to fp
-        close access fp
-        return "ok"
-    on error
-        return "no_image"
-    end try
-end try"#,
-        path.display()
-    );
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
+    let out_path = std::env::temp_dir().join(format!("clipboard-{ts}.png"));
+
+    let helper = ensure_clipboard_helper()?;
+
+    let output = std::process::Command::new(&helper)
+        .arg(out_path.to_string_lossy().as_ref())
         .output()
-        .map_err(|e| format!("osascript: {e}"))?;
+        .map_err(|e| format!("clipboard helper: {e}"))?;
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim() == "ok" && path.exists() {
-        Ok(path.to_string_lossy().into_owned())
+    if stdout.trim() == "ok" && out_path.exists() {
+        Ok(out_path.to_string_lossy().into_owned())
     } else {
         Err("no image on clipboard".into())
+    }
+}
+
+/// Read plain text from the macOS clipboard via `pbpaste`.
+/// WKWebView does not expose the async Clipboard API (`navigator.clipboard.readText()`
+/// rejects with a permissions error), so we go through the native utility instead.
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    let output = std::process::Command::new("pbpaste")
+        .output()
+        .map_err(|e| format!("pbpaste: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err("pbpaste failed".into())
     }
 }
 
@@ -14197,6 +14270,7 @@ pub fn run() {
             path_is_dir,
             capture_region,
             paste_clipboard_image,
+            read_clipboard_text,
             open_external,
             reveal_path,
             read_text_file,

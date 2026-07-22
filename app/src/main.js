@@ -656,7 +656,7 @@ function ensureSession(id) {
               else invoke("send_input", { id, data: quoted + " " }).catch(() => {});
               showToast("Image pasted → " + path.split("/").pop());
             }).catch(() => {
-              navigator.clipboard.readText().then((text) => {
+              invoke("read_clipboard_text").then((text) => {
                 if (text) term.paste(text);
               }).catch(() => {});
             });
