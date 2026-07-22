@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build-daemon-sidecar.sh — build the agent-teams-daemon binary for the Tauri
-# externalBin. Mirrors build-mcp-sidecar.sh / build-whisper-cli.sh: build → cp to
-# binaries/<host-triple> (the committed prebuilt the app bundles). Tauri strips the
-# triple suffix at bundle time → Contents/MacOS/agent-teams-daemon.
+# externalBin. Mirrors build-mcp-sidecar.sh: build → cp to binaries/<host-triple>
+# (the committed prebuilt the app bundles). Tauri strips the triple suffix at
+# bundle time → Contents/MacOS/agent-teams-daemon.
 #
 # 08-T9 — BUNDLE-BUT-INERT. This stages the daemon Mach-O into the app bundle so the
 # packaged AC-1..6 GUI-verify (detached-PTY survives Cmd+Q, no double-spawn,
@@ -28,8 +28,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # host triple — hardcoded aarch64-apple-darwin to match the committed
-# agent-teams-mcp-<triple> / whisper-cli-<triple> prebuilt names (macOS aarch64 host
-# only; cross-arch is out of scope, same constraint the other sidecars carry).
+# agent-teams-mcp-<triple> prebuilt name (macOS aarch64 host only; cross-arch is
+# out of scope, same constraint the other sidecars carry).
 TRIPLE="aarch64-apple-darwin"
 DEST="$REPO/app/src-tauri/binaries/agent-teams-daemon-$TRIPLE"
 

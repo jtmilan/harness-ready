@@ -10,7 +10,7 @@
 #
 # The 5 suites (matching CI jobs):
 #   1. Rust workspace          — cargo test --workspace --locked  (core/* + agent-teams-mcp)
-#   2. App crate               — bash scripts/test-app-crate.sh   (whisper-model gated)
+#   2. App crate               — bash scripts/test-app-crate.sh
 #   3. Frontend unit tests     — cd app && npm ci && npm test     (vitest)
 #   4. Frontend lint           — npm run lint                     (eslint; advisory)
 #   5. Visual regression       — npm run test:visual              (playwright webkit; advisory)
@@ -52,7 +52,7 @@ run_suite() {
 run_suite "1/5 Rust workspace (cargo test --workspace)" \
   cargo test --workspace --locked
 
-# 2. Tauri app crate (whisper-model gated wrapper)
+# 2. Tauri app crate
 run_suite "2/5 App crate (scripts/test-app-crate.sh)" \
   bash "$REPO/scripts/test-app-crate.sh"
 

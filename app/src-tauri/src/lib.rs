@@ -184,11 +184,6 @@ struct AppState {
     // close path's DETACHED disk-cleanup thread (see `pending_cleanups`) can hold the
     // same guard while it rewrites the registry after the slow worktree removal.
     worktree_registry_lock: std::sync::Arc<Mutex<()>>,
-    // Plan 05-04 (voice INPUT): push-to-talk mic capture. The cpal input `Stream` is
-    // `!Send`, so it can NEVER live in this (Send+Sync) struct — it stays thread-local
-    // on a dedicated capture thread (see `start_dictation`). AppState holds only the
-    // Send control handle (a stop signal + the join handle + the raw-WAV path).
-    dictation: Mutex<Option<Dictation>>,
     // Per-pane WRITE SERIALIZER (perf: send_input off the main thread): `write_to_pane` holds a
     // pane's entry for the WHOLE write — claude Esc-prime settle + body + split-submit settle +
     // deferred `\r` — so the settle sleeps can run off the main thread (`send_input` is
@@ -235,19 +230,6 @@ struct AppState {
     // never leaks. Inert unless delegate-live.
     #[cfg_attr(not(feature = "delegate-live"), allow(dead_code))]
     delegate_loop_id: Mutex<String>,
-}
-
-/// Control handle for an in-flight push-to-talk capture. Holds only `Send` things —
-/// NEVER the cpal `Stream` (it's `!Send` and lives on the capture thread, dropping —
-/// which stops capture — when that thread exits on the stop signal).
-struct Dictation {
-    /// Set by `stop_dictation` to tell the capture thread to drop the stream + finalize.
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Joined by `stop_dictation` to wait for the WAV to be flushed/finalized.
-    handle: std::thread::JoinHandle<Result<(), String>>,
-    /// The raw-capture WAV (device-native rate/format) the thread writes; downsampled
-    /// to whisper's 16 kHz mono s16le by `stop_dictation` via afconvert.
-    raw_wav: PathBuf,
 }
 
 /// One persisted worktree record (JSONL line in the registry file).
@@ -11511,9 +11493,8 @@ fn resolve_test_suites(target: &std::path::Path) -> (Vec<TestSuite>, Vec<String>
 
 /// Allowlisted, bounded env-provisioning for an UNVERIFIED gate — provision ONLY what the TRUSTED
 /// gate already DECLARES to run (then the caller re-runs the SAME gate); NEVER author/widen the gate
-/// (the false-PASS trap). Returns true iff it provisioned something (progress). Covers (a) a declared
-/// JS-runner command suite with no `node_modules` → the repo's lockfile install; (b) a declared
-/// app-crate cargo manifest needing the gitignored whisper model → `scripts/fetch-whisper-model.sh`.
+/// (the false-PASS trap). Returns true iff it provisioned something (progress). Covers a declared
+/// JS-runner command suite with no `node_modules` → the repo's lockfile install.
 #[cfg(feature = "delegate-live")]
 fn provision_uncollected_evidence(integ_wt: &Path, say_back: &dyn Fn(&str)) -> bool {
     let (suites, _dropped) = resolve_test_suites(integ_wt);
@@ -11535,14 +11516,6 @@ fn provision_uncollected_evidence(integ_wt: &Path, say_back: &dyn Fn(&str)) -> b
         };
         say_back(&format!("[flywheel] remediation: provisioning JS deps ({})", argv.join(" ")));
         did = run_bounded(argv) || did;
-    }
-    let needs_model = suites.iter().any(|s| matches!(s, TestSuite::Cargo(p) if p.ends_with("app/src-tauri/Cargo.toml")));
-    if needs_model
-        && integ_wt.join("scripts/fetch-whisper-model.sh").is_file()
-        && !integ_wt.join("app/src-tauri/models/ggml-tiny.en.bin").is_file()
-    {
-        say_back("[flywheel] remediation: fetching the whisper test model (scripts/fetch-whisper-model.sh)");
-        did = run_bounded(&["bash", "scripts/fetch-whisper-model.sh"]) || did;
     }
     did
 }
@@ -13284,110 +13257,11 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
 }
 // ════════════════ 06-02 phase-b HTTP transport [END] ════════════════
 
-// ───────────────────── Plan 05-04: voice INPUT (push-to-talk dictation) ─────────
-//
-// The voice-INPUT half deferred from 05-03 (D35/D36): hold push-to-talk → in-app mic
-// capture → whisper.cpp file-only sidecar → fill the SAME 05-03 Voice Reply field
-// (Model-A: the human still reviews + presses Speak & Send; this adds NO send path).
-//
-// CLEAN SEPARATION (the 05-03 TCC lesson): the ENTITLED APP owns the mic (cpal = raw
-// CoreAudio; NSMicrophoneUsageDescription + a TCC grant). The FILE-ONLY whisper-cli
-// sidecar only reads a WAV → never touches the mic → needs NO TCC (a bare CLI that
-// opened the mic would hit the __TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__ SIGABRT that
-// disqualified macOS Speech in 05-03).
-//
-// THREADING: a cpal input `Stream` is `!Send`, so it can never cross threads or live in
-// the (Send+Sync) AppState. `start_dictation` spawns a dedicated thread that builds the
-// stream, plays it, and parks on a stop flag; the `Stream` is a thread-local that drops
-// (stopping capture) when the thread returns. AppState holds only the Send control
-// handle. Capture is at the device-native rate/format → afconvert downsamples to
-// whisper's 16 kHz mono s16le (cpal+hound do NOT resample; afconvert is a system bin →
-// zero new Rust deps, preferred over pulling in rubato).
-
-/// The raw-capture WAV — a SIBLING of state_root (mirrors `default_registry_path`) so
-/// the startup state-dir wipe never deletes it mid-capture (AC-1). Device-native
-/// rate/format; downsampled to 16 kHz mono s16le by `stop_dictation`.
-fn dictation_raw_wav_path() -> PathBuf {
-    sibling_of_state_root("dictation-raw.wav")
-}
-
-/// The whisper-ready WAV (16 kHz mono s16le) — also a sibling of state_root (AC-1).
-fn dictation_wav_path() -> PathBuf {
-    sibling_of_state_root("dictation-16k.wav")
-}
-
-/// Helper: `<state_root parent>/<state_root name>-<suffix>` — the sibling-of-state_root
-/// naming every survives-the-wipe file uses (registry/run-log/dev-source). Pure-ish.
-fn sibling_of_state_root(suffix: &str) -> PathBuf {
-    let sr = default_state_root();
-    let name = sr
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "agent-teams".to_string());
-    sr.parent()
-        .map(|p| p.join(format!("{name}-{suffix}")))
-        .unwrap_or_else(|| PathBuf::from(format!("agent-teams-{suffix}")))
-}
-
-/// argv for `/usr/bin/afconvert` to transcode `src` → `dst` as **16 kHz mono s16le WAV**
-/// (`-d LEI16@16000 -c 1`), exactly what whisper.cpp wants. Pure → unit-tested. (Verified
-/// end-to-end: `say -o x.aiff … | afconvert -f WAVE -d LEI16@16000 -c 1 | whisper-cli`
-/// returns the spoken text; cpal+hound can't resample, so this system bin does it.)
-fn afconvert_args(src: &std::path::Path, dst: &std::path::Path) -> Vec<String> {
-    vec![
-        "-f".into(),
-        "WAVE".into(),
-        "-d".into(),
-        "LEI16@16000".into(),
-        "-c".into(),
-        "1".into(),
-        src.to_string_lossy().into_owned(),
-        dst.to_string_lossy().into_owned(),
-    ]
-}
-
-/// argv for the whisper-cli sidecar: `-m <model> -f <wav> -nt -np` — `-nt` strips
-/// timestamps and `-np` strips the progress/info prints so stdout is ONLY the
-/// transcript (verified). Pure → unit-tested.
-fn whisper_args(model: &std::path::Path, wav: &std::path::Path) -> Vec<String> {
-    vec![
-        "-m".into(),
-        model.to_string_lossy().into_owned(),
-        "-f".into(),
-        wav.to_string_lossy().into_owned(),
-        "-nt".into(),
-        "-np".into(),
-    ]
-}
-
-/// Resolve the bundled whisper-cli sidecar binary. Precedence (mirrors
-/// `resolve_hooks_dir`): 1. `AGENT_TEAMS_WHISPER_BIN` override (dev/tests);
-/// 2. the externalBin next to the running executable (Tauri strips the target-triple
-/// suffix at bundle time, so it's just `whisper-cli` beside the app binary); 3. a typed
-/// Err (NEVER panic — transcription is optional, like voice). File-only → no TCC.
-fn resolve_whisper_bin() -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("AGENT_TEAMS_WHISPER_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().map_err(|e| format!("whisper: current_exe failed: {e}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "whisper: exe has no parent dir".to_string())?;
-    let cand = dir.join("whisper-cli");
-    if cand.exists() {
-        return Ok(cand);
-    }
-    Err(format!(
-        "whisper-cli sidecar not found (looked beside {} and AGENT_TEAMS_WHISPER_BIN unset)",
-        dir.display()
-    ))
-}
-
 /// Resolve the bundled read-only `agent-teams-mcp` stdio sidecar (16-01 / D56),
-/// mirroring [`resolve_whisper_bin`]'s precedence but returning a `PathBuf` (not a
-/// `Result`): the sidecar is OPTIONAL, so a missing binary must degrade to "no MCP
-/// in the pane" (the supervisor's `inject_mcp_config`/`mcp_args` handle a bogus
-/// path / failed inject without breaking the spawn — AC-6), never panic.
+/// returning a `PathBuf` (not a `Result`): the sidecar is OPTIONAL, so a missing
+/// binary must degrade to "no MCP in the pane" (the supervisor's
+/// `inject_mcp_config`/`mcp_args` handle a bogus path / failed inject without
+/// breaking the spawn — AC-6), never panic.
 ///
 /// Precedence:
 /// 1. `AGENT_TEAMS_MCP_BIN` override (dev / tests).
@@ -13403,7 +13277,6 @@ fn resolve_sidecar_bin() -> PathBuf {
     if let Ok(p) = std::env::var("AGENT_TEAMS_MCP_BIN") {
         return PathBuf::from(p);
     }
-    // beside the running executable (the bundled externalBin)
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp")));
@@ -13412,23 +13285,17 @@ fn resolve_sidecar_bin() -> PathBuf {
             return cand.clone();
         }
     }
-    // dev fallback: app/src-tauri → ../../<...>. The committed prebuilt is ALWAYS
-    // present (it ships in the tree); prefer it, then a fresher local cargo build.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let prebuilt = manifest.join("binaries/agent-teams-mcp-aarch64-apple-darwin");
     if prebuilt.exists() {
         return prebuilt;
     }
-    // app/src-tauri → ../../target (the workspace target; agent-teams-mcp IS a
-    // workspace member, so `cargo build` lands the binary here).
     for profile in ["release", "debug"] {
         let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
         if cand.exists() {
             return cand;
         }
     }
-    // last resort: the (absent) beside-exe path, or the prebuilt path — the caller
-    // degrades to "no MCP in the pane" rather than failing the spawn.
     beside.unwrap_or(prebuilt)
 }
 
@@ -13447,8 +13314,6 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
     if let Ok(p) = std::env::var("AGENT_TEAMS_MCP_COORDINATOR_BIN") {
         return PathBuf::from(p);
     }
-    // beside the running executable (a SEPARATE bundled binary, distinct from the
-    // read-only `agent-teams-mcp` every pane otherwise gets).
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp-coordinator")));
@@ -13457,7 +13322,6 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
             return cand.clone();
         }
     }
-    // dev fallback: a local phase-b cargo build lands at target/{release,debug}/agent-teams-mcp.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for profile in ["release", "debug"] {
         let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
@@ -13465,290 +13329,7 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
             return cand;
         }
     }
-    // fail SAFE: no coordinator binary bundled → read-only sidecar (no broadcast tools).
     resolve_sidecar_bin()
-}
-
-/// Resolve the ggml-tiny.en model. Precedence: 1. `AGENT_TEAMS_WHISPER_MODEL` override;
-/// 2. bundled as a Tauri resource (`models/ggml-tiny.en.bin`, fetched at build, NOT
-/// committed); 3. a typed Err. Takes the app handle for the bundled-resource lookup.
-fn resolve_whisper_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("AGENT_TEAMS_WHISPER_MODEL") {
-        return Ok(PathBuf::from(p));
-    }
-    if let Ok(res) = app
-        .path()
-        .resolve("models/ggml-tiny.en.bin", tauri::path::BaseDirectory::Resource)
-    {
-        if res.exists() {
-            return Ok(res);
-        }
-    }
-    Err("ggml-tiny.en.bin model not found (set AGENT_TEAMS_WHISPER_MODEL or bundle it as a resource)".into())
-}
-
-/// Build the hound `WavSpec` matching cpal's reported config (channels / rate / sample
-/// format). The f32-vs-i16 header MUST match the samples we write (the classic footgun);
-/// afconvert reads either fine. Pure → unit-tested via the helper inputs.
-fn wav_spec_for(channels: u16, sample_rate: u32, is_float: bool, bits: u16) -> hound::WavSpec {
-    hound::WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample: bits,
-        sample_format: if is_float {
-            hound::SampleFormat::Float
-        } else {
-            hound::SampleFormat::Int
-        },
-    }
-}
-
-/// Start push-to-talk capture. Spawns a dedicated thread that owns the (`!Send`) cpal
-/// input stream and writes device-native PCM to the raw WAV until `stop_dictation`
-/// flips the stop flag. Returns a typed Err on mic-open failure / permission DENY —
-/// NEVER panics (mirrors the 05-01 notification auth-degrade); the frontend disables
-/// PTT + toasts, and typed replies keep working (AC-4). Idempotent-ish: a second
-/// start while one is in flight returns an error rather than leaking a thread.
-/// (async): blocks up to 15s on `ready_rx.recv_timeout` waiting for the mic/TCC
-/// prompt — run on the async runtime, never the main thread.
-#[tauri::command(async)]
-fn start_dictation(state: tauri::State<AppState>) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    {
-        let g = state.dictation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if g.is_some() {
-            return Err("dictation already in progress".into());
-        }
-    }
-    let raw_wav = dictation_raw_wav_path();
-    // best-effort: clear a stale raw WAV from a prior (crashed) capture.
-    let _ = std::fs::remove_file(&raw_wav);
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    let raw_for_thread = raw_wav.clone();
-
-    // Channel to surface a stream-open error (mic DENY, no device) back to THIS command
-    // synchronously, so a denial is a typed Err — not a silently-empty WAV later.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-        use std::sync::atomic::Ordering as O;
-
-        let host = cpal::default_host();
-        let device = match host.default_input_device() {
-            Some(d) => d,
-            None => {
-                let _ = ready_tx.send(Err("no input device (mic) available".into()));
-                return Err("no input device".into());
-            }
-        };
-        let config = match device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("mic config unavailable: {e}")));
-                return Err(format!("mic config: {e}"));
-            }
-        };
-        let channels = config.channels();
-        let sample_rate = config.sample_rate().0;
-        let fmt = config.sample_format();
-        let spec = wav_spec_for(
-            channels,
-            sample_rate,
-            fmt.is_float(),
-            (fmt.sample_size() * 8) as u16,
-        );
-        let writer = match hound::WavWriter::create(&raw_for_thread, spec) {
-            Ok(w) => std::sync::Arc::new(std::sync::Mutex::new(Some(w))),
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("WAV create failed: {e}")));
-                return Err(format!("WAV create: {e}"));
-            }
-        };
-        let w_cb = writer.clone();
-        let err_fn = |e: cpal::StreamError| eprintln!("[agent-teams] dictation stream error: {e}");
-        let stream_cfg: cpal::StreamConfig = config.clone().into();
-
-        // Build a stream typed to the device's sample format; both branches downcast to
-        // i16 for the WAV (afconvert is happy with float WAV too, but i16 keeps the raw
-        // file small). On a sample-format we don't handle, surface a typed error.
-        let stream = match fmt {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &stream_cfg,
-                move |data: &[f32], _: &_| {
-                    if let Ok(mut g) = w_cb.try_lock() {
-                        if let Some(w) = g.as_mut() {
-                            for &s in data {
-                                let _ = w.write_sample(s);
-                            }
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &stream_cfg,
-                move |data: &[i16], _: &_| {
-                    if let Ok(mut g) = w_cb.try_lock() {
-                        if let Some(w) = g.as_mut() {
-                            for &s in data {
-                                let _ = w.write_sample(s);
-                            }
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &stream_cfg,
-                move |data: &[u16], _: &_| {
-                    if let Ok(mut g) = w_cb.try_lock() {
-                        if let Some(w) = g.as_mut() {
-                            // hound has no u16 Sample impl; recenter unsigned → signed i16
-                            // (0..=65535 → -32768..=32767) so the WAV is valid s16le.
-                            for &s in data {
-                                let _ = w.write_sample((s as i32 - 32_768) as i16);
-                            }
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            other => {
-                let _ = ready_tx.send(Err(format!("unsupported mic sample format: {other}")));
-                return Err(format!("unsupported sample format: {other}"));
-            }
-        };
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                // mic DENY surfaces here as a stream-build error on macOS — typed Err,
-                // never a panic (the AC-4 degrade contract).
-                let _ = ready_tx.send(Err(format!("mic open failed (permission?): {e}")));
-                return Err(format!("mic open: {e}"));
-            }
-        };
-        if let Err(e) = stream.play() {
-            let _ = ready_tx.send(Err(format!("mic start failed: {e}")));
-            return Err(format!("mic play: {e}"));
-        }
-        // capture is live — tell the command it succeeded.
-        let _ = ready_tx.send(Ok(()));
-
-        // Park until stop. The `!Send` stream stays on THIS thread; dropping it (when we
-        // return) stops capture. Poll the flag (cpal has no blocking-stop primitive).
-        while !stop_thread.load(O::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        drop(stream); // stop capturing
-        // finalize the WAV (flush header) so afconvert sees a complete file.
-        if let Some(w) = writer.lock().unwrap().take() {
-            w.finalize().map_err(|e| format!("WAV finalize: {e}"))?;
-        }
-        Ok(())
-    });
-
-    // Wait for the thread to confirm the stream opened (or report a DENY/error). A
-    // generous timeout so a slow first-time TCC prompt doesn't false-fail.
-    match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
-        Ok(Ok(())) => {
-            let mut slot = state.dictation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Stop any prior in-flight capture before overwriting the slot — otherwise the previous
-            // thread (which holds its OWN stop-flag Arc) parks in its 50ms poll loop forever, holding
-            // the mic stream open (a double-start without an intervening stop_dictation leaks it).
-            if let Some(prev) = slot.take() {
-                prev.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _ = prev.handle.join();
-            }
-            *slot = Some(Dictation { stop, handle, raw_wav });
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            // capture thread already returned an Err — join to reap it, surface the error.
-            let _ = handle.join();
-            Err(e)
-        }
-        Err(_) => {
-            // never confirmed: signal stop + reap, return a typed error (no panic, no leak).
-            stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-            Err("mic did not start in time (permission prompt may be pending)".into())
-        }
-    }
-}
-
-/// Stop push-to-talk capture: flip the stop flag, join the capture thread (which drops
-/// the stream + finalizes the raw WAV), then shell `afconvert` to produce the 16 kHz
-/// mono s16le WAV whisper wants. Returns the converted WAV path. Typed Err (never
-/// panics) if no capture was in flight or any step fails.
-/// (async): joins the capture thread and blocks on the `afconvert` subprocess — run
-/// on the async runtime, never the main thread.
-#[tauri::command(async)]
-fn stop_dictation(state: tauri::State<AppState>) -> Result<String, String> {
-    use std::sync::atomic::Ordering;
-    let d = state
-        .dictation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-        .ok_or("no dictation in progress")?;
-    d.stop.store(true, Ordering::Relaxed);
-    d.handle
-        .join()
-        .map_err(|_| "dictation capture thread panicked".to_string())??;
-    let out = dictation_wav_path();
-    let _ = std::fs::remove_file(&out);
-    let status = std::process::Command::new("/usr/bin/afconvert")
-        .args(afconvert_args(&d.raw_wav, &out))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("afconvert spawn failed: {e}"))?;
-    if !status.success() {
-        return Err(format!("afconvert failed (status {status})"));
-    }
-    // the device-native raw capture is consumed by afconvert; remove it now (data-at-
-    // rest hygiene — previously only stale-cleared at the NEXT capture's start, so the
-    // last utterance's audio lingered). Best-effort, local same-user.
-    let _ = std::fs::remove_file(&d.raw_wav);
-    Ok(out.to_string_lossy().into_owned())
-}
-
-/// Transcribe a WAV via the bundled file-only whisper-cli (ggml-tiny.en). Shells the
-/// sidecar with a kill-timeout (reuses `run_capture_cmd`, D43) → trimmed transcript.
-/// File-only: the sidecar never opens the mic, so it needs NO TCC. Typed Err (never
-/// panics) if the sidecar/model can't be resolved or the run fails.
-/// (async): blocks on the whisper sidecar subprocess (≤60s kill-ceiling) — run on the
-/// async runtime, never the main thread.
-#[tauri::command(async)]
-fn transcribe(app: tauri::AppHandle, wav_path: String) -> Result<String, String> {
-    // Guard: a flag-like path (leading `-`) would be parsed by whisper-cli as an
-    // option, not a file. Require an existing, non-flag path (the sole legitimate
-    // caller passes the dictation WAV we just wrote).
-    if wav_path.starts_with('-') {
-        return Err("invalid wav path (leading '-')".into());
-    }
-    let wav = std::path::Path::new(&wav_path);
-    if !wav.is_file() {
-        return Err(format!("wav path does not exist: {wav_path}"));
-    }
-    let bin = resolve_whisper_bin()?;
-    let model = resolve_whisper_model(&app)?;
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(whisper_args(&model, wav));
-    // 60s ceiling: tiny.en on a short PTT clip is sub-second warm; this only guards a
-    // wedged process, it is not the expected latency.
-    let out = run_capture_cmd(cmd, std::time::Duration::from_secs(60))?;
-    // the converted 16 kHz clip is consumed once transcribed; remove it (data-at-rest
-    // hygiene). Best-effort, local same-user; the sole caller always passes the
-    // dictation WAV (prewarm shells run_capture_cmd directly, not transcribe).
-    let _ = std::fs::remove_file(&wav_path);
-    Ok(out.trim().to_string())
 }
 
 /// Decide which `needs_human` rows fire an OS notification THIS tick, edge-triggered:
@@ -13773,31 +13354,6 @@ fn notifications_to_fire<'a>(
     (fire, next_prev)
 }
 
-/// Pre-warm whisper at launch (best-effort, off-thread): the FIRST whisper run on a
-/// machine pays a ~3s Metal shader compile that then persists across processes (D35).
-/// We synthesize a tiny silent WAV and run the sidecar once so the first REAL dictation
-/// is warm. Silently no-ops if the binary/model isn't resolvable (dev without a bundle).
-fn prewarm_whisper(app: &tauri::AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        let Ok(bin) = resolve_whisper_bin() else { return };
-        let Ok(model) = resolve_whisper_model(&app) else { return };
-        // 0.5s of silence at 16 kHz mono s16le — already in whisper's required format.
-        let wav = sibling_of_state_root("whisper-prewarm.wav");
-        let spec = wav_spec_for(1, 16_000, false, 16);
-        let Ok(mut w) = hound::WavWriter::create(&wav, spec) else { return };
-        for _ in 0..8_000 {
-            let _ = w.write_sample(0i16);
-        }
-        if w.finalize().is_err() {
-            return;
-        }
-        let mut cmd = std::process::Command::new(&bin);
-        cmd.args(whisper_args(&model, &wav));
-        let _ = run_capture_cmd(cmd, std::time::Duration::from_secs(30));
-        let _ = std::fs::remove_file(&wav);
-    });
-}
 
 /// Initialize Sentry crash/error monitoring for the GUI app. Returns a guard that MUST be held
 /// for the whole process lifetime (its Drop flushes pending events on exit) — `main()` binds it.
@@ -13970,8 +13526,6 @@ pub fn run() {
                 runs_log: default_runs_path(),
                 live_registry_lock: Mutex::new(()),
                 worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
-                // 05-04: no capture in flight at launch (push-to-talk fills this).
-                dictation: Mutex::new(None),
                 // per-pane write serializer: filled lazily on first write to each pane.
                 pane_write_locks: Mutex::new(HashMap::new()),
                 // async-close disk-cleanup serializer: filled per close, self-draining.
@@ -13987,11 +13541,6 @@ pub fn run() {
                 // P3 LOOP: no loop tag at launch (loop_iteration stamps it per-fire).
                 delegate_loop_id: Mutex::new(String::new()),
             });
-
-            // 05-04: pre-warm whisper once at launch (off-thread, best-effort) so the
-            // first real dictation skips the ~3s Metal shader compile (D35). No-ops if
-            // the sidecar/model aren't bundled (e.g. `cargo run` without a build).
-            prewarm_whisper(&app.handle().clone());
 
             // ── 06-02 phase-b socket listener ──
             // Bind the Unix-domain mutation socket (sibling of state_root) on a
@@ -14340,9 +13889,6 @@ pub fn run() {
             set_max_concurrent,
             run_now,
             speak,
-            start_dictation,
-            stop_dictation,
-            transcribe,
             // 09-04 Slice 1 read-only diff viewer (AC-5). PLAIN entries (not in the
             // cfg(unix) mcp_http block) — they run on every platform.
             diff_changed_files,
@@ -17958,239 +17504,6 @@ mod voice_tests {
     }
 }
 
-#[cfg(test)]
-mod dictation_tests {
-    use super::*;
-
-    // AC-1: the dictation WAVs are SIBLINGS of state_root (mirrors default_registry_path),
-    // so the startup state-dir wipe never deletes a capture mid-flight.
-    #[test]
-    fn dictation_wavs_are_siblings_of_state_root() {
-        let sr = default_state_root();
-        for p in [dictation_raw_wav_path(), dictation_wav_path()] {
-            assert_eq!(
-                p.parent(),
-                sr.parent(),
-                "dictation WAV must be a sibling of state_root (survives the wipe): {}",
-                p.display()
-            );
-            // not UNDER state_root → the remove_dir_all(state_root) wipe spares it.
-            assert!(!p.starts_with(&sr), "WAV must NOT live under state_root: {}", p.display());
-        }
-    }
-
-    // AC-1: afconvert argv encodes whisper's required 16 kHz mono s16le (`-d LEI16@16000
-    // -c 1`), src/dst as the final two positionals. Verified end-to-end (say → afconvert
-    // → whisper-cli returns the spoken text) — this pins the recipe so it can't drift.
-    #[test]
-    fn afconvert_args_encode_16k_mono_s16le() {
-        let a = afconvert_args(std::path::Path::new("/tmp/in.wav"), std::path::Path::new("/tmp/out.wav"));
-        assert_eq!(
-            a,
-            vec![
-                "-f".to_string(),
-                "WAVE".to_string(),
-                "-d".to_string(),
-                "LEI16@16000".to_string(),
-                "-c".to_string(),
-                "1".to_string(),
-                "/tmp/in.wav".to_string(),
-                "/tmp/out.wav".to_string(),
-            ]
-        );
-    }
-
-    // AC-2: whisper argv is `-m <model> -f <wav> -nt -np` — `-nt`/`-np` make stdout the
-    // bare transcript (verified). The model + wav are passed as explicit args (never a
-    // shell string), so a path with spaces/metacharacters is inert.
-    #[test]
-    fn whisper_args_request_bare_transcript() {
-        let a = whisper_args(std::path::Path::new("/m/ggml-tiny.en.bin"), std::path::Path::new("/w/x.wav"));
-        assert_eq!(
-            a,
-            vec![
-                "-m".to_string(),
-                "/m/ggml-tiny.en.bin".to_string(),
-                "-f".to_string(),
-                "/w/x.wav".to_string(),
-                "-nt".to_string(),
-                "-np".to_string(),
-            ]
-        );
-    }
-
-    // The hound WavSpec MUST mirror cpal's reported sample format — a f32-vs-i16 header
-    // mismatch silently corrupts the WAV (the classic footgun). Float and int branches.
-    #[test]
-    fn wav_spec_mirrors_sample_format() {
-        let f = wav_spec_for(2, 48_000, true, 32);
-        assert_eq!(f.channels, 2);
-        assert_eq!(f.sample_rate, 48_000);
-        assert_eq!(f.bits_per_sample, 32);
-        assert!(matches!(f.sample_format, hound::SampleFormat::Float));
-
-        let i = wav_spec_for(1, 16_000, false, 16);
-        assert_eq!(i.channels, 1);
-        assert!(matches!(i.sample_format, hound::SampleFormat::Int));
-    }
-
-    // 17-01 / AC4 (Scout repo-blind fix): resolve_synth_cwd runs the synthesizer ROOTED
-    // at a real repo dir when given one (so a Scout/orchestration pass can read it), and
-    // falls back to $HOME for None or a non-existent path (today's neutral-cwd behavior).
-    // (Command::current_dir can't be read back in std, so this pure helper is what we
-    // assert — cargo-green is necessary; the live pane behavior is the operator probe.)
-    #[test]
-    fn resolve_synth_cwd_uses_repo_when_real_else_home() {
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
-
-        // a real, existing dir → run there (the Scout repo-rooted path)
-        let real = std::env::temp_dir();
-        assert!(real.is_dir());
-        assert_eq!(resolve_synth_cwd(Some(&real)), real);
-
-        // None → $HOME (no-repo fan-in / socket path, unchanged)
-        assert_eq!(resolve_synth_cwd(None), home);
-
-        // a path that does NOT exist → $HOME (never a bogus cwd that would fail the spawn)
-        let missing = std::env::temp_dir().join("at-17-01-definitely-not-a-real-dir-xyz");
-        let _ = std::fs::remove_dir_all(&missing);
-        assert_eq!(resolve_synth_cwd(Some(&missing)), home);
-    }
-
-    // Bedrock-alias fix: resolve_headless_model maps the app's 1P model aliases to the cwd repo's
-    // configured Bedrock ids when CLAUDE_CODE_USE_BEDROCK is set (else the headless synthesis 400s
-    // with "provided model identifier is invalid"); the matching tier is chosen by substring.
-    #[test]
-    fn resolve_headless_model_maps_alias_on_bedrock_repo() {
-        let root = std::env::temp_dir().join(format!("at-bedrock-model-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".claude")).unwrap();
-        std::fs::write(
-            root.join(".claude/settings.local.json"),
-            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1",
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL":"us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                "ANTHROPIC_DEFAULT_OPUS_MODEL":"us.anthropic.claude-opus-4-8[1m]",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL":"us.anthropic.claude-sonnet-4-5-20250929-v1:0[1m]"}}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolve_headless_model(&root, "claude-haiku-4-5"),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
-        assert_eq!(resolve_headless_model(&root, "claude-opus-4-8"), "us.anthropic.claude-opus-4-8[1m]");
-        assert_eq!(
-            resolve_headless_model(&root, "claude-sonnet-4-6"),
-            "us.anthropic.claude-sonnet-4-5-20250929-v1:0[1m]"
-        );
-        // a model with no tier token is left untouched
-        assert_eq!(resolve_headless_model(&root, "some-other-model"), "some-other-model");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // Passthrough: a non-Bedrock repo, no settings file, or a missing matching default → the alias
-    // is returned unchanged (today's operator-account behavior; never invent an id).
-    #[test]
-    fn resolve_headless_model_passthrough_when_not_bedrock() {
-        let root = std::env::temp_dir().join(format!("at-nobedrock-model-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        // no settings file at all
-        assert_eq!(resolve_headless_model(&root, "claude-haiku-4-5"), "claude-haiku-4-5");
-
-        // settings present but Bedrock OFF
-        std::fs::create_dir_all(root.join(".claude")).unwrap();
-        std::fs::write(
-            root.join(".claude/settings.local.json"),
-            r#"{"env":{"ANTHROPIC_DEFAULT_HAIKU_MODEL":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve_headless_model(&root, "claude-haiku-4-5"), "claude-haiku-4-5");
-
-        // Bedrock ON but the matching default is absent → passthrough (don't fabricate an id)
-        std::fs::write(
-            root.join(".claude/settings.local.json"),
-            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#,
-        )
-        .unwrap();
-        assert_eq!(resolve_headless_model(&root, "claude-opus-4-8"), "claude-opus-4-8");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // resolve_whisper_bin honors the env override (the dev/test seam, mirroring
-    // AGENT_TEAMS_HOOKS_DIR) and returns a typed Err — never panics — when unset and no
-    // sidecar sits beside the test binary.
-    #[test]
-    fn resolve_whisper_bin_uses_env_override() {
-        // Serialized via the env var: set → expect it back; the absence path is covered
-        // by the Err type (we don't assert the no-sidecar case to avoid flakiness if a
-        // binary happens to sit beside the test harness).
-        std::env::set_var("AGENT_TEAMS_WHISPER_BIN", "/custom/whisper-cli");
-        assert_eq!(resolve_whisper_bin().unwrap(), PathBuf::from("/custom/whisper-cli"));
-        std::env::remove_var("AGENT_TEAMS_WHISPER_BIN");
-    }
-
-    // 16-01 / D56: resolve_sidecar_bin honors the AGENT_TEAMS_MCP_BIN override (the
-    // dev/test seam) and, without it, falls back to the ALWAYS-present committed
-    // prebuilt (or a fresher target/ build) — returning a PathBuf, never panicking,
-    // so a missing sidecar degrades to "no MCP in the pane" (AC-6), never a hard fail.
-    #[test]
-    fn resolve_sidecar_bin_uses_env_override() {
-        std::env::set_var("AGENT_TEAMS_MCP_BIN", "/custom/agent-teams-mcp");
-        assert_eq!(resolve_sidecar_bin(), PathBuf::from("/custom/agent-teams-mcp"));
-        std::env::remove_var("AGENT_TEAMS_MCP_BIN");
-        // with no override + no binary beside the test exe, the dev fallback resolves
-        // the committed prebuilt (always in the tree) — an absolute, existing path.
-        let resolved = resolve_sidecar_bin();
-        assert!(resolved.is_absolute(), "dev fallback must be absolute: {}", resolved.display());
-        assert!(
-            resolved.exists(),
-            "dev fallback must resolve an existing binary (the committed prebuilt): {}",
-            resolved.display()
-        );
-        assert_eq!(resolved.file_name().and_then(|s| s.to_str()), Some("agent-teams-mcp-aarch64-apple-darwin"));
-    }
-
-    // REAL end-to-end transcription WITHOUT a mic or TCC: say → afconvert → whisper-cli.
-    // Gated on AGENT_TEAMS_WHISPER_BIN + AGENT_TEAMS_WHISPER_MODEL so the default
-    // `cargo test` stays green in CI without the (uncommitted) model. Run locally with:
-    //   AGENT_TEAMS_WHISPER_BIN=app/src-tauri/binaries/whisper-cli-aarch64-apple-darwin \
-    //   AGENT_TEAMS_WHISPER_MODEL=app/src-tauri/models/ggml-tiny.en.bin \
-    //   cargo test --manifest-path app/src-tauri/Cargo.toml transcribe_say_roundtrip -- --ignored
-    #[test]
-    #[ignore]
-    fn transcribe_say_roundtrip() {
-        let bin = std::env::var("AGENT_TEAMS_WHISPER_BIN").expect("set AGENT_TEAMS_WHISPER_BIN");
-        let model = std::env::var("AGENT_TEAMS_WHISPER_MODEL").expect("set AGENT_TEAMS_WHISPER_MODEL");
-        let nonce = std::process::id();
-        let aiff = std::env::temp_dir().join(format!("at-test-say-{nonce}.aiff"));
-        let wav = std::env::temp_dir().join(format!("at-test-16k-{nonce}.wav"));
-        // 1. synthesize speech (no mic).
-        assert!(std::process::Command::new("/usr/bin/say")
-            .args(["-o", aiff.to_str().unwrap(), "approve and run the tests"])
-            .status()
-            .unwrap()
-            .success());
-        // 2. afconvert → whisper's format (the exact recipe the app uses).
-        assert!(std::process::Command::new("/usr/bin/afconvert")
-            .args(afconvert_args(&aiff, &wav))
-            .status()
-            .unwrap()
-            .success());
-        // 3. shell whisper-cli file-only (no TCC) via the same arg builder + timeout path.
-        let mut cmd = std::process::Command::new(&bin);
-        cmd.args(whisper_args(std::path::Path::new(&model), &wav));
-        let out = run_capture_cmd(cmd, std::time::Duration::from_secs(60)).unwrap();
-        let text = out.trim().to_lowercase();
-        let _ = std::fs::remove_file(&aiff);
-        let _ = std::fs::remove_file(&wav);
-        assert!(
-            text.contains("approve") && text.contains("run the tests"),
-            "transcript did not contain the spoken phrase: {text:?}"
-        );
-    }
-}
 
 #[cfg(test)]
 mod synth_timeout_tests {
@@ -21444,7 +20757,6 @@ mod daemon_spawn_routing_tests {
                 runs_log: self.dir.join("runs.jsonl"),
                 live_registry_lock: Mutex::new(()),
                 worktree_registry_lock: std::sync::Arc::new(Mutex::new(())),
-                dictation: Mutex::new(None),
                 pane_write_locks: Mutex::new(HashMap::new()),
                 pending_cleanups: std::sync::Arc::new(Mutex::new(HashMap::new())),
                 http_port: Mutex::new(None),

@@ -6,7 +6,3 @@
 # will have schema files for capabilities auto-completion
 /gen/schemas
 
-# Plan 05-04: the ggml-tiny.en whisper model is FETCHED at build time (~74 MB), never
-# committed (AC-5). scripts/fetch-whisper-model.sh downloads it into models/. The
-# whisper-cli externalBin (~3 MB, static/relocatable) IS committed under binaries/.
-/models/*.bin

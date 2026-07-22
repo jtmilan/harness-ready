@@ -5,7 +5,7 @@
   "identifier": "com.jeffrymilan.harnessready",
   "build": {
     "beforeDevCommand": "npm --prefix ../ui run dev",
-    "beforeBuildCommand": "bash ../scripts/fetch-whisper-model.sh && npm --prefix ../ui run build",
+    "beforeBuildCommand": "npm --prefix ../ui run build",
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:5173"
   },
@@ -27,7 +27,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
-    "externalBin": ["binaries/whisper-cli", "binaries/agent-teams-mcp", "binaries/agent-teams-mcp-coordinator", "binaries/agent-teams-daemon"],
+    "externalBin": ["binaries/agent-teams-mcp", "binaries/agent-teams-mcp-coordinator", "binaries/agent-teams-daemon"],
     "resources": {
       "../../core/hooks/state-writer.sh": "hooks/state-writer.sh",
       "../../core/hooks/codex-notify.sh": "hooks/codex-notify.sh",
@@ -37,8 +37,7 @@
       "../../core/hooks/claude-mcp.tmpl.json": "hooks/claude-mcp.tmpl.json",
       "../../core/hooks/cursor-mcp.tmpl.json": "hooks/cursor-mcp.tmpl.json",
       "../../core/hooks/commandcode-mcp.tmpl.json": "hooks/commandcode-mcp.tmpl.json",
-      "../../core/hooks/cursor-role.tmpl.md": "hooks/cursor-role.tmpl.md",
-      "models/ggml-tiny.en.bin": "models/ggml-tiny.en.bin"
+      "../../core/hooks/cursor-role.tmpl.md": "hooks/cursor-role.tmpl.md"
     },
     "icon": [
       "icons/32x32.png",

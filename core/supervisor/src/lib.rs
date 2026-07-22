@@ -1351,7 +1351,7 @@ impl Supervisor {
             // hook injection. Claude → staged sibling path (used by --mcp-config);
             // cursor → in-worktree .cursor/mcp.json (+git-excluded) → None. A
             // failure here is best-effort: degrade to "no MCP in the pane" rather
-            // than failing the spawn (parity with whisper being optional, AC-6).
+            // than failing the spawn.
             // Phase-16: a delegate WORKER does NOT get the sidecar — worker_args'
             // --allowedTools excludes mcp__agent-teams__* (the worker can't call it),
             // so injecting it would only spawn an unused sidecar process at startup.

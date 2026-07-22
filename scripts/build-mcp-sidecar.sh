@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build-mcp-sidecar.sh — build the agent-teams-mcp sidecar for the Tauri
-# externalBin. Mirrors build-whisper-cli.sh: build → cp to binaries/<host-triple>
-# (the committed prebuilt the app bundles). Tauri strips the triple suffix at
-# bundle time → Contents/MacOS/agent-teams-mcp.
+# externalBin. Build → cp to binaries/<host-triple> (the committed prebuilt the
+# app bundles). Tauri strips the triple suffix at bundle time →
+# Contents/MacOS/agent-teams-mcp.
 #
 # AGENT-WRITE ENABLED (enablement slice). This builds with
 #   --features "memory-notes task-tools"
@@ -22,9 +22,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# host triple — hardcoded aarch64-apple-darwin to match the committed
-# whisper-cli-<triple> prebuilt name (macOS aarch64 host only; cross-arch is out
-# of scope).
+# host triple — hardcoded aarch64-apple-darwin (macOS aarch64 host only; cross-arch
+# is out of scope).
 TRIPLE="aarch64-apple-darwin"
 DEST="$REPO/app/src-tauri/binaries/agent-teams-mcp-$TRIPLE"
 

@@ -19,8 +19,8 @@ This pipeline has two halves:
   verdict is always HOLD → it always needs human review. For a feature that can
   *auto-pass*, give it **backend test coverage**.
 - **Scope the gate to a model-free crate** (`core/*`). The integration tree is a
-  fresh `git worktree add`; gitignored fixtures (e.g. `app/src-tauri/models/
-  ggml-tiny.en.bin`) are absent → the app crate fails to *build* → false REJECT.
+  fresh `git worktree add`; gitignored fixtures (if any) are absent → an app
+  crate that required them would fail to *build* → false REJECT.
 - **Confirm the Bridge preview** shows a `verify` pane (no "commit" in its task) +
   the dispatch toast says "M verify held" (M ≥ 1) — the orchestrator (haiku) is
   unreliable at honoring a verify focus, and **0 verify panes = no auto-fold**.
