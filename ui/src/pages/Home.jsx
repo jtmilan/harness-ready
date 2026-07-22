@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
-import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace } from "@/lib/workspaceStore";
+import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace, resetWorkspaces } from "@/lib/workspaceStore";
 import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
@@ -143,8 +143,21 @@ export default function Home() {
     }
     forceRerender(); // assignment is localStorage-only; re-bucket without a tab switch
   };
+  // CLOSE WORKSPACE confirm path: terminate the whole fleet AND return to a
+  // clean launch pad (matches the ConfirmOverlay copy). bridge.closeWorkspace()
+  // kills every pane on the backend side; resetWorkspaces() then wipes the
+  // localStorage workspace registry back to the single seed tab and scrubs
+  // every pane→workspace assignment. Without the registry reset, the per-tab
+  // entries survive with zero panes and rehydrate as empty ghost cards on
+  // relaunch (the bug this fixes). forceRerender() mirrors the other handlers
+  // that mutate the assignment store (handleSpawnAgent, handleDropOnWorkspace)
+  // so the grid re-reads the now-empty assignment map on the next paint.
   const handleCloseWorkspace = () => {
     bridge.closeWorkspace();
+    const next = resetWorkspaces();
+    setWorkspaces(next);
+    setActiveWorkspace(next[0].id);
+    forceRerender();
     setCheckedIds([]);
     setSelectedId(null);
     setOverlay(null);
