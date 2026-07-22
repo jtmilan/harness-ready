@@ -7607,6 +7607,18 @@ fn handle_socket_request(
             response_code::BAD_REQUEST,
             "daemon-spawn op is served by the daemon, not the app socket",
         ),
+        // WritePtyRaw (raw PTY keystrokes, bypassing normalize_input) is DAEMON-LOCAL —
+        // `op_served_by_app` is false, so the daemon's accept loop serves it for daemon-owned
+        // panes (the GUI's `daemon_send_input` routes there). The app-owned keyboard path does
+        // NOT use this socket op (xterm onData → the Tauri `send_input` command → `write_to_pane`
+        // directly), so the app socket never legitimately receives it. The arm exists ONLY to
+        // keep this shared `SocketRequest` match exhaustive (core/mcp carries the variant
+        // unconditionally; the daemon-spawn feature gates the daemon HANDLER, not the wire enum)
+        // — same reject pattern as Spawn/Close/ListLive above.
+        SocketRequest::WritePtyRaw { .. } => SocketResponse::err(
+            response_code::BAD_REQUEST,
+            "raw PTY write is served by the daemon, not the app socket",
+        ),
 
         // #262 ext: EXTERNAL visible-grid spawn. Already WHO-gated above (external_spawn_admit:
         // allow_external_spawn + pid-pin). Here we enforce WHAT — the validations the GUI gets
@@ -13889,19 +13901,6 @@ pub fn run() {
             // detected second instance so we don't clobber the first instance's state.
             if single_instance {
                 let _ = std::fs::remove_dir_all(&state_root);
-                // Codex MCP startup hygiene (mirrors the daemon): we are the sole instance
-                // and have spawned no panes yet, so any `[mcp_servers.agent-teams-<pane>]`
-                // block in ~/.codex/config.toml is a leak from a prior session that died
-                // without `Supervisor::kill`. Codex's GLOBAL config otherwise piles up one
-                // stale `agent-teams-<workspace>` server per dead pane (the "many workspaces"
-                // bloat in the MCP list). Purge them; live panes re-inject on spawn. Gated on
-                // single_instance so a second instance never wipes the first's live blocks.
-                let purged = supervisor::purge_all_managed_codex_mcp();
-                if purged > 0 {
-                    eprintln!(
-                        "[agent-teams] startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
-                    );
-                }
             } else {
                 eprintln!(
                     "[agent-teams] another instance holds {} — preserving state_root (skipping startup wipe)",
