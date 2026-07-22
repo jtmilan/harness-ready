@@ -13748,12 +13748,6 @@ pub fn run() {
                     eprintln!("[codex-trust] startup: registered {n} worktree path(s) as trusted");
                 }
             }
-            // Per-pane cline homes carry OAuth-token copies; sessions don't survive
-            // restart (D7), so every home from a prior run is stale — sweep them all.
-            let swept_cline = supervisor::sweep_stale_cline_homes(&state_root, |_| false);
-            if swept_cline > 0 {
-                eprintln!("[agent-teams] swept {swept_cline} stale cline home(s)");
-            }
             // Single-instance guard (multi-instance collision fix): take an exclusive flock on
             // an `instance.lock` sibling BEFORE the destructive wipe. If ANOTHER live app already
             // holds it, two instances are sharing this state_root — do NOT wipe (that would nuke
