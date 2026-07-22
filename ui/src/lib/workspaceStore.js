@@ -1,16 +1,25 @@
 // Local workspace registry — persisted in localStorage.
 // Real backend: each workspace maps to a repo root directory that agents
 // create their git worktrees under.
-import { assign, getAssignment, unassignWorkspace } from "@/lib/workspaceAssign";
+import { assign, getAssignment, unassign, unassignWorkspace } from "@/lib/workspaceAssign";
 
 const KEY = "acc-workspaces";
+
+// Launch-pad seed: the single default workspace the fleet returns to after a
+// full CLOSE WORKSPACE. Exported as a FACTORY (not a shared constant) so every
+// caller gets a fresh array — mutating the return value of loadWorkspaces() or
+// resetWorkspaces() can never poison a later call's seed. The array shape
+// ({id,name}) matches what the rest of the app expects for workspace entries.
+export function launchPadWorkspaces() {
+  return [{ id: "ws-1", name: "MY WORKSPACE" }];
+}
 
 export function loadWorkspaces() {
   try {
     const saved = JSON.parse(localStorage.getItem(KEY));
     if (Array.isArray(saved) && saved.length) return saved;
   } catch { /* fall through to seed */ }
-  return [{ id: "ws-1", name: "MY WORKSPACE" }];
+  return launchPadWorkspaces();
 }
 
 export function saveWorkspaces(list) {
@@ -70,4 +79,27 @@ export function mergeWorkspaces(fromWsId, intoWsId) {
   if (next.length === list.length) return list; // fromWs wasn't in the registry
   saveWorkspaces(next);
   return next;
+}
+
+// Reset the registry to the launch-pad seed. Used by the CLOSE WORKSPACE
+// confirm path (Home.handleCloseWorkspace) after bridge.closeWorkspace() has
+// terminated every pane: without this reset, the localStorage workspace list
+// survives with zero panes per tab and rehydrates as empty ghost cards on
+// relaunch (the bug this fixes). We also scrub every pane→workspace
+// assignment so the map holds no stale entries for the dead fleet.
+//
+// Same command+query shape as deleteWorkspace / mergeWorkspaces: persist the
+// new state AND return it, so the React caller can setWorkspaces(next) in one
+// step. Idempotent — calling twice yields the same seed with empty assignments.
+export function resetWorkspaces() {
+  // 1. clear every pane assignment (the fleet is dead; no stale entries).
+  //    Loop + unassign mirrors mergeWorkspaces's per-pane assign loop and
+  //    notifies subscribers per write so any live assignment-aware UI re-reads.
+  for (const paneId of Object.keys(getAssignment())) {
+    unassign(paneId);
+  }
+  // 2. persist the launch-pad seed and hand it back to the caller.
+  const seed = launchPadWorkspaces();
+  saveWorkspaces(seed);
+  return seed;
 }
