@@ -10,7 +10,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use state_adapter::inject::{
-    inject, inject_commandcode_mcp, inject_cursor_role, inject_grok_mcp, inject_mcp_config, InjectConfig,
+    inject, inject_commandcode_mcp, inject_cursor_role, inject_grok_mcp, inject_mcp_config,
+    inject_opencode_mcp, InjectConfig,
     InjectHarness,
 };
 use std::io::{Read, Write};
@@ -1321,15 +1322,15 @@ impl Supervisor {
             }
         }
 
-        // commandcode + opencode are state-blind (no InjectHarness, so they skip the block
-        // above) but first-class MCP CLIENTS: both read a project-local `.mcp.json` at the
-        // pane cwd (auto-discovered) so they get the queue + the gated memory/task tools like
-        // cursor (D56/D60). SEPARATE from hook injection: a state-blind harness can still be
-        // a first-class MCP client via a project-local `.mcp.json`. Best-effort — a write
-        // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
+        // commandcode is state-blind (no InjectHarness, so it skips the block above) but
+        // a first-class MCP CLIENT: it reads a project-local `.mcp.json` at the pane cwd
+        // (auto-discovered) so it gets the queue + the gated memory/task tools like cursor
+        // (D56/D60). SEPARATE from hook injection: a state-blind harness can still be a
+        // first-class MCP client via a project-local config. Best-effort — a write failure
+        // degrades to "no MCP in the pane", never a failed spawn (AC-6).
         // Gated on `!is_worker` to mirror the inject_mcp_config gate above (PR #137 —
         // autonomous workers skip the sidecar).
-        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode | Harness::OpenCode) {
+        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode) {
             if let Err(e) = inject_commandcode_mcp(
                 &spec.worktree,
                 hooks_dir,
@@ -1339,8 +1340,29 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_mcp failed ({:?} pane will have no MCP): {e}",
-                    spec.harness
+                    "[agent-teams] inject_commandcode_mcp failed (commandcode pane will have no MCP): {e}"
+                );
+            }
+        }
+
+        // opencode is state-blind but a first-class MCP CLIENT like commandcode. However
+        // OpenCode does NOT read `.mcp.json` (the Claude/Cursor format — GitHub issue
+        // anomalyco/opencode#27809 closed as not planned). It reads `opencode.json` at the
+        // project root with MCP servers under the `"mcp"` key (not `"mcpServers"`), using
+        // `type: "local"`, `command` as a string array, and `environment` (not `env`).
+        // OpenCode merges project-level config with global (~/.config/opencode/opencode.json)
+        // so the user's models/providers are preserved; only `mcp` is added here.
+        if !spec.is_worker && matches!(spec.harness, Harness::OpenCode) {
+            if let Err(e) = inject_opencode_mcp(
+                &spec.worktree,
+                hooks_dir,
+                sidecar_bin,
+                state_root,
+                &spec.id,
+                &mem_key,
+            ) {
+                eprintln!(
+                    "[agent-teams] inject_opencode_mcp failed (opencode pane will have no MCP): {e}"
                 );
             }
         }

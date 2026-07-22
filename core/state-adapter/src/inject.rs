@@ -318,6 +318,45 @@ pub fn inject_commandcode_mcp(
     Ok(out)
 }
 
+/// Inject the Agent Teams MCP sidecar into an OpenCode pane's project-scoped config.
+/// OpenCode reads `opencode.json` at the project root (NOT `.mcp.json` — that format is
+/// Claude/Cursor-specific and OpenCode silently ignores it, GitHub issue #27809 "Closed
+/// as not planned"). The MCP key in `opencode.json` is `"mcp"` (not `"mcpServers"`),
+/// with `type: "local"`, `command` as a string array, and `environment` (not `env`).
+/// Same provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE).
+///
+/// OVERWRITES + git-excludes: the worktree is disposable, so a repo's own committed
+/// `opencode.json` is shadowed only inside this ephemeral pane. Additive sibling to
+/// [`inject_commandcode_mcp`] / [`inject_mcp_config`] — do NOT fold in. std-only.
+/// OpenCode merges project-level config with global (`~/.config/opencode/opencode.json`)
+/// so the pane's user-configured models/providers are preserved; only `mcp` is added.
+pub fn inject_opencode_mcp(
+    repo_dir: &Path,
+    templates_dir: &Path,
+    sidecar_bin: &Path,
+    state_root: &Path,
+    pane_id: &str,
+    repo_key: &str,
+) -> io::Result<PathBuf> {
+    const REL: &str = "opencode.json";
+    let tmpl = fs::read_to_string(templates_dir.join("opencode-mcp.tmpl.json"))?;
+    let rendered = tmpl
+        .replace("{{SIDECAR}}", &sidecar_bin.to_string_lossy())
+        .replace("{{STATE_DIR}}", &state_root.to_string_lossy())
+        .replace("{{PANE_ID}}", pane_id)
+        .replace("{{REPO_KEY}}", repo_key)
+        .replace("{{TASK_SCOPE}}", pane_id);
+
+    let out = repo_dir.join(REL);
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_config_guarded(repo_dir, &out, &rendered)?;
+    // keep `git status` clean — generated tooling, not project source (idempotent)
+    exclude_from_git(repo_dir, REL)?;
+    Ok(out)
+}
+
 /// Inject the Agent Teams MCP sidecar into a GROK pane's project-scoped config.
 /// Grok reads `.grok/config.toml` at the project root (discovered by path, like
 /// cursor's `.cursor/mcp.json`). The template is TOML (not JSON) — grok's native
@@ -691,6 +730,74 @@ mod mcp_tests {
         let body = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert_eq!(
             body.matches(".mcp.json").count(),
+            1,
+            "exclude entry must be idempotent: {body:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // opencode: writes `opencode.json` (NOT `.mcp.json` — OpenCode ignores that format,
+    // anomalyco/opencode#27809). Uses OpenCode's native MCP schema: `"mcp"` key (not
+    // `"mcpServers"`), `type: "local"`, `command` as a string array, `environment` (not `env`).
+    // Git-excluded idempotently, like commandcode/cursor.
+    #[test]
+    fn opencode_config_at_worktree_root_and_excluded_idempotently() {
+        let root = scratch("opencode");
+        let repo = root.join("worktree");
+        let staged = root.join("staged-hooks");
+        let state = root.join("app-state");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::copy(
+            templates_dir().join("opencode-mcp.tmpl.json"),
+            staged.join("opencode-mcp.tmpl.json"),
+        )
+        .unwrap();
+
+        let sidecar = PathBuf::from("/abs/path/to/agent-teams-mcp");
+        let written =
+            inject_opencode_mcp(&repo, &staged, &sidecar, &state, "ws-oc-p0", "ws-oc")
+                .expect("inject opencode");
+
+        // project scope = `opencode.json` at the worktree ROOT
+        assert_eq!(written, repo.join("opencode.json"));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&written).unwrap()).expect("parseable JSON");
+        // OpenCode schema: "mcp" key (NOT "mcpServers")
+        assert!(
+            v.get("mcp").is_some(),
+            "opencode.json must use 'mcp' key, got: {v}"
+        );
+        assert!(
+            v.get("mcpServers").is_none(),
+            "opencode.json must NOT use 'mcpServers' key"
+        );
+        let srv = &v["mcp"]["agent-teams"];
+        // type: "local" for stdio servers
+        assert_eq!(srv["type"], "local");
+        // command as string array (not separate command + args)
+        assert_eq!(srv["command"][0], "/bin/sh");
+        assert_eq!(srv["command"][1], "-c");
+        assert_eq!(srv["command"][2], "exec '/abs/path/to/agent-teams-mcp'");
+        // environment (not env)
+        assert_eq!(
+            srv["environment"]["AGENT_TEAMS_STATE_DIR"],
+            state.to_string_lossy().as_ref()
+        );
+        assert_eq!(srv["environment"]["AGENT_TEAMS_PANE_ID"], "ws-oc-p0");
+        assert_eq!(srv["environment"]["AGENT_TEAMS_MEMORY_REPO_KEY"], "ws-oc");
+        assert_eq!(srv["environment"]["AGENT_TEAMS_TASK_SCOPE"], "ws-oc-p0");
+        // enabled
+        assert_eq!(srv["enabled"], true);
+
+        // excluded exactly once, idempotent on a second inject
+        inject_opencode_mcp(&repo, &staged, &sidecar, &state, "ws-oc-p0", "ws-oc")
+            .expect("inject opencode again");
+        let body = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            body.matches("opencode.json").count(),
             1,
             "exclude entry must be idempotent: {body:?}"
         );
