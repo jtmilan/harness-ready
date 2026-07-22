@@ -333,8 +333,10 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
           lastCols = cols;
           backoffMs = 500; // reset backoff after a real ack
           // Late convergence after boot race: TUI may already have painted at the
-          // spawn 30×100. Jiggle winsize so SIGWINCH forces a full repaint.
-          if (wasFirstAck && termHasContent() && onResizeRef.current) {
+          // spawn 30×100 (or paint AFTER this first ACK — OpenTUI/OpenCode often does).
+          // Always jiggle once so SIGWINCH forces a full repaint; do NOT require
+          // termHasContent() (alt-screen clear looks empty and used to skip the jiggle).
+          if (wasFirstAck && onResizeRef.current) {
             const jiggleRows = Math.max(5, rows - 1);
             try {
               await Promise.resolve(onResizeRef.current(agent.id, jiggleRows, cols));
@@ -360,27 +362,41 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
           if (pending && !disposed) { pending = false; syncNow(); }
         });
     };
-    // Trailing ~80ms debounce: a live window drag / seam drag fires ResizeObserver
-    // per frame; one fit + at most one resize_pty lands after the burst settles.
-    const pushResize = () => {
+    // Trailing ~80ms debounce for ResizeObserver bursts (seam/window drag). Callers that
+    // know the box just became real (tiling measure, reveal, raw-retry) pass `true` for
+    // an immediate fit — agent-teams fitSession is immediate; the debounce is HR-only for
+    // drag spam. NEVER force setSized without ≥20×5 (wrap red line from e135fc8).
+    const pushResize = (immediate = false) => {
       if (disposed) return;
       backoffMs = 500; // fresh geometry re-arms a snappy retry cadence
       clearTimeout(debTimer);
-      debTimer = setTimeout(syncNow, 80);
+      if (immediate) syncNow();
+      else debTimer = setTimeout(syncNow, 80);
     };
     pushResizeRef.current = pushResize;
-    pushResize();
+    pushResize(true);
+    // Double-rAF: first paint often lands 0×0; agent-teams re-fits on relayout. Wait one
+    // frame for the tiling host to assign a real rect, then fit immediately.
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (!disposed) pushResize(true);
+      });
+    });
     // Container geometry (tiling/seam drag/maximize/restore/cross-ws move all end up
     // resizing this element) + window resize as belt-and-braces for webview quirks.
-    const ro = new ResizeObserver(pushResize);
+    const onWinResize = () => pushResize(false);
+    const ro = new ResizeObserver(onWinResize);
     if (mountRef.current) ro.observe(mountRef.current);
-    window.addEventListener("resize", pushResize);
+    window.addEventListener("resize", onWinResize);
 
     return () => {
       disposed = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
       clearTimeout(debTimer);
       clearTimeout(retryTimer);
-      window.removeEventListener("resize", pushResize);
+      window.removeEventListener("resize", onWinResize);
       ro.disconnect();
       pushResizeRef.current = null;
       onDataDisposable.dispose();
@@ -398,10 +414,11 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
   // maximize/restore, seam-drag commit, visibility flip). The ResizeObserver above
   // covers these too, but keying on the actual rect props costs nothing and keeps
   // the pane correct even if an observation is missed under WKWebView.
+  // Immediate (not debounced): 0→real rect is the agent-teams reveal path equivalent.
   const styleW = style ? style.width : undefined;
   const styleH = style ? style.height : undefined;
   useEffect(() => {
-    if (pushResizeRef.current) pushResizeRef.current();
+    if (pushResizeRef.current) pushResizeRef.current(true);
   }, [styleW, styleH, visible]);
 
   // WebGL on visible panes only (prod policy): attach when shown, free the GPU context on hide.
@@ -409,6 +426,27 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     if (visible) attachWebgl(glRef.current);
     else detachWebgl(glRef.current);
   }, [visible]);
+
+  // Geometry-retry (agent-teams parity without the wrap red line):
+  // agent-teams has NO write gate — its .pane-term is always in a measured flex box, so
+  // term.write is immediate. HR must hold writes until cols≥20/rows≥5 (TUI wrap is
+  // permanent). When PTY bytes are already buffered and the gate has not latched yet
+  // (0×0 mount, chrome-eaten height, missed ResizeObserver), keep re-fitting — never
+  // force setSized(true) without a valid grid (that was e135fc8 and broke wrap).
+  useEffect(() => {
+    if (sized) return undefined;
+    const raw = agent.raw !== undefined ? agent.raw : "";
+    if (!raw || raw.length === 0) return undefined;
+    // Immediate attempt, then poll fit for up to ~5s while raw is waiting.
+    if (pushResizeRef.current) pushResizeRef.current(true);
+    let n = 0;
+    const id = setInterval(() => {
+      n += 1;
+      if (pushResizeRef.current) pushResizeRef.current(true);
+      if (n >= 50) clearInterval(id);
+    }, 100);
+    return () => clearInterval(id);
+  }, [agent.raw, sized]);
 
   // Stream new bytes into the terminal. `agent.raw` is append-only; write only the
   // un-written tail. A bumped `agent.gen` means the backend replayed from a later base
@@ -419,6 +457,7 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
     // Hold ALL writes until the first valid fit (see `sized`). Replaying the accumulated
     // PTY history into a not-yet-sized terminal wraps it permanently; once sized flips,
     // this effect re-runs and writes the full backlog into a correctly-sized grid.
+    // Geometry-retry above keeps asking for a fit while raw is waiting — never force-open.
     if (!sized) return;
     // Web-preview fallback: the mock bridge has no raw byte stream, so render its line
     // array as terminal text instead.
@@ -429,8 +468,16 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       term.reset();
     }
     if (raw.length > writtenRef.current) {
+      const firstPaint = writtenRef.current === 0;
       term.write(raw.slice(writtenRef.current));
       writtenRef.current = raw.length;
+      // OpenTUI/OpenCode often paints into alt-screen after backlog lands; agent-teams
+      // writes immediately into an already-fitted grid. After our first backlog write,
+      // refresh the renderer and re-push PTY winsize so SIGWINCH forces a full repaint.
+      if (firstPaint) {
+        try { term.refresh(0, Math.max(0, term.rows - 1)); } catch { /* ignore */ }
+        if (pushResizeRef.current) pushResizeRef.current(true);
+      }
     } else if (raw.length < writtenRef.current) {
       // buffer shrank without a gen bump (e.g. mock replaced output) — resync.
       term.reset();
@@ -507,6 +554,14 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          {/* rawLen: diagnose (W)+blank — synthetic SessionStart can show Working while
+              agent.raw is still empty (PTY hung) or full-but-unpainted (sized-gate). */}
+          <span
+            className="font-mono text-[9px] text-cyan-800 tabular-nums"
+            title={`PTY raw buffer: ${(agent.raw || "").length} chars`}
+          >
+            {(agent.raw || "").length}b
+          </span>
           <span className={`font-mono text-sm font-bold ${meta.color}`}>({meta.badge})</span>
           <button
             // stopPropagation, not preventDefault: the head's onPointerDown would otherwise read
@@ -529,7 +584,11 @@ export default function AgentPane({ agent, selected, checked, onToggleCheck, onS
       <div
         ref={mountRef}
         onClick={(e) => e.stopPropagation()}
-        className="crt-screen flex-1 min-h-0 overflow-hidden p-1.5 terminal-scroll"
+        // min-h so FitAddon always sees a measurable box (nexus-agents uses fixed h-36).
+        // Without a floor, flex + chrome can leave 0 height → sized-gate never opens → blank
+        // OpenCode even when agent.raw is full. min-h-0 still allows shrink below preferred
+        // only after the min is met by the parent; 5.5rem ≈ 5–6 xterm rows @ fontSize 11.
+        className="crt-screen flex-1 min-h-[5.5rem] overflow-hidden p-1.5 terminal-scroll"
       />
       {agent.status === "needs_input" && <AttentionPrompt agent={agent} onRespond={onRespond} />}
     </div>

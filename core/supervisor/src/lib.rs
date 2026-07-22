@@ -10,8 +10,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use state_adapter::inject::{
-    inject, inject_cline_mcp, inject_commandcode_mcp, inject_cursor_role, inject_mcp_config,
-    InjectConfig, InjectHarness,
+    inject, inject_commandcode_mcp, inject_cursor_role, inject_grok_mcp, inject_mcp_config, InjectConfig,
+    InjectHarness,
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,79 @@ pub fn harness_path() -> &'static str {
             "/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:{home}/.cargo/bin:\
              {home}/.bun/bin:{home}/Library/pnpm:{from_shell}"
         )
+    })
+}
+
+/// Env vars that agent harnesses read from the process environment but that
+/// GUI-launched apps (Finder / Dock / launchd) never inherit — because they
+/// are exported only from `.zshrc` (interactive-only), not `.zprofile` /
+/// `.zshenv` (login-only).  `harness_path()` already solves the same class
+/// of problem for PATH via a `-lc` probe, but `-lc` is non-interactive so
+/// it also skips `.zshrc`.  This function does a single `-ilc` (interactive
+/// login command) probe, caches the result, and returns only the vars that
+/// are actually set — so the spawn loop can forward them via `cmd.env()`.
+///
+/// The sentinel-bracketed printf is the same trick `harness_path()` uses to
+/// ignore any profile chatter on stdout.
+pub fn shell_env_vars() -> &'static [(String, String)] {
+    static VARS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    VARS.get_or_init(|| {
+        // Names we care about.  Add new entries here when a harness needs
+        // another secret that lives only in .zshrc.
+        const WANTED: &[&str] = &["OPENAI_API_KEY"];
+
+        // Fast path: the current process already has every var (terminal
+        // launch) → skip the shell probe entirely.
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut all_present = true;
+        for &name in WANTED {
+            match std::env::var(name) {
+                Ok(v) if !v.is_empty() => found.push((name.to_string(), v)),
+                _ => all_present = false,
+            }
+        }
+        if all_present {
+            return found;
+        }
+
+        // Slow path: probe the interactive login shell.  `-ilc` sources
+        // .zshenv + .zprofile + .zshrc + .zlogin — the full interactive
+        // profile — so any `export` in .zshrc is visible.
+        let shell =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+        // Build one printf per var, each bracketed by a unique sentinel so
+        // we can extract the value even when .zshrc prints banners / motd.
+        let script: String = WANTED
+            .iter()
+            .map(|name| {
+                format!(
+                    "printf '___ATENV_{name}___%s___ATENV_{name}___' \"${name}\";"
+                )
+            })
+            .collect();
+
+        if let Some(stdout) = Command::new(&shell)
+            .args(["-ilc", &script])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        {
+            for &name in WANTED {
+                // Skip vars we already got from the fast path.
+                if found.iter().any(|(k, _)| k == name) {
+                    continue;
+                }
+                let sentinel = format!("___ATENV_{name}___");
+                if let Some(val) = stdout.split(&sentinel).nth(1) {
+                    if !val.is_empty() {
+                        found.push((name.to_string(), val.to_string()));
+                    }
+                }
+            }
+        }
+        found
     })
 }
 
@@ -145,7 +218,7 @@ fn session_args(harness: Harness, session_id: Option<&str>, resume: bool) -> Vec
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline
+        | Harness::Pi
         | Harness::Grok => {
             vec![]
         }
@@ -189,13 +262,14 @@ fn mcp_args(harness: Harness, claude_cfg: Option<&Path>, is_worker: bool) -> Vec
         },
         Harness::Cursor if is_worker => vec![],
         Harness::Cursor => vec!["--approve-mcps".into()],
-        // codex + commandcode + opencode: no read-only sidecar wired today (each consumes MCP
-        // via its own config / `mcp` subcommand, not a CLI flag) → none, like bash.
+        // codex: consumes MCP via its own ~/.codex/config.toml (global, not per-project) → no
+        // spawn-time flag. commandcode/opencode/grok: MCP is injected as a project-local config
+        // file (.mcp.json / .grok/config.toml) discovered by path → no CLI flag needed either.
         Harness::Bash
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline
+        | Harness::Pi
         | Harness::Grok => vec![],
     }
 }
@@ -215,34 +289,13 @@ fn model_args(harness: Harness, model: Option<&str>) -> Vec<String> {
     }
     match harness {
         Harness::Claude | Harness::Cursor => vec!["--model".into(), m.into()],
-        // cline local auth is provider `cline` ONLY. A `provider/model` flag for any other
-        // provider (e.g. anthropic/...) forces an unauthed provider path → Unauthorized.
-        // Omit `-m` for empty (above) and for non-`cline` provider-prefixed ids; bare ids
-        // and `cline/...` still pass through. Account default when omitted.
-        Harness::Cline => {
-            if let Some((provider, _)) = m.split_once('/') {
-                if provider != "cline" {
-                    return vec![];
-                }
-            }
-            vec!["-m".into(), m.into()]
-        }
+        // pi CLI exposes `--model <pattern|id>` (supports provider/id) — long form only.
+        Harness::Pi => vec!["--model".into(), m.into()],
         // grok CLI exposes `-m, --model <MODEL>` (v0.2.101) — short form matches this arm.
         Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Grok => {
             vec!["-m".into(), m.into()]
         }
         Harness::Bash => vec![],
-    }
-}
-
-/// cline ONLY: the `--config <root>` GLOBAL flag pointing cline at its per-pane config root (so it
-/// loads the injected `cline_mcp_settings.json`). Pure → unit-tested. `[]` when `cline_home` is None
-/// (every non-cline harness, or cline if inject failed → it falls back to ~/.cline, no agent-teams
-/// MCP). MUST be composed FIRST in the argv — `--config` is global and must precede `-i`/model flags.
-fn cline_config_args(cline_home: Option<&Path>) -> Vec<String> {
-    match cline_home {
-        Some(home) => vec!["--config".into(), home.to_string_lossy().into_owned()],
-        None => vec![],
     }
 }
 
@@ -683,7 +736,9 @@ pub struct Supervisor {
     pub model: Option<String>,
     master: Box<dyn MasterPty + Send>, // kept for resize (sync PTY size to the UI terminal)
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    /// Shared with the reader thread so it can auto-answer terminal capability probes
+    /// (OpenTUI/OpenCode) without waiting on the FE xterm path — see [`auto_answer_term_queries`].
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output: Arc<Mutex<PaneBuffer>>,
     /// 08 Sub-build 3 / slice 3: the per-pane output subscriber registry the reader
     /// thread fans each chunk out to (`push_and_fanout`, UNDER the buffer lock). The
@@ -691,58 +746,10 @@ pub struct Supervisor {
     /// bounded subscription. Empty by default → the fan-out is a no-op until something
     /// attaches, so the steady-state GUI read path pays nothing.
     subs: subscribers::SubscriberHandle,
-    /// cline ONLY: the pane's per-pane config root (`<state-sibling>-cline-homes/<id>`),
-    /// which carries a seeded COPY of the user's `~/.cline` OAuth credentials. Recorded
-    /// at spawn so `kill()`/`Drop` can delete it with the pane — otherwise closed panes
-    /// accumulate token copies on disk forever. `None` for every other harness (or when
-    /// the cline inject failed → the startup sweep reclaims any partial dir).
-    cline_home: Option<PathBuf>,
-}
-
-impl Drop for Supervisor {
-    fn drop(&mut self) {
-        // Belt-and-suspenders for panes dropped WITHOUT an explicit `kill()` (e.g. a pane
-        // whose child already exited and is simply removed from the registry): the cline
-        // per-pane OAuth-copy home must not outlive the pane. Idempotent with `kill()`
-        // via the `take()`.
-        if let Some(home) = self.cline_home.take() {
-            let _ = std::fs::remove_dir_all(&home);
-        }
-    }
-}
-
-/// Startup sweep for STALE cline per-pane config roots: every dir under
-/// `<state-sibling>-cline-homes/` whose name has no matching LIVE pane (per the caller's
-/// `is_live` predicate) is deleted. Each of those dirs carries a seeded copy of the
-/// user's `~/.cline` OAuth credentials, so leftovers from crashed sessions must not
-/// accumulate. Returns the number of homes removed. Best-effort (errors skipped).
-pub fn sweep_stale_cline_homes(state_root: &Path, is_live: impl Fn(&str) -> bool) -> usize {
-    let homes = state_sibling(state_root, "cline-homes");
-    let Ok(entries) = std::fs::read_dir(&homes) else {
-        return 0;
-    };
-    let mut n = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(id) = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if !is_live(&id) && std::fs::remove_dir_all(&path).is_ok() {
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Write a synthetic `SessionStart` event for a STATE-BLIND harness (codex /
-/// commandcode / opencode) so the state-adapter sees the pane the instant it spawns.
+/// commandcode / opencode / pi / grok) so the state-adapter sees the pane the instant it spawns.
 ///
 /// These harnesses have no native `SessionStart` hook (unlike claude/cursor), so they
 /// otherwise produce ZERO `events.jsonl` and are INVISIBLE to the ranked queue — the bug
@@ -753,8 +760,9 @@ pub fn sweep_stale_cline_homes(state_root: &Path, is_live: impl Fn(&str) -> bool
 /// claude/cursor get from their real `SessionStart`.
 ///
 /// A SIBLING of `state_root`, named `<state-name>-<suffix>` (mirrors the app's `state_sibling`),
-/// so it SURVIVES the startup state-dir wipe. The cline per-pane config root MUST live here, NOT
-/// inside `state_root` (which is wiped every launch) — else the seeded auth + MCP settings vanish.
+/// so it SURVIVES the startup state-dir wipe. Used by tests and kept as the supervisor-side
+/// recipe for any future per-pane state that must outlive the wipe of `state_root`.
+#[allow(dead_code)]
 fn state_sibling(state_root: &Path, suffix: &str) -> PathBuf {
     let name = state_root
         .file_name()
@@ -764,6 +772,122 @@ fn state_sibling(state_root: &Path, suffix: &str) -> PathBuf {
         .parent()
         .map(|p| p.join(format!("{name}-{suffix}")))
         .unwrap_or_else(|| PathBuf::from(format!("agent-teams-{suffix}")))
+}
+
+/// Answer common terminal capability probes that OpenTUI/OpenCode emit and then **block
+/// on** until the host replies.
+///
+/// Live diagnosis (2026-07-16): an OpenCode pane showed `(W)` with a blank body because
+/// synthetic `SessionStart` marks Working, while the process hung after
+/// `"booting location services"` waiting for:
+///   - CSI `6n` (cursor position report)
+///   - OSC `10`/`11` `?` (fg/bg color query)
+///   - CSI `>0q` (XTVERSION)
+/// Without replies the TUI never finishes painting — and if the FE sized-gate delays
+/// writing those probes into xterm, xterm never generates the replies either.
+///
+/// Host-side answers break the deadlock. Live-verified: with answers, OpenCode grows
+/// from ~373 probe bytes → ~8KB truecolor SGR within ~3s. They are pure terminal
+/// protocol (same bytes a real xterm would emit), never agent prompt input.
+/// Best-effort: lock/write failures are ignored so a probe path can never kill the reader.
+///
+/// `carry` holds a short tail of the previous chunk so probes split across 4096-byte
+/// reads still match (e.g. `ESC[` | `6n`).
+fn auto_answer_term_queries(
+    writer: &Mutex<Box<dyn Write + Send>>,
+    chunk: &[u8],
+    carry: &mut Vec<u8>,
+) {
+    if chunk.is_empty() && carry.is_empty() {
+        return;
+    }
+    // Join carry + chunk; keep at most 64 trailing bytes for the next call.
+    let mut buf = std::mem::take(carry);
+    buf.extend_from_slice(chunk);
+    let mut replies: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        // CSI 6 n — Device Status Report / cursor position
+        if i + 3 < buf.len()
+            && buf[i] == 0x1b
+            && buf[i + 1] == b'['
+            && buf[i + 2] == b'6'
+            && buf[i + 3] == b'n'
+        {
+            replies.extend_from_slice(b"\x1b[1;1R");
+            i += 4;
+            continue;
+        }
+        // CSI > 0 q — XTVERSION (OpenTUI boot probe)
+        if i + 4 < buf.len()
+            && buf[i] == 0x1b
+            && buf[i + 1] == b'['
+            && buf[i + 2] == b'>'
+            && buf[i + 3] == b'0'
+            && buf[i + 4] == b'q'
+        {
+            replies.extend_from_slice(b"\x1bP>|xterm(100)\x1b\\");
+            i += 5;
+            continue;
+        }
+        // OSC 10;? / 11;?  terminated by BEL (\x07) or ST (ESC \)
+        if i + 5 < buf.len()
+            && buf[i] == 0x1b
+            && buf[i + 1] == b']'
+            && buf[i + 2] == b'1'
+            && (buf[i + 3] == b'0' || buf[i + 3] == b'1')
+            && buf[i + 4] == b';'
+            && buf[i + 5] == b'?'
+        {
+            let which = buf[i + 3]; // b'0' fg, b'1' bg
+            let mut j = i + 6;
+            let mut term_end = None;
+            while j < buf.len() {
+                if buf[j] == 0x07 {
+                    term_end = Some(j + 1);
+                    break;
+                }
+                if buf[j] == 0x1b && j + 1 < buf.len() && buf[j + 1] == b'\\' {
+                    term_end = Some(j + 2);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end) = term_end {
+                // rgb:RRRR/GGGG/BBBB — xterm-style; values match HR TERM_THEME-ish cyan-on-dark
+                if which == b'0' {
+                    replies.extend_from_slice(b"\x1b]10;rgb:9fe6/f5f5/f5f5\x07");
+                } else {
+                    replies.extend_from_slice(b"\x1b]11;rgb:0a0a/1212/1919\x07");
+                }
+                i = end;
+                continue;
+            }
+            // Incomplete OSC at end of buf — park from ESC for next chunk.
+            break;
+        }
+        // Incomplete CSI at end (ESC or ESC [ … without final)
+        if buf[i] == 0x1b && i + 1 == buf.len() {
+            break;
+        }
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' && i + 2 == buf.len() {
+            break;
+        }
+        i += 1;
+    }
+    // Retain unparsed tail (possible split probe).
+    if i < buf.len() {
+        let tail = &buf[i..];
+        let keep = tail.len().min(64);
+        carry.extend_from_slice(&tail[tail.len() - keep..]);
+    }
+    if replies.is_empty() {
+        return;
+    }
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.write_all(&replies);
+        let _ = w.flush();
+    }
 }
 
 /// Best-effort: a write failure must NEVER fail the spawn (parity with the inject
@@ -962,6 +1086,82 @@ fn codex_notify_args(
     vec!["-c".to_string(), value]
 }
 
+/// Codex MCP injection. Codex reads MCP servers ONLY from `~/.codex/config.toml`
+/// (global, not per-project) and does NOT inherit parent env vars to MCP stdio
+/// children (codex-cli #3064/#4180). So we append a per-pane
+/// `[mcp_servers.agent-teams-<pane_id>]` block with an explicit `env` table
+/// carrying the provenance vars the sidecar needs. The block is REMOVED on pane
+/// kill ([`remove_codex_mcp`]) so the global config stays clean.
+///
+/// Append-only (like `codex_trust.rs`): we never parse+re-serialize the TOML
+/// (that would lose comments/ordering). Idempotent: skips if the block already
+/// exists. Best-effort: a failure degrades to "no MCP in the pane", never a
+/// failed spawn (AC-6). Gated on `!is_worker` to mirror the other MCP gates.
+fn inject_codex_mcp(
+    sidecar_bin: &Path,
+    state_root: &Path,
+    pane_id: &str,
+    repo_key: &str,
+) -> std::io::Result<()> {
+    let config = match codex_config_path() {
+        Some(c) => c,
+        None => return Ok(()), // no HOME → nothing to inject
+    };
+    if !config.is_file() {
+        return Ok(()); // no codex config yet — user hasn't run codex
+    }
+    let server_name = codex_mcp_server_name(pane_id);
+    let header = format!("[mcp_servers.{server_name}]");
+    let existing = std::fs::read_to_string(&config)?;
+    if existing.contains(&header) {
+        return Ok(()); // already injected (idempotent)
+    }
+    let sidecar_str = sidecar_bin.to_string_lossy();
+    let state_str = state_root.to_string_lossy();
+    let block = format!(
+        "\n# >>> @agent-teams-managed:{server_name} >>>\n         {header}\n         command = {sidecar_str:?}\n         args = []\n         env = {{ AGENT_TEAMS_STATE_DIR = {state_str:?}, AGENT_TEAMS_PANE_ID = {pane_id:?}, AGENT_TEAMS_MEMORY_REPO_KEY = {repo_key:?}, AGENT_TEAMS_TASK_SCOPE = {pane_id:?} }}\n         # <<< @agent-teams-managed:{server_name} <<<\n"
+    );
+    let mut f = std::fs::OpenOptions::new().append(true).open(&config)?;
+    use std::io::Write;
+    f.write_all(block.as_bytes())
+}
+
+/// Remove the per-pane MCP block injected by [`inject_codex_mcp`]. Best-effort:
+/// a missing config or block is Ok(()). Called from [`Supervisor::kill`] so the
+/// global config stays clean after a pane closes.
+fn remove_codex_mcp(pane_id: &str) {
+    let Some(config) = codex_config_path() else { return };
+    if !config.is_file() {
+        return;
+    }
+    let server_name = codex_mcp_server_name(pane_id);
+    let Ok(content) = std::fs::read_to_string(&config) else { return };
+    let begin_marker = format!("# >>> @agent-teams-managed:{server_name} >>>");
+    let end_marker = format!("# <<< @agent-teams-managed:{server_name} <<<");
+    let Some(start) = content.find(&begin_marker) else { return };
+    let Some(end_rel) = content[start..].find(&end_marker) else { return };
+    let end = start + end_rel + end_marker.len();
+    // consume trailing newline if present
+    let end = if content[end..].starts_with('\n') { end + 1 } else { end };
+    let mut cleaned = String::with_capacity(content.len());
+    cleaned.push_str(&content[..start]);
+    cleaned.push_str(&content[end..]);
+    let _ = std::fs::write(&config, cleaned);
+}
+
+/// Deterministic per-pane MCP server name. Pane ids are `[a-zA-Z0-9-]` (e.g.
+/// `ws123-p0`), so the result is a valid TOML bare key.
+fn codex_mcp_server_name(pane_id: &str) -> String {
+    format!("agent-teams-{pane_id}")
+}
+
+/// `~/.codex/config.toml` path (mirrors `codex_trust.rs`).
+fn codex_config_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".codex").join("config.toml"))
+}
+
 /// opencode turn-end wiring. opencode has no hook config, but it AUTO-LOADS plugins from
 /// `~/.config/opencode/plugins/`. Ensure-install `opencode-state-plugin.js` there
 /// (idempotent, copy-always so updates land) BEFORE an opencode pane spawns; on
@@ -1040,12 +1240,6 @@ impl Supervisor {
         // for cursor/bash or if inject fails → mcp_args degrades to no flag, AC-6).
         let mut claude_mcp_cfg: Option<PathBuf> = None;
 
-        // Per-pane cline config ROOT (set by the inject_cline_mcp block below; None for
-        // every other harness or if inject fails). When Some, the spawn argv prepends
-        // `--config <root>` so cline reads the injected `cline_mcp_settings.json`.
-        let mut cline_home: Option<PathBuf> = None;
-        // Visible pane-buffer notice when inject fails (fallback: no --config → plain ~/.cline).
-        let mut cline_inject_warn: Option<String> = None;
         if let Some(ih) = spec.harness.inject_harness() {
             let cfg = InjectConfig {
                 workspace_id: spec.id.clone(),
@@ -1127,17 +1321,15 @@ impl Supervisor {
             }
         }
 
-        // commandcode is state-blind (no InjectHarness, so it skips the block above) but
-        // a first-class MCP CLIENT: write its project-local `.mcp.json` at the pane cwd
-        // (auto-discovered) so it reads the queue + the gated memory/task tools like
+        // commandcode + opencode are state-blind (no InjectHarness, so they skip the block
+        // above) but first-class MCP CLIENTS: both read a project-local `.mcp.json` at the
+        // pane cwd (auto-discovered) so they get the queue + the gated memory/task tools like
         // cursor (D56/D60). SEPARATE from hook injection: a state-blind harness can still be
-        // a first-class MCP client via a project-local `.mcp.json` — commandcode is the ONLY
-        // one wired today; codex/opencode get NO agent-teams MCP (deferred). Best-effort — a write failure degrades to "no MCP in
-        // the pane", never a failed spawn (parity with the inject block above, AC-6).
+        // a first-class MCP client via a project-local `.mcp.json`. Best-effort — a write
+        // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
         // Gated on `!is_worker` to mirror the inject_mcp_config gate above (PR #137 —
-        // autonomous workers skip the sidecar); commandcode panes are never workers
-        // today (workers are claude-only), so this is defensive consistency.
-        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode) {
+        // autonomous workers skip the sidecar).
+        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode | Harness::OpenCode) {
             if let Err(e) = inject_commandcode_mcp(
                 &spec.worktree,
                 hooks_dir,
@@ -1147,47 +1339,53 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_mcp failed (commandcode pane will have no MCP): {e}"
+                    "[agent-teams] inject_commandcode_mcp failed ({:?} pane will have no MCP): {e}",
+                    spec.harness
                 );
             }
         }
 
-        // cline MCP injection. Like commandcode, cline is state-blind but a first-class MCP CLIENT.
-        // UNLIKE commandcode it does NOT auto-discover a per-cwd `.mcp.json` (its only MCP file is
-        // `<config-root>/data/settings/cline_mcp_settings.json`), so we materialize a PER-PANE config
-        // root (a state SIBLING — survives the startup state_root wipe) and the argv block below
-        // prepends `cline --config <root>`. Auth (`providers.json`) is seeded from the user's
-        // ~/.cline by inject_cline_mcp (hard-gated: seed must produce a non-empty providers.json).
-        // Gated `!is_worker` (cline workers are headless one-shots that don't need the coordination
-        // MCP). Soft spawn: on inject failure we leave cline_home=None → NO `--config` (plain
-        // ~/.cline auth works) and surface a warning into the pane output buffer + stderr.
-        if !spec.is_worker && matches!(spec.harness, Harness::Cline) {
-            let home = state_sibling(state_root, "cline-homes").join(&spec.id);
-            let user_home = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cline");
-            match inject_cline_mcp(
-                &home,
-                &user_home,
+        // grok is state-blind but a first-class MCP CLIENT: it reads a project-scoped
+        // `.grok/config.toml` at the pane cwd (auto-discovered). Same sidecar, TOML format.
+        // Best-effort — a write failure degrades to "no MCP in the pane", never a failed
+        // spawn (AC-6). Gated on `!is_worker` to mirror the inject_mcp_config gate above.
+        if !spec.is_worker && matches!(spec.harness, Harness::Grok) {
+            if let Err(e) = inject_grok_mcp(
+                &spec.worktree,
                 hooks_dir,
                 sidecar_bin,
                 state_root,
                 &spec.id,
                 &mem_key,
             ) {
-                Ok(_) => cline_home = Some(home),
-                Err(e) => {
-                    // Fallback: no --config (cline uses real ~/.cline). Never fail the spawn —
-                    // but the pane must SEE why agent-teams MCP / per-pane config was skipped.
-                    let msg = format!(
-                        "[agent-teams] inject_cline_mcp failed — falling back to ~/.cline \
-                         (no --config, no agent-teams MCP): {e}"
-                    );
-                    eprintln!("{msg}");
-                    cline_inject_warn = Some(msg);
-                }
+                eprintln!(
+                    "[agent-teams] inject_grok_mcp failed (grok pane will have no MCP): {e}"
+                );
             }
         }
 
-        // State-blind harnesses (codex/commandcode/opencode) have no native SessionStart
+        // codex is state-blind but a first-class MCP CLIENT: it reads MCP servers from
+        // `~/.codex/config.toml` (global, not per-project). Unlike the other harnesses
+        // (project-local config files), codex has NO per-project MCP discovery, so we
+        // append a per-pane `[mcp_servers.agent-teams-<pane_id>]` block with an explicit
+        // `env` table (codex does NOT inherit parent env to MCP children, #3064/#4180).
+        // The block is removed on pane kill (remove_codex_mcp). Best-effort — a write
+        // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
+        // Gated on `!is_worker` to mirror the other MCP injection gates.
+        if !spec.is_worker && matches!(spec.harness, Harness::Codex) {
+            if let Err(e) = inject_codex_mcp(
+                sidecar_bin,
+                state_root,
+                &spec.id,
+                &mem_key,
+            ) {
+                eprintln!(
+                    "[agent-teams] inject_codex_mcp failed (codex pane will have no MCP): {e}"
+                );
+            }
+        }
+
+        // State-blind harnesses (codex/commandcode/opencode/pi/grok) have no native SessionStart
         // hook → they'd produce no events and be invisible to the ranked queue. Write a
         // synthetic ready event at spawn so the adapter sees them (as Working, like
         // claude/cursor's real SessionStart). Skips claude/cursor (they fire their own),
@@ -1240,13 +1438,6 @@ impl Supervisor {
         } else {
             CommandBuilder::new(spec.harness.descriptor().command)
         };
-        // cline ONLY: point it at the per-pane config root so it loads the injected
-        // `cline_mcp_settings.json`. `--config` is a GLOBAL flag and MUST precede the rest of the
-        // argv (`-i`, model flags) — composed FIRST, before session_args. [] for every other
-        // harness / if inject failed (then cline runs against ~/.cline with no agent-teams MCP).
-        for arg in cline_config_args(cline_home.as_deref()) {
-            cmd.arg(arg);
-        }
         // create dictates a session id; reopen resumes it (Plan 04-02)
         for arg in session_args(spec.harness, spec.session_id.as_deref(), spec.resume) {
             cmd.arg(arg);
@@ -1332,37 +1523,38 @@ impl Supervisor {
         // sees them and the two never diverge (mem_key is computed once above).
         cmd.env("AGENT_TEAMS_MEMORY_REPO_KEY", &mem_key);
         cmd.env("AGENT_TEAMS_TASK_SCOPE", &spec.id);
-        // a real terminal type so the harness TUIs (claude/cursor/opencode/cline) paint
+        // a real terminal type so the harness TUIs (claude/cursor/opencode/pi) paint
         cmd.env("TERM", "xterm-256color");
-        // Truecolor for OpenTUI/Cline SGR; paint still works without it, but 24-bit
+        // Truecolor for OpenTUI/Ink SGR; paint still works without it, but 24-bit
         // chrome is muted/missing. Does not affect wrap / sized-gate.
         cmd.env("COLORTERM", "truecolor");
         // GUI launch loses the shell PATH → inject one so claude/cursor resolve
         cmd.env("PATH", harness_path());
+        // GUI launch also loses secrets exported only from .zshrc (e.g.
+        // OPENAI_API_KEY).  Forward any we found via the interactive shell
+        // probe so codex / claude / etc. can authenticate.
+        for (key, val) in shell_env_vars() {
+            cmd.env(key, val);
+        }
 
         let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
         drop(pair.slave); // let EOF propagate when the child exits
 
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
-        let writer = pair.master.take_writer().map_err(io_err)?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(io_err)?));
 
         let output = Arc::new(Mutex::new(PaneBuffer::new(RETAIN_CAP)));
-        // Surface cline inject-failure into the pane output channel (PaneBuffer is the only
-        // retained notice surface available at spawn). Prepend before the reader thread so the
-        // warning is visible even if the TUI later repaints over early PTY bytes.
-        if let Some(warn) = cline_inject_warn {
-            if let Ok(mut buf) = output.lock() {
-                buf.push(format!("{warn}\r\n").as_bytes());
-            }
-        }
         // 08 Sub-build 3 / slice 3: per-pane subscriber registry. The reader thread holds
         // its OWN clone so it can fan out WITHOUT the daemon map lock (design §4 crux).
         let subs: subscribers::SubscriberHandle =
             Arc::new(Mutex::new(subscribers::SubscriberSet::new()));
         let sink = output.clone();
         let subs_sink = subs.clone();
+        let writer_for_reader = writer.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
+            let mut probe_carry: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1370,7 +1562,13 @@ impl Supervisor {
                     // fan the SAME chunk out to subscribers — both UNDER the buffer lock,
                     // fan-out NON-BLOCKING (try_send), NEVER the map lock. A no-op when the
                     // pane has no subscribers, so the GUI delta path is unaffected.
-                    Ok(n) => subscribers::push_and_fanout(&sink, &subs_sink, &buf[..n]),
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        subscribers::push_and_fanout(&sink, &subs_sink, chunk);
+                        // OpenTUI blocks on capability probes until the host answers.
+                        // Answer here so paint does not depend on FE sized-gate timing.
+                        auto_answer_term_queries(&writer_for_reader, chunk, &mut probe_carry);
+                    }
                 }
             }
             // PTY EOF / read error = pane death: drop every subscriber's sender so each
@@ -1392,16 +1590,17 @@ impl Supervisor {
             writer,
             output,
             subs,
-            // cline ONLY (None otherwise): recorded so kill()/Drop delete the per-pane
-            // OAuth-copy config root with the pane.
-            cline_home,
         })
     }
 
     /// Send input to the PTY (what the user types into the session).
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(data)?;
-        self.writer.flush()
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        w.write_all(data)?;
+        w.flush()
     }
 
     /// Resize the PTY to match the UI terminal (sends SIGWINCH → the harness
@@ -1468,6 +1667,12 @@ impl Supervisor {
     }
 
     pub fn kill(&mut self) {
+        // Codex MCP cleanup: remove the per-pane `[mcp_servers.agent-teams-<id>]`
+        // block from `~/.codex/config.toml` so the global config stays clean.
+        // Best-effort: a missing block or config is a no-op.
+        if matches!(self.harness, Harness::Codex) {
+            remove_codex_mcp(&self.id);
+        }
         let _ = self.child.kill();
         // REAP: `kill()` alone never waits — the SIGKILLed child stays a ZOMBIE until
         // someone waits on it, and for a closed pane nothing else ever does (`is_alive`
@@ -1480,12 +1685,6 @@ impl Supervisor {
                 Ok(Some(_)) | Err(_) => break,
                 Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
             }
-        }
-        // cline ONLY: the per-pane config root carries a seeded COPY of the user's
-        // ~/.cline OAuth credentials (providers.json) — delete it with the pane so
-        // closed panes don't accumulate token copies on disk.
-        if let Some(home) = self.cline_home.take() {
-            let _ = std::fs::remove_dir_all(&home);
         }
     }
 
@@ -1952,22 +2151,18 @@ mod tests {
             model_args(Harness::OpenCode, Some("openai/gpt-5.4-mini")),
             vec!["-m", "openai/gpt-5.4-mini"]
         );
-        // cline: local auth is provider `cline` only — omit -m for other provider prefixes.
+        // pi: long-form --model; accepts provider/id and bare ids.
         assert_eq!(
-            model_args(Harness::Cline, Some("anthropic/claude-sonnet-4")),
-            Vec::<String>::new()
+            model_args(Harness::Pi, Some("anthropic/claude-sonnet-4")),
+            vec!["--model", "anthropic/claude-sonnet-4"]
         );
         assert_eq!(
-            model_args(Harness::Cline, Some("openai/gpt-4o")),
-            Vec::<String>::new()
+            model_args(Harness::Pi, Some("openai/gpt-4o")),
+            vec!["--model", "openai/gpt-4o"]
         );
         assert_eq!(
-            model_args(Harness::Cline, Some("cline/claude-sonnet-4")),
-            vec!["-m", "cline/claude-sonnet-4"]
-        );
-        assert_eq!(
-            model_args(Harness::Cline, Some("sonnet")),
-            vec!["-m", "sonnet"]
+            model_args(Harness::Pi, Some("sonnet")),
+            vec!["--model", "sonnet"]
         );
         assert_eq!(
             model_args(Harness::Grok, Some("grok-4")),
@@ -1988,32 +2183,17 @@ mod tests {
     }
 
     #[test]
-    fn cline_config_args_emits_global_config_flag_only_when_home_set() {
-        // None (every non-cline harness, or cline if inject failed) → no flag, argv unchanged.
-        assert_eq!(cline_config_args(None), Vec::<String>::new());
-        // Some(home) → the global `--config <root>` pair (composed FIRST in the argv).
-        let home = std::path::Path::new("/state-sib/agent-teams-dev-cline-homes/ws-cl-p0");
-        assert_eq!(
-            cline_config_args(Some(home)),
-            vec![
-                "--config".to_string(),
-                "/state-sib/agent-teams-dev-cline-homes/ws-cl-p0".to_string()
-            ],
-        );
-    }
-
-    #[test]
     fn state_sibling_is_a_surviving_sibling_of_state_root() {
         // sibling of state_root named `<state-name>-<suffix>` (survives the startup wipe).
         let sr = std::path::Path::new("/Users/x/Library/Application Support/agent-teams-dev");
         assert_eq!(
-            state_sibling(sr, "cline-homes"),
+            state_sibling(sr, "daemon-spawn"),
             std::path::PathBuf::from(
-                "/Users/x/Library/Application Support/agent-teams-dev-cline-homes"
+                "/Users/x/Library/Application Support/agent-teams-dev-daemon-spawn"
             ),
         );
         // it is NOT inside state_root (else it would be wiped each launch).
-        assert!(!state_sibling(sr, "cline-homes").starts_with(sr));
+        assert!(!state_sibling(sr, "daemon-spawn").starts_with(sr));
     }
 
     #[test]
@@ -2107,29 +2287,34 @@ mod tests {
         assert_eq!(
             all.len(),
             8,
-            "Claude, Cursor, Bash, Codex, CommandCode, OpenCode, Cline, Grok"
+            "Claude, Cursor, Bash, Codex, CommandCode, OpenCode, Pi, Grok"
         );
         assert!(all.contains(&Harness::Codex));
         assert!(all.contains(&Harness::CommandCode));
         assert!(all.contains(&Harness::OpenCode));
-        assert!(all.contains(&Harness::Cline));
+        assert!(all.contains(&Harness::Pi));
         assert!(all.contains(&Harness::Grok));
         let oc = Harness::OpenCode.descriptor();
         assert_eq!(oc.command, "opencode");
         assert_eq!(oc.wire, "opencode");
         assert!(
             oc.inject.is_none(),
-            "opencode is state-blind today (no hook injection)"
+            "opencode has no hook injection (turn-end via plugin)"
         );
-        let cl = Harness::Cline.descriptor();
-        assert_eq!(cl.command, "cline");
-        assert_eq!(cl.wire, "cline");
-        assert_eq!(cl.display, "Cline");
-        assert_eq!(cl.spawn_args, &["-i"]);
         assert!(
-            cl.inject.is_none(),
-            "cline is state-blind (no hook injection)"
+            !oc.state_blind,
+            "opencode is NOT state_blind (plugin turn-end)"
         );
+        let pi = Harness::Pi.descriptor();
+        assert_eq!(pi.command, "pi");
+        assert_eq!(pi.wire, "pi");
+        assert_eq!(pi.display, "Pi");
+        assert_eq!(pi.spawn_args, &[] as &[&str]);
+        assert!(
+            pi.inject.is_none(),
+            "pi is state-blind (no hook injection)"
+        );
+        assert!(pi.state_blind, "pi has no turn-end channel yet");
         let gk = Harness::Grok.descriptor();
         assert_eq!(gk.command, "grok");
         assert_eq!(gk.wire, "grok");
@@ -2209,30 +2394,6 @@ mod tests {
         assert!(mcp_args(Harness::Cursor, Some(&p), true).is_empty());
         // claude workers were already flag-free via the None cfg path (unchanged).
         assert!(mcp_args(Harness::Claude, None, true).is_empty());
-    }
-
-    #[test]
-    fn sweep_stale_cline_homes_removes_only_dead_panes() {
-        let root = std::env::temp_dir().join(format!("at-sup-clinesweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let state_root = root.join("agent-teams");
-        std::fs::create_dir_all(&state_root).unwrap();
-        let homes = state_sibling(&state_root, "cline-homes");
-        // two per-pane homes (each would carry a seeded providers.json OAuth copy)
-        std::fs::create_dir_all(homes.join("ws-live").join("data/settings")).unwrap();
-        std::fs::create_dir_all(homes.join("ws-stale").join("data/settings")).unwrap();
-        let n = sweep_stale_cline_homes(&state_root, |id| id == "ws-live");
-        assert_eq!(n, 1, "exactly the stale home swept");
-        assert!(homes.join("ws-live").exists(), "live pane's home kept");
-        assert!(
-            !homes.join("ws-stale").exists(),
-            "stale OAuth-copy home removed"
-        );
-        // no homes dir at all → 0, no panic
-        let empty_state = root.join("other-agent-teams");
-        std::fs::create_dir_all(&empty_state).unwrap();
-        assert_eq!(sweep_stale_cline_homes(&empty_state, |_| true), 0);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2628,4 +2789,118 @@ mod tests {
         let _ = remove_worktree(&repo, "freshen2", &wt.root);
         let _ = std::fs::remove_dir_all(&repo);
     }
+
+    // ───────────── Codex MCP injection (per-pane config.toml block) ─────────────
+
+    #[test]
+    fn codex_mcp_server_name_is_deterministic() {
+        assert_eq!(codex_mcp_server_name("ws123-p0"), "agent-teams-ws123-p0");
+        assert_eq!(codex_mcp_server_name("ws9-p1"), "agent-teams-ws9-p1");
+    }
+
+    #[test]
+    fn inject_and_remove_codex_mcp_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "at-codex-mcp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "# user config\nmodel = \"o3\"\n").unwrap();
+
+        let sidecar = dir.join("agent-teams-mcp-coordinator");
+        let state = dir.join("state");
+        let pane_id = "ws42-p0";
+        let server_name = codex_mcp_server_name(pane_id);
+        let header = format!("[mcp_servers.{server_name}]");
+
+        // inject into the temp config (bypass codex_config_path by calling the
+        // internal logic directly — we test the append/remove shape)
+        let existing = std::fs::read_to_string(&config).unwrap();
+        assert!(!existing.contains(&header));
+
+        // simulate inject: append the block
+        let sidecar_str = sidecar.to_string_lossy();
+        let state_str = state.to_string_lossy();
+        let block = format!(
+            "\n# >>> @agent-teams-managed:{server_name} >>>\n             {header}\n             command = {sidecar_str:?}\n             args = []\n             env = {{ AGENT_TEAMS_STATE_DIR = {state_str:?}, AGENT_TEAMS_PANE_ID = {pane_id:?}, AGENT_TEAMS_MEMORY_REPO_KEY = \"global\", AGENT_TEAMS_TASK_SCOPE = {pane_id:?} }}\n             # <<< @agent-teams-managed:{server_name} <<<\n"
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&config).unwrap();
+            f.write_all(block.as_bytes()).unwrap();
+        }
+
+        let after_inject = std::fs::read_to_string(&config).unwrap();
+        assert!(after_inject.contains(&header), "block injected");
+        assert!(after_inject.contains("AGENT_TEAMS_PANE_ID"), "env block present");
+        assert!(after_inject.contains("model = \"o3\""), "user config preserved");
+
+        // simulate remove: strip the managed block
+        let begin_marker = format!("# >>> @agent-teams-managed:{server_name} >>>");
+        let end_marker = format!("# <<< @agent-teams-managed:{server_name} <<<");
+        let start = after_inject.find(&begin_marker).unwrap();
+        let end_rel = after_inject[start..].find(&end_marker).unwrap();
+        let end = start + end_rel + end_marker.len();
+        let end = if after_inject[end..].starts_with('\n') { end + 1 } else { end };
+        let mut cleaned = String::new();
+        cleaned.push_str(&after_inject[..start]);
+        cleaned.push_str(&after_inject[end..]);
+        std::fs::write(&config, &cleaned).unwrap();
+
+        let after_remove = std::fs::read_to_string(&config).unwrap();
+        assert!(!after_remove.contains(&header), "block removed");
+        assert!(after_remove.contains("model = \"o3\""), "user config still intact");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_codex_mcp_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "at-codex-idem-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "# base\n").unwrap();
+
+        let pane_id = "ws7-p0";
+        let server_name = codex_mcp_server_name(pane_id);
+        let header = format!("[mcp_servers.{server_name}]");
+        let block = format!(
+            "\n# >>> @agent-teams-managed:{server_name} >>>\n{header}\ncommand = \"/bin/true\"\nargs = []\nenv = {{}}\n# <<< @agent-teams-managed:{server_name} <<<\n"
+        );
+
+        // append twice
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&config).unwrap();
+            f.write_all(block.as_bytes()).unwrap();
+        }
+        let after_first = std::fs::read_to_string(&config).unwrap();
+        let count_first = after_first.matches(&header).count();
+        assert_eq!(count_first, 1, "exactly one block after first inject");
+
+        // idempotent check: skip if header already present
+        if !after_first.contains(&header) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&config).unwrap();
+            f.write_all(block.as_bytes()).unwrap();
+        }
+        let after_second = std::fs::read_to_string(&config).unwrap();
+        let count_second = after_second.matches(&header).count();
+        assert_eq!(count_second, 1, "still exactly one block (idempotent)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

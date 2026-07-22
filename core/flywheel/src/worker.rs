@@ -141,7 +141,7 @@ fn non_claude_harness(name: &str) -> Option<harness::Harness> {
         "codex" => Some(harness::Harness::Codex),
         "opencode" => Some(harness::Harness::OpenCode),
         "commandcode" => Some(harness::Harness::CommandCode),
-        "cline" => Some(harness::Harness::Cline),
+        "pi" => Some(harness::Harness::Pi),
         _ => None,
     }
 }
@@ -251,7 +251,7 @@ mod tests {
         // + the CLI's apply_git_deny_env). The deny env is the CLI's responsibility (harness returns
         // program+args only), so this guards that the adapter still applies it on every harness.
         let builders: Vec<(&str, Command)> =
-            ["cursor", "codex", "opencode", "commandcode", "cline"]
+            ["cursor", "codex", "opencode", "commandcode", "pi"]
                 .into_iter()
                 .map(|h| (h, worker_command(h, repo, Some("m"), true, wt).cmd))
                 .collect();

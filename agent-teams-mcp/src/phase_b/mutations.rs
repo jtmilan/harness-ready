@@ -208,7 +208,7 @@ pub struct OrchestrateArgs {
 /// `[{harness:"claude",role:"builder",count:2},{harness:"codex",role:"reviewer"}]`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PaneSpecArg {
-    /// Harness wire string ("claude"/"cursor"/"codex"/"commandcode"/"opencode"/"cline"). NO bash/shell.
+    /// Harness wire string ("claude"/"cursor"/"codex"/"commandcode"/"opencode"/"pi"/"grok"). NO bash/shell.
     pub harness: String,
     /// Optional role/persona for this pane group (e.g. "coordinator"/"reviewer"/"builder"/"tester").
     #[serde(default)]
@@ -707,6 +707,7 @@ pub const DELEGATE_TOOLS: &[&str] = &["team_delegate"];
 pub const CONTEXT_ROUTER_TOOLS: &[&str] = &[
     "team_orchestrate",
     "team_broadcast",
+    "team_prompt_all",
     "team_handoff",
     "team_synthesize",
 ];
@@ -840,6 +841,7 @@ mod tests {
             &[
                 "team_orchestrate",
                 "team_broadcast",
+                "team_prompt_all",
                 "team_handoff",
                 "team_synthesize"
             ]

@@ -472,7 +472,7 @@ const HARNESS_NEWLINE = {
   cursor: "\n",         // Ctrl+J
   gemini: "\n",         // Ctrl+J
   commandcode: "\n",    // Ctrl+J (assumed — adjust if it differs)
-  cline: "\n",          // default TUI newline (UNVERIFIED — Ink-based; splits like the other non-bash TUIs, settle=200ms)
+  pi: "\n",          // default TUI newline (UNVERIFIED — Ink-based; splits like the other non-bash TUIs, settle=200ms)
   bash: "\\\r", sh: "\\\r", zsh: "\\\r", // shell line continuation (Ctrl+J would submit)
 };
 const DEFAULT_NEWLINE = "\n"; // Ctrl+J — the most common TUI newline
@@ -511,7 +511,7 @@ function ensureSession(id) {
   // operator had no way to see a pane's model anywhere. idx-keyed like spawnPane.
   const phMeta = document.createElement("span");
   phMeta.className = "ph-meta";
-  // state-blind badge (#D5): codex/commandcode/opencode/cline emit no state signal, so this
+  // state-blind badge (#D5): codex/commandcode/opencode/pi emit no state signal, so this
   // pane's "Working" tick is unreported — not live. Flag it so the operator isn't misled.
   const phBlind = document.createElement("span");
   phBlind.className = "ph-blind";
@@ -5707,8 +5707,8 @@ let fwWorkers = 3;
 // CLAUDE is live-verifiable AND keeps the token/cost meter (it emits parseable usage) + a tight
 // allowlist (commit ✓ / push ✗). The others run on YOUR subscription (the meter goes blind →
 // "subscription" label) via a coarser autonomous-commit mode, and are UNVERIFIED → experimental.
-const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "cline", "grok"];
-const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", cline: "Cline", grok: "Grok Build" };
+const FW_HARNESSES = ["claude", "codex", "cursor", "commandcode", "opencode", "pi", "grok"];
+const FW_HARNESS_LABEL = { claude: "Claude", codex: "Codex", cursor: "Cursor", commandcode: "CommandCode", opencode: "OpenCode", pi: "Pi", grok: "Grok Build" };
 // Curated quick-pick models per harness. NOT exhaustive + ACCOUNT-SCOPED (ids rot + depend on your
 // auth/providers) — the text field is the SOURCE OF TRUTH and accepts anything; "" (the "(default)"
 // chip) = the harness account default (no --model / no -m), the SAFEST pick (a stale/unauthed id 400s).
@@ -5723,7 +5723,7 @@ const FW_MODELS = {
   cursor: ["composer-2.5-fast", "composer-2.5", "gpt-5.5-high", "auto"],
   commandcode: ["claude-sonnet-4-6", "claude-opus-4-8", "gpt-5.5"],
   opencode: ["", "github-copilot/claude-haiku-4.5", "github-copilot/claude-sonnet-4.5", "github-copilot/gpt-5.4"],
-  cline: ["anthropic/claude-sonnet-4", "anthropic/claude-opus-4", "openai/gpt-5"],
+  pi: ["", "anthropic/claude-sonnet-4", "openai/gpt-4o", "google/gemini-2.5-pro"],
   grok: ["grok-4.5"],
 };
 let fwHarness = "claude";

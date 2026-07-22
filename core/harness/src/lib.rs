@@ -83,16 +83,15 @@ pub enum Harness {
     /// is `opencode run [message]` with `-m provider/model` + `--dangerously-skip-permissions`
     /// (see `worker_spawn`). Resume/MCP/role persona = deferred.
     OpenCode,
-    /// Cline CLI (`cline` binary — cline/cline, provider-agnostic). Spawnable interactive
-    /// TUI via `-i`; like codex/commandcode/opencode it has NO hook mechanism today →
-    /// `inject: None` → STATE-BLIND (no who-needs-you queue report). Headless worker mode is
-    /// `cline -c <cwd> [-m model] <positional-prompt>` (prompt is the trailing positional,
-    /// see `worker_spawn`); it runs in ACT mode with auto-approve=true BY DEFAULT (no flag) —
-    /// its built-in autonomous-commit posture. ALL headless cline behavior is UNVERIFIED.
-    /// Resume (`--id`)/MCP/role persona = deferred.
-    Cline,
+    /// Pi CLI (`pi` binary — pi.dev / @earendil-works/pi-coding-agent). Spawnable
+    /// interactive TUI via bare `pi`; like codex/commandcode/opencode it has NO hook
+    /// mechanism today → `inject: None` → STATE-BLIND (no who-needs-you queue report).
+    /// Headless worker mode is `pi -p [--model id] <positional-prompt>` (prompt is the
+    /// trailing positional, see `worker_spawn`). ALL headless pi behavior is UNVERIFIED.
+    /// Resume/MCP/role persona = deferred. Replaces the former Cline harness.
+    Pi,
     /// Grok CLI (`grok` binary — xAI's "Grok Build TUI"). Spawnable interactive
-    /// TUI via bare `grok`; like codex/opencode/cline it has NO hook mechanism
+    /// TUI via bare `grok`; like codex/opencode/pi it has NO hook mechanism
     /// today → `inject: None` → STATE-BLIND (no who-needs-you queue report).
     /// Headless worker mode is `grok agent --cwd <cwd> [-m model] <positional-prompt>`
     /// (see `worker_spawn`). ALL headless grok behavior is UNVERIFIED.
@@ -129,7 +128,7 @@ pub struct HarnessDescriptor {
     /// TRUE when the harness has NO turn-end signal at all: after the synthetic
     /// spawn-time `SessionStart` its pane shows **Working forever** (never Done /
     /// Needs-You) because nothing ever reports a turn boundary. Today that is
-    /// commandcode + cline. FALSE for the harnesses with a real turn-end channel —
+    /// commandcode + pi + grok. FALSE for the harnesses with a real turn-end channel —
     /// claude/cursor (lifecycle hooks), codex (`notify` override), opencode (the
     /// auto-loaded turn-end plugin) — and for bash (a plain shell that never enters
     /// the agent state machine at all). Pure data bit; surfaces (queue/UI) consume it
@@ -205,22 +204,21 @@ impl Harness {
                 // has a turn-end channel (or, for bash, never enters the agent state machine)
                 state_blind: false,
             },
-            Harness::Cline => HarnessDescriptor {
-                command: "cline",
-                // State-blind like codex/opencode (no hooks). `-i`/--tui opens the interactive
-                // TUI for the human pane (bare `cline [prompt]` would headless-run instead); no
-                // startup-suppression flags are needed (the headless WORKER path uses
-                // `cline -c <cwd> …`, built in `worker_spawn`, not here).
+            Harness::Pi => HarnessDescriptor {
+                command: "pi",
+                // State-blind like codex/opencode (no hooks). Bare `pi` opens the interactive
+                // TUI; no startup-suppression flags are needed (the headless WORKER path uses
+                // `pi -p …`, built in `worker_spawn`, not here).
                 inject: None,
-                wire: "cline",
-                display: "Cline",
-                spawn_args: &["-i"],
+                wire: "pi",
+                display: "Pi",
+                spawn_args: &[],
                 // NO turn-end signal → perpetual Working after the synthetic SessionStart
                 state_blind: true,
             },
             Harness::Grok => HarnessDescriptor {
                 command: "grok",
-                // State-blind like codex/opencode/cline (no hooks). Bare `grok` opens the
+                // State-blind like codex/opencode/pi (no hooks). Bare `grok` opens the
                 // interactive TUI; no startup-suppression flags needed for the TUI spawn
                 // (the headless WORKER path uses `grok agent --cwd <cwd> ...`, built in
                 // `worker_spawn`, not here).
@@ -244,7 +242,7 @@ impl Harness {
             Harness::Codex,
             Harness::CommandCode,
             Harness::OpenCode,
-            Harness::Cline,
+            Harness::Pi,
             Harness::Grok,
         ]
     }
@@ -272,7 +270,7 @@ impl Harness {
 /// of being mis-parsed as a flag.
 ///
 /// CONSERVATIVELY `false` for EVERY harness today. No CLI (claude/cursor/codex/
-/// opencode/commandcode/cline/bash) has been live-verified to accept `--`, so the
+/// opencode/commandcode/pi/bash) has been live-verified to accept `--`, so the
 /// safe posture is to REJECT a `-`-leading prompt rather than risk a silent mis-parse
 /// that would drop the task. Flip a variant to `true` ONLY after live-verifying that
 /// its CLI honors `--` (a live-verify-owed follow-up). The match is CLOSED (no
@@ -285,7 +283,7 @@ pub fn supports_end_of_options(h: Harness) -> bool {
         | Harness::Codex
         | Harness::CommandCode
         | Harness::OpenCode
-        | Harness::Cline
+        | Harness::Pi
         | Harness::Grok => false,
     }
 }
@@ -581,28 +579,26 @@ pub fn worker_spawn(
                 prompt_via_stdin: false,
             }
         }
-        Harness::Cline => {
-            // `cline [prompt]` runs in ACT mode with auto-approve=true BY DEFAULT (no flag) — its
-            // built-in autonomous posture (like commandcode --yolo / opencode --dangerously-skip, but
-            // on by default). Prompt is the trailing POSITIONAL (prompt_via_stdin=false). `-m` sets the
-            // model. `-c <cwd>` pins the working dir to the worktree (defensive, mirrors opencode --dir;
-            // cline's cwd-resolution against a linked-worktree `.git` file is UNVERIFIED). cline has NO
-            // documented path sandbox / `--add-dir`, so extra_dirs (the fan-in report dir) needs no extra
-            // flag — auto-approve writes anywhere. ⚠️ SECURITY: auto-approve is COARSE (can `git push`);
-            // the §9.2 worker_git_deny_env is what actually denies push (same trust class as cursor/
-            // commandcode/opencode). State-blind (inject:None) → no who-needs-you report. UNVERIFIED headless.
-            let mut args: Vec<String> = vec!["-c".into(), cwd.to_string_lossy().into_owned()];
+        Harness::Pi => {
+            // `pi -p [prompt]` = non-interactive print mode (process prompt and exit). Prompt is the
+            // trailing POSITIONAL (prompt_via_stdin=false). `--model` sets provider/id or bare id.
+            // Pi honors process cwd (no OpenCode-style --dir needed). No documented path sandbox /
+            // `--add-dir`, so extra_dirs need no extra flag. ⚠️ SECURITY: tool use is COARSE (can
+            // `git push`); the §9.2 worker_git_deny_env is what actually denies push (same trust
+            // class as cursor/commandcode/opencode). State-blind (inject:None) → no who-needs-you
+            // report. UNVERIFIED headless.
+            let mut args: Vec<String> = vec!["-p".into()];
             if let Some(m) = &m {
-                args.push("-m".into());
+                args.push("--model".into());
                 args.push(m.clone());
             }
             WorkerSpawn {
-                program: "cline".into(),
+                program: "pi".into(),
                 args,
                 prompt_via_stdin: false,
             }
         }
-        // UNVERIFIED: mirror the cline positional shape (`--cwd <cwd>` + trailing positional prompt).
+        // UNVERIFIED: headless shape (`grok agent --cwd <cwd>` + trailing positional prompt).
         // `grok agent` is the headless subcommand; `grok --cwd` redirects the interactive TUI's cwd.
         // For headless worker mode, use `grok agent --cwd <cwd> [-m model] <positional-prompt>`.
         // grok has a path sandbox (`--sandbox`), so extra_dirs are NOT wired through here.
@@ -653,7 +649,7 @@ mod tests {
                 Harness::Codex => 3,
                 Harness::CommandCode => 4,
                 Harness::OpenCode => 5,
-                Harness::Cline => 6,
+                Harness::Pi => 6,
                 Harness::Grok => 7,
             }
         }
@@ -696,13 +692,13 @@ mod tests {
     #[test]
     fn state_blind_bit_marks_exactly_the_no_turn_end_harnesses() {
         // state_blind = NO turn-end signal at all → the pane shows Working forever after
-        // the synthetic SessionStart. Today: commandcode + cline ONLY. claude/cursor have
+        // the synthetic SessionStart. Today: commandcode + pi + grok. claude/cursor have
         // lifecycle hooks, codex has the notify override, opencode has the auto-loaded
         // plugin, and bash never enters the agent state machine. Driven off all() so a
         // new variant must take an explicit position (the descriptor match is closed).
         for h in Harness::all() {
             let d = h.descriptor();
-            let want = matches!(h, Harness::CommandCode | Harness::Cline | Harness::Grok);
+            let want = matches!(h, Harness::CommandCode | Harness::Pi | Harness::Grok);
             assert_eq!(
                 d.state_blind, want,
                 "{h:?} state_blind must be {want} (wire {:?})",
@@ -916,10 +912,10 @@ mod tests {
                 &["run", "--dangerously-skip-permissions", "--dir"],
             ),
             (
-                Harness::Cline,
-                "cline",
+                Harness::Pi,
+                "pi",
                 "anthropic/claude-sonnet-4",
-                &["-c"],
+                &["-p"],
             ),
             (
                 Harness::Grok,

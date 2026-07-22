@@ -30,8 +30,11 @@ pub enum Harness {
     Codex,
     CommandCode,
     OpenCode,
-    Cline,
-    /// Grok Build (wire: `"grok"`) — state-blind like codex/commandcode/opencode/cline;
+    /// Pi (wire: `"pi"`) — state-blind like codex/commandcode/grok; no hook/plugin
+    /// surface today. Synthetic `SessionStart` at spawn → perpetual `Working` until a
+    /// turn-end signal is wired. Replaces the former Cline harness.
+    Pi,
+    /// Grok Build (wire: `"grok"`) — state-blind like codex/commandcode/opencode/pi;
     /// no hook integration in v1 (inject: None). Synthetic `SessionStart` at spawn
     /// → perpetual `Working` until a turn-end signal is wired.
     Grok,
@@ -146,26 +149,26 @@ pub fn normalize(ev: &RawEvent) -> AgentState {
         // Not a hook — surfaced via stderr by a Phase-02 supervisor; needs_human=false.
         (Cursor, "resource_exhausted") => (Waiting, Some(RateLimit)),
 
-        // ---- codex / commandcode / opencode / cline / grok: state-blind harnesses ----
+        // ---- codex / commandcode / opencode / pi / grok: state-blind harnesses ----
         // No native SessionStart hook, so the supervisor writes a SYNTHETIC one at
         // spawn (write_spawn_ready_event) → Working, the SAME baseline claude/cursor
         // get from their real SessionStart. codex's only turn-end signal is `notify`
-        // (its global config hook) → Done; commandcode/grok have no turn-end hook yet,
+        // (its global config hook) → Done; commandcode/pi/grok have no turn-end hook yet,
         // so they stay Working until one lands (the catch-all keeps any other event
         // Working — never a false block).
         (Codex, "SessionStart")
         | (CommandCode, "SessionStart")
         | (OpenCode, "SessionStart")
-        | (Cline, "SessionStart")
+        | (Pi, "SessionStart")
         | (Grok, "SessionStart") => (Working, None),
         (Codex, "notify") => (Done, Some(TurnEnd)),
         // opencode's turn-end: its plugin (opencode-state-plugin.js) writes `stop` on
-        // `session.idle`. cline/grok have NO hook/plugin surface today (inject:None,
+        // `session.idle`. pi/grok have NO hook/plugin surface today (inject:None,
         // no emitter), so in production they behave like commandcode — stay Working
         // after synthetic SessionStart and never reach Done (headless turn-end
-        // UNVERIFIED). The `(Cline|Grok, "stop")` arms are FORWARD-DEFENSE only: if
+        // UNVERIFIED). The `(Pi|Grok, "stop")` arms are FORWARD-DEFENSE only: if
         // either ever grows a turn-end emitter, it maps correctly without a code change.
-        (OpenCode, "stop") | (Cline, "stop") | (Grok, "stop") => (Done, Some(TurnEnd)),
+        (OpenCode, "stop") | (Pi, "stop") | (Grok, "stop") => (Done, Some(TurnEnd)),
 
         // ---- unknown event: assume the agent is working, never a false block ----
         _ => (Working, None),
@@ -433,7 +436,7 @@ mod tests {
             Harness::Codex,
             Harness::CommandCode,
             Harness::OpenCode,
-            Harness::Cline,
+            Harness::Pi,
             Harness::Grok,
         ];
         let events = [
@@ -500,7 +503,7 @@ mod tests {
             Harness::Codex,
             Harness::CommandCode,
             Harness::OpenCode,
-            Harness::Cline,
+            Harness::Pi,
             Harness::Grok,
         ] {
             for &e in &unknowns {
@@ -534,7 +537,7 @@ mod tests {
             Harness::Codex,
             Harness::CommandCode,
             Harness::OpenCode,
-            Harness::Cline,
+            Harness::Pi,
             Harness::Grok,
         ] {
             let st = normalize(&ev(h, "SessionStart", None));
@@ -552,11 +555,11 @@ mod tests {
         assert_eq!(oc.state, State::Done);
         assert_eq!(oc.waiting_reason, Some(WaitingReason::TurnEnd));
         assert!(!oc.needs_human);
-        // cline turn-end: same synthetic `stop` → Done/TurnEnd treatment as opencode.
-        let cl = normalize(&ev(Harness::Cline, "stop", None));
-        assert_eq!(cl.state, State::Done);
-        assert_eq!(cl.waiting_reason, Some(WaitingReason::TurnEnd));
-        assert!(!cl.needs_human);
+        // pi turn-end: forward-defense synthetic `stop` (no emitter today).
+        let pi = normalize(&ev(Harness::Pi, "stop", None));
+        assert_eq!(pi.state, State::Done);
+        assert_eq!(pi.waiting_reason, Some(WaitingReason::TurnEnd));
+        assert!(!pi.needs_human);
         // grok turn-end: forward-defense synthetic `stop` (no emitter today).
         let gr = normalize(&ev(Harness::Grok, "stop", None));
         assert_eq!(gr.state, State::Done);

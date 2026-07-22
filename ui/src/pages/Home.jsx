@@ -305,7 +305,11 @@ export default function Home() {
     let cancelled = false;
     listen("pane-early-respawn", (e) => {
       const p = (e && e.payload) || {};
-      if (!p.id || !p.ok) return;
+      if (!p.id) return;
+      // ok:true → backend respawned a fresh PTY; reset delta cursor + scrollback.
+      // ok:false → budget spent (OpenCode/Bun crash loop); still reset so the pane is
+      // not a silent blank corpse holding stale scrollback (nexus-agents has no handler;
+      // main.js toasts — we at least re-arm the terminal for the failure surface).
       if (typeof bridge.onEarlyRespawn === "function") bridge.onEarlyRespawn(p.id);
     }).then((fn) => {
       if (cancelled) {

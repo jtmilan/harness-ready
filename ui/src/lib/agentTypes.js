@@ -6,7 +6,7 @@ export const AGENT_KINDS = {
   opencode: { label: "OPENCODE", cmd: "opencode" },
   codex: { label: "CODEX", cmd: "codex" },
   commandcode: { label: "COMMANDCODE", cmd: "commandcode" },
-  cline: { label: "CLINE", cmd: "cline" },
+  pi: { label: "PI", cmd: "pi" },
   grok: { label: "GROK", cmd: "grok" },
   bash: { label: "BASH", cmd: "bash" },
 };

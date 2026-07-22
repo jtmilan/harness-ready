@@ -111,7 +111,7 @@ describe("robustness + active pointer", () => {
     expect(getActivePresetId()).toBeNull();
   });
   it("KNOWN_HARNESSES matches the app's harnesses (display order)", () => {
-    expect(KNOWN_HARNESSES).toEqual(["claude", "codex", "commandcode", "cursor", "opencode", "cline", "grok", "bash"]);
+    expect(KNOWN_HARNESSES).toEqual(["claude", "codex", "commandcode", "cursor", "opencode", "pi", "grok", "bash"]);
   });
 });
 

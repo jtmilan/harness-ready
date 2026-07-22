@@ -94,7 +94,7 @@ fn harness_str(h: Harness) -> &'static str {
         Harness::Codex => "codex",
         Harness::CommandCode => "commandcode",
         Harness::OpenCode => "opencode",
-        Harness::Cline => "cline",
+        Harness::Pi => "pi",
         Harness::Grok => "grok",
     }
 }
@@ -612,7 +612,7 @@ pub enum SocketRequest {
 
     // ───────────── #21 gap-7: live-scrollback read (app-served READ op) ─────────────
     /// Read a LIVE tail of pane `id`'s in-memory PTY scrollback from the RUNNING app —
-    /// the read primitive for STATE-BLIND harnesses (commandcode/codex/opencode/cline)
+    /// the read primitive for STATE-BLIND harnesses (commandcode/codex/opencode/pi)
     /// that persist no on-disk transcript, so every sidecar disk locator misses and
     /// `team_read_output` could only answer an honest `source:"none"`. READ-ONLY: the
     /// app copies the pane's retained output buffer (`PaneBuffer` / the daemon
@@ -628,11 +628,32 @@ pub enum SocketRequest {
     /// Serde-additive/backward-compatible: an OLD app deserializes this unknown `op` as
     /// a malformed request (structured `BAD_REQUEST`, never a panic), and an omitted
     /// `max_bytes` deserializes to `None` and is not re-serialized.
+    ///
+    /// `strip_ansi` defaults to `true` (clean text for programmatic consumers). Pass
+    /// `false` to keep raw PTY bytes (CSI/OSC/TUI frames). Omitted on the wire when
+    /// true so old peers stay compatible.
     ReadOutput {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
+        /// When true (default), strip ANSI escape codes from the scrollback content
+        /// via [`strip_ansi_codes`] before returning. Explicit `false` preserves raw PTY.
+        #[serde(
+            default = "default_true",
+            skip_serializing_if = "is_true_or_none"
+        )]
+        strip_ansi: Option<bool>,
     },
+}
+
+/// Serde default for [`SocketRequest::ReadOutput::strip_ansi`]: strip by default.
+fn default_true() -> Option<bool> {
+    Some(true)
+}
+
+/// Omit `strip_ansi` on the wire when it is the default (`true` / `None`).
+fn is_true_or_none(v: &Option<bool>) -> bool {
+    v.unwrap_or(true)
 }
 
 /// One pane group in an atomic multi-pane [`SocketRequest::CreateWorkspace`] (#262 ext).
@@ -865,8 +886,8 @@ pub fn split_settle_ms(wire: &str, payload_len: usize) -> u64 {
         "cursor" => 150,      // Ink stdin batching
         "opencode" => 180,    // joined the coalescing set (06-08)
         "commandcode" => 200, // Ink, slowest batching observed
-        "cline" => 200,       // Ink TUI, slowest-batch class (= commandcode)
-        "grok" => 200,        // conservative base (= cline); TUI coalescing unmeasured
+        "pi" => 200,          // TUI batching unmeasured — conservative (= commandcode)
+        "grok" => 200,        // conservative base (= pi); TUI coalescing unmeasured
         "bash" => return 0,   // never splits (harness_needs_split_submit=false)
         _ => 100,             // unknown harness → claude-equivalent safe default
     };
@@ -947,7 +968,7 @@ pub fn op_external_spawn_allowed(req: &SocketRequest) -> bool {
 pub fn external_spawn_harness_allowed(harness: &str) -> bool {
     matches!(
         harness.trim().to_ascii_lowercase().as_str(),
-        "claude" | "cursor" | "codex" | "opencode" | "commandcode" | "cline" | "grok"
+        "claude" | "cursor" | "codex" | "opencode" | "commandcode" | "pi" | "grok"
     )
 }
 
@@ -1031,6 +1052,108 @@ pub fn read_output_cap(max_bytes: Option<u64>) -> usize {
         .map(|m| usize::try_from(m).unwrap_or(READ_OUTPUT_HARD_MAX_BYTES))
         .unwrap_or(READ_OUTPUT_DEFAULT_MAX_BYTES)
         .min(READ_OUTPUT_HARD_MAX_BYTES)
+}
+
+/// Strip ANSI escape sequences from PTY scrollback content.
+///
+/// Removes CSI (`\x1b[…`), OSC (`\x1b]…\x07` / ST), charset-select (`\x1b(X` /
+/// `\x1b)X`), and simple keypad escapes (`\x1b=`, `\x1b>`). After stripping,
+/// collapses excessive blank lines (3+ consecutive newlines → 2) and trims
+/// trailing whitespace per line so TUI frame noise does not dominate the text.
+///
+/// Pure + unit-testable; no I/O. Used by the app-side [`SocketRequest::ReadOutput`]
+/// handler when `strip_ansi` is not explicitly `false`.
+pub fn strip_ansi_codes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            // Copy one UTF-8 character (or a single invalid byte as U+FFFD-safe slice).
+            let rest = &input[i..];
+            match rest.chars().next() {
+                Some(ch) => {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                None => break,
+            }
+            continue;
+        }
+        // ESC sequence — drop the sequence, keep following text.
+        if i + 1 >= bytes.len() {
+            break; // trailing lone ESC
+        }
+        match bytes[i + 1] {
+            b'[' => {
+                // CSI: ESC [ params/intermediates final(0x40–0x7E)
+                // Covers private modes (`?…h/l/m`), cursor (`H`), SGR (`m`), etc.
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+            }
+            b']' => {
+                // OSC: ESC ] … BEL (0x07) or ST (ESC \)
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b')' => {
+                // Charset select: ESC ( X / ESC ) X
+                i += 2;
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'=' | b'>' => {
+                // Keypad mode
+                i += 2;
+            }
+            _ => {
+                // Unknown 2-byte ESC sequence — drop ESC + next byte
+                i += 2;
+            }
+        }
+    }
+    collapse_after_ansi_strip(&out)
+}
+
+/// Collapse TUI residue left after ANSI stripping: trim trailing spaces per line,
+/// fold 3+ consecutive newlines into 2, trim overall ends.
+fn collapse_after_ansi_strip(s: &str) -> String {
+    let joined: String = s
+        .lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = String::with_capacity(joined.len());
+    let mut newline_run = 0u32;
+    for ch in joined.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newline_run = 0;
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 /// MF-D ROUTING classifier (pure → unit-tested). `true` for the synthesis/orchestration
@@ -1199,7 +1322,7 @@ pub struct PaneSourceWire {
     /// Pane id as requested (matches `QueueRow.id` / the live registry).
     pub id: String,
     /// Where the content came from: `orchestrate_report` | `claude_transcript` |
-    /// `cursor_transcript` | `none` (nothing on disk for this pane).
+    /// `cursor_transcript` | `grok_transcript` | `none` (nothing on disk for this pane).
     pub source: String,
     /// Bytes of content folded into the consolidated document (0 when `source:"none"`).
     pub bytes: u64,
@@ -2758,7 +2881,8 @@ mod tests {
         // its content-exfil admission is layered app-side (coordinator OR external gate).
         assert!(!op_requires_mutations(&SocketRequest::ReadOutput {
             id: "w".into(),
-            max_bytes: None
+            max_bytes: None,
+            strip_ansi: None,
         }));
         // Mutating ops: behind allow_mutations.
         assert!(op_requires_mutations(&SocketRequest::SendInput {
@@ -2827,13 +2951,15 @@ mod tests {
         assert!(op_external_orchestrator_allowed(
             &SocketRequest::ReadOutput {
                 id: "w".into(),
-                max_bytes: None
+                max_bytes: None,
+                strip_ansi: None,
             }
         ));
         assert!(op_external_orchestrator_allowed(
             &SocketRequest::ReadOutput {
                 id: "w".into(),
-                max_bytes: Some(1024)
+                max_bytes: Some(1024),
+                strip_ansi: None,
             }
         ));
         // Autonomous / multi-hop / lifecycle are EXCLUDED — they stay coordinator-only.
@@ -2862,28 +2988,43 @@ mod tests {
     #[test]
     fn read_output_wire_shape_is_additive_and_backward_compatible() {
         // Omitted max_bytes ⇒ None and NOT re-serialized (the serde-additive contract
-        // every optional field in this enum follows).
+        // every optional field in this enum follows). Omitted strip_ansi ⇒ Some(true)
+        // (default strip) and NOT re-serialized when true.
         let req: SocketRequest =
             serde_json::from_str(r#"{"op":"read_output","id":"ws9-p4"}"#).unwrap();
         assert_eq!(
             req,
             SocketRequest::ReadOutput {
                 id: "ws9-p4".into(),
-                max_bytes: None
+                max_bytes: None,
+                strip_ansi: Some(true),
             }
         );
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
             r#"{"op":"read_output","id":"ws9-p4"}"#
         );
-        // Present max_bytes round-trips.
+        // Present max_bytes round-trips; default strip_ansi still omitted on wire.
         let req = SocketRequest::ReadOutput {
             id: "ws9-p4".into(),
             max_bytes: Some(4096),
+            strip_ansi: Some(true),
         };
         let s = serde_json::to_string(&req).unwrap();
         assert_eq!(s, r#"{"op":"read_output","id":"ws9-p4","max_bytes":4096}"#);
         assert_eq!(serde_json::from_str::<SocketRequest>(&s).unwrap(), req);
+        // Explicit strip_ansi:false is re-serialized (opt-out of cleaning).
+        let raw = SocketRequest::ReadOutput {
+            id: "ws9-p4".into(),
+            max_bytes: None,
+            strip_ansi: Some(false),
+        };
+        let s = serde_json::to_string(&raw).unwrap();
+        assert_eq!(
+            s,
+            r#"{"op":"read_output","id":"ws9-p4","strip_ansi":false}"#
+        );
+        assert_eq!(serde_json::from_str::<SocketRequest>(&s).unwrap(), raw);
         // The new app still parses every OLD request (spot-check the 06-02 shapes)…
         assert!(serde_json::from_str::<SocketRequest>(r#"{"op":"focus","id":"w"}"#).is_ok());
         assert!(serde_json::from_str::<SocketRequest>(
@@ -2903,6 +3044,84 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         let back: SocketResponse = serde_json::from_str(&s).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn strip_ansi_codes_cleans_real_grok_tui_noise() {
+        // Spinner braille frames must SURVIVE (they are text, not escapes).
+        let spinners = "⠋⠙⠹⠸⠼⠴⠦⠧";
+        assert_eq!(strip_ansi_codes(spinners), spinners);
+
+        // Cursor positioning CSI
+        assert_eq!(
+            strip_ansi_codes("hello\x1b[15;54Hworld"),
+            "helloworld"
+        );
+
+        // OSC title (BEL-terminated)
+        assert_eq!(
+            strip_ansi_codes("\x1b]0;⠧ - no-op… - grok\x07Grok 4.5"),
+            "Grok 4.5"
+        );
+        // OSC with ST terminator (ESC \)
+        assert_eq!(
+            strip_ansi_codes("\x1b]0;title\x1b\\plain"),
+            "plain"
+        );
+
+        // Color / intensity SGR
+        assert_eq!(
+            strip_ansi_codes("\x1b[1mbold\x1b[22m\x1b[0m normal"),
+            "bold normal"
+        );
+
+        // Private modes (synced output / alt screen style)
+        assert_eq!(
+            strip_ansi_codes("pre\x1b[?2026hmid\x1b[?2026lpost"),
+            "premidpost"
+        );
+
+        // Charset select + keypad modes
+        assert_eq!(
+            strip_ansi_codes("\x1b(B\x1b)0\x1b=\x1b>text"),
+            "text"
+        );
+
+        // Composite: noisy TUI frame → readable model name
+        let noisy = concat!(
+            "\x1b[?2026h\x1b[15;54H\x1b]0;⠧ - no-op… - grok\x07",
+            "\x1b[1mGrok 4.5\x1b[0m\n",
+            "\x1b[0m\n\n\n",
+            "ready\x1b[?2026l",
+        );
+        let clean = strip_ansi_codes(noisy);
+        assert!(
+            clean.contains("Grok 4.5"),
+            "model name must be readable: {clean:?}"
+        );
+        assert!(
+            clean.contains("ready"),
+            "trailing text kept: {clean:?}"
+        );
+        assert!(
+            !clean.contains('\x1b'),
+            "no ESC residual: {clean:?}"
+        );
+        // Excessive blank lines collapsed (≤2 consecutive newlines in the middle).
+        assert!(
+            !clean.contains("\n\n\n"),
+            "blank-line run collapsed: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_codes_is_identity_on_plain_text() {
+        assert_eq!(strip_ansi_codes(""), "");
+        assert_eq!(strip_ansi_codes("hello world"), "hello world");
+        assert_eq!(
+            strip_ansi_codes("line1\nline2\n"),
+            "line1\nline2"
+        );
     }
 
     #[test]
@@ -3502,7 +3721,8 @@ mod tests {
             "codex",
             "commandcode",
             "opencode",
-            "cline",
+            "pi",
+            "grok",
         ] {
             assert!(harness_needs_split_submit(wire), "{wire} must split-submit");
         }
@@ -3528,7 +3748,8 @@ mod tests {
         assert_eq!(split_settle_ms("cursor", 0), 150);
         assert_eq!(split_settle_ms("opencode", 0), 180);
         assert_eq!(split_settle_ms("commandcode", 0), 200);
-        assert_eq!(split_settle_ms("cline", 0), 200);
+        assert_eq!(split_settle_ms("pi", 0), 200);
+        assert_eq!(split_settle_ms("grok", 0), 200);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use agent_teams_core::{
     external_orchestrator_pins, external_spawn_cap, external_spawn_harness_allowed,
     external_spawn_role_allowed, op_external_orchestrator_allowed, op_external_spawn_allowed,
     op_requires_mutations, op_timeout, read_mcp_config, read_mcp_config_checked, read_output_cap,
-    response_code, socket_path, validate_spawn_id,
+    response_code, socket_path, strip_ansi_codes, validate_spawn_id,
     DispatchEntry, PaneSpec, PaneVerdictWire, SocketData, SocketRequest, SocketResponse, SpawnSpec,
 };
 // 06-02 Phase-B HTTP transport (DRAFT — security review). The loopback TCP path has
@@ -767,12 +767,11 @@ async fn list_harness_models(harness: String) -> serde_json::Value {
             Some(Harness::CommandCode) => run_model_list("commandcode", &["--list-models"], parse_commandcode_models),
             Some(Harness::OpenCode) => run_model_list("opencode", &["models"], parse_opencode_models),
             Some(Harness::Codex) => codex_cache_models(),
-            // cline: NO verified credit-free list command (its CLI takes `-m <model>` but a
-            // generic probe risks the codex-style billed trap) → fallback tiles until one is
-            // verified. Explicit arm so a reader doesn't mistake it for an oversight.
-            Some(Harness::Cline) => None,
+            // pi: NO verified credit-free list command (`pi --list-models` is provider-
+            // dependent) → fallback tiles until a credit-free list is verified.
+            Some(Harness::Pi) => None,
             // grok: no verified credit-free list command (model flag AMBIGUOUS / unverified) →
-            // fallback tiles until one is verified. Explicit arm (LAST, after cline).
+            // fallback tiles until one is verified. Explicit arm (LAST, after pi).
             Some(Harness::Grok) => None,
             // claude (no list command — it's a billed trap), bash (no model), unknown wire.
             Some(Harness::Claude) | Some(Harness::Bash) | None => None,
@@ -1547,9 +1546,9 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
                     do_resume = false; // → session_args = [] (fresh chat)
                 }
             }
-            // bash + codex + commandcode + opencode + cline + grok never resume (session_args is
+            // bash + codex + commandcode + opencode + pi + grok never resume (session_args is
             // always [] for them) → no safety-net downgrade needed; a fresh spawn is the only path.
-            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Cline | Harness::Grok => {}
+            Harness::Bash | Harness::Codex | Harness::CommandCode | Harness::OpenCode | Harness::Pi | Harness::Grok => {}
         }
     }
 
@@ -2874,9 +2873,6 @@ fn stage_hooks(src: &std::path::Path) -> Option<PathBuf> {
         "cursor-mcp.tmpl.json",
         // commandcode's project-local .mcp.json template (inject_commandcode_mcp).
         "commandcode-mcp.tmpl.json",
-        // cline's per-pane config-root template (inject_cline_mcp → <cline_home>/data/
-        // settings/cline_mcp_settings.json, transport-nested schema).
-        "cline-mcp.tmpl.json",
     ] {
         std::fs::copy(src.join(name), dest.join(name)).ok()?;
     }
@@ -7146,7 +7142,7 @@ fn socket_synthesize(app: &tauri::AppHandle, dir: &str, goal: &str) -> SocketRes
 
 // ─────────────── gap-7: live-scrollback read (socket ReadOutput) ────────────────
 //
-// The read primitive for STATE-BLIND harnesses (commandcode/codex/opencode/cline):
+// The read primitive for STATE-BLIND harnesses (commandcode/codex/opencode/pi):
 // they persist no on-disk transcript, so the sidecar's `team_read_output` disk
 // locators all miss and it could only answer an honest `source:"none"`. This serves
 // the pane's LIVE in-memory output tail instead — the same retained bytes the GUI
@@ -7210,8 +7206,15 @@ fn audit_external_read(app: &tauri::AppHandle, id: &str, bytes: usize) {
 /// buffer (`daemon_stream_handle`), else the in-process supervisor registry's
 /// `output_handle()` (handle cloned UNDER the registry lock, read OFF it — the A2
 /// lock-shedding rule); (3) tail-cap via the shared `read_output_cap` (default 64 KiB,
-/// hard 256 KiB); (4) audit id + byte count (never content).
-fn socket_read_output(app: &tauri::AppHandle, id: &str, max_bytes: Option<u64>) -> SocketResponse {
+/// hard 256 KiB); (4) optional ANSI strip via shared [`strip_ansi_codes`] (default ON —
+/// clean text for programmatic consumers; explicit `strip_ansi: false` keeps raw PTY);
+/// (5) audit id + byte count (never content).
+fn socket_read_output(
+    app: &tauri::AppHandle,
+    id: &str,
+    max_bytes: Option<u64>,
+    strip_ansi: Option<bool>,
+) -> SocketResponse {
     if !validate_spawn_id(id) {
         return SocketResponse::err(
             response_code::BAD_REQUEST,
@@ -7242,7 +7245,12 @@ fn socket_read_output(app: &tauri::AppHandle, id: &str, max_bytes: Option<u64>) 
             "read_output: no such live pane (list live panes with team_get_queue)",
         );
     };
-    let (content, truncated) = scrollback_tail(&window, cap);
+    let (mut content, truncated) = scrollback_tail(&window, cap);
+    // Default true: programmatic consumers (sidecar live_scrollback, external brains)
+    // get clean text. Explicit false preserves CSI/OSC/TUI frames for raw inspection.
+    if strip_ansi.unwrap_or(true) {
+        content = strip_ansi_codes(&content);
+    }
     audit_external_read(app, id, content.len());
     SocketResponse::ok(
         "live scrollback tail — unverified, may be mid-stream (not a persisted report)",
@@ -7562,7 +7570,11 @@ fn handle_socket_request(
         // pane OR the pid-pinned external orchestrator); the handler validates the id
         // (validate_spawn_id — an id, never a caller path), resolves the pane's LIVE
         // in-memory output buffer read-only, tail-caps it, and audits (id + byte count).
-        SocketRequest::ReadOutput { id, max_bytes } => socket_read_output(app, &id, max_bytes),
+        SocketRequest::ReadOutput {
+            id,
+            max_bytes,
+            strip_ansi,
+        } => socket_read_output(app, &id, max_bytes, strip_ansi),
     }
 }
 
@@ -10368,7 +10380,7 @@ fn default_max_concurrent() -> usize {
 /// slot is "free" ONLY when its pane reports a SETTLED idle/done state. Turn-end matrix
 /// today (pinned by core/harness's `state_blind` test): Claude/Cursor emit real lifecycle
 /// hooks; codex reaches `done` via its notify override and opencode via its auto-loaded
-/// plugin; commandcode and cline are the STATE-BLIND ones (no turn-end signal — they read
+/// plugin; commandcode and pi are the STATE-BLIND ones (no turn-end signal — they read
 /// Working forever), and bash never enters the agent state machine. State-blind panes,
 /// fresh spawns with no event
 /// yet, and working/waiting panes are all conservatively OCCUPIED, so the budget can never
@@ -13698,6 +13710,14 @@ pub fn run() {
     // Gated by this env so direct-`Harness::Bash` integration tests stay on a deterministic bare
     // bash; the packaged app always wants the rich prompt. Safe to set unconditionally here.
     std::env::set_var("AGENT_TEAMS_SHELL_LOGIN", "1");
+    // GUI launch (Finder / Dock / launchd) inherits a minimal env — secrets
+    // exported only from .zshrc (e.g. OPENAI_API_KEY) are missing.  Probe the
+    // user's interactive login shell ONCE and inject them into THIS process's
+    // env so every child (PTY panes, headless workers, model probes) inherits
+    // them automatically.  The supervisor's shell_env_vars() caches the probe.
+    for (key, val) in supervisor::shell_env_vars() {
+        std::env::set_var(key, val);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -18790,7 +18810,11 @@ mod socket_seam_tests {
 
     #[test]
     fn read_output_is_a_read_op_in_the_external_subset_with_id_validation() {
-        let req = SocketRequest::ReadOutput { id: "ws9-p4".into(), max_bytes: None };
+        let req = SocketRequest::ReadOutput {
+            id: "ws9-p4".into(),
+            max_bytes: None,
+            strip_ansi: None,
+        };
         // A READ op: never behind allow_mutations…
         assert!(!op_requires_mutations(&req));
         // …but IN the external-orchestrator subset (the admission it shares with
@@ -19521,7 +19545,11 @@ mod socket_seam_tests {
                 SocketRequest::Close { id: "w".into() },
                 // gap-7: live-scrollback READ — exempt from allow_mutations, but its OWN
                 // content-exfil admission (coordinator OR external orchestrator) applies.
-                SocketRequest::ReadOutput { id: "w".into(), max_bytes: None },
+                SocketRequest::ReadOutput {
+                    id: "w".into(),
+                    max_bytes: None,
+                    strip_ansi: None,
+                },
                 // #262 ext: the external-spawn ops — mutating (op_requires_mutations) and on
                 // their OWN external axis (allow_external_spawn, never the control opt-in).
                 SocketRequest::CreateWorkspace {

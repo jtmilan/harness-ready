@@ -1,6 +1,6 @@
 # Agent Teams (MVP)
 
-Local macOS app: a **team of interactive coding agents** (claude / cursor / opencode / codex / commandcode / cline, or `bash` to smoke-test), each in its own git worktree + PTY, surfaced through **one ranked queue of which agent needs you right now**.
+Local macOS app: a **team of interactive coding agents** (claude / cursor / opencode / codex / commandcode / pi, or `bash` to smoke-test), each in its own git worktree + PTY, surfaced through **one ranked queue of which agent needs you right now**.
 
 ## Run (dev)
 
@@ -17,7 +17,7 @@ cd agent-teams/app && bun install   # first time only
 
 ## Use
 
-- **“+ New” (⌘N)** — pick a harness (claude / cursor / opencode / codex / commandcode / cline, or `bash` to smoke-test), a repo path, and an optional initial prompt → spawns the agent in a `git worktree` with hooks injected.
+- **“+ New” (⌘N)** — pick a harness (claude / cursor / opencode / codex / commandcode / pi, or `bash` to smoke-test), a repo path, and an optional initial prompt → spawns the agent in a `git worktree` with hooks injected.
 - **Left rail** — the ranked *who-needs-you* queue. `►` marks an agent **waiting on you** (approval/question), sorted above working/done. Click a row to focus its terminal.
 - **⌘⇧J** — OS-global hotkey (via `tauri-plugin-global-shortcut`): raises the window and jumps to the top of the queue, even when the app is in the background.
 - **Main pane** — the focused agent's live PTY. Type to drive it; answer approval prompts in place (Model A).

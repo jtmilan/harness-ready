@@ -28,7 +28,7 @@ export const ENVELOPE_VERSION = 1;
 // catalog (a harness_catalog() Tauri command). Until then, keep in sync with
 // parse_harness() (app/src-tauri/src/lib.rs:235) and the #f-harness <select>
 // (app/src/index.html:108-112).
-export const KNOWN_HARNESSES = ["claude", "codex", "commandcode", "cursor", "opencode", "cline", "grok", "bash"];
+export const KNOWN_HARNESSES = ["claude", "codex", "commandcode", "cursor", "opencode", "pi", "grok", "bash"];
 export function isKnownHarness(id) { return KNOWN_HARNESSES.includes(id); }
 
 // Round-robin an ORDERED, multi-selected harness set across `count` panes: pane i takes
@@ -61,7 +61,7 @@ export const BUILTIN_PRESETS = [
   { id: "builtin-claude-codex-cursor", name: "Claude + Codex + Cursor", harnesses: ["claude", "codex", "cursor"], builtin: true },
   { id: "builtin-4-commandcode", name: "4 × CommandCode", harnesses: ["commandcode", "commandcode", "commandcode", "commandcode"], builtin: true },
   { id: "builtin-claude-commandcode-cursor", name: "Claude + CommandCode + Cursor", harnesses: ["claude", "commandcode", "cursor"], builtin: true },
-  { id: "builtin-4-cline", name: "4 × Cline", harnesses: ["cline", "cline", "cline", "cline"], builtin: true },
+  { id: "builtin-4-pi", name: "4 × Pi", harnesses: ["pi", "pi", "pi", "pi"], builtin: true },
 ];
 
 // ---- internals -------------------------------------------------------------
@@ -122,7 +122,12 @@ function saveUserPresets(list) {
 // DERIVING count. Returns null only when there is no usable harness to salvage.
 export function normalizePreset(p) {
   if (!p || typeof p !== "object") return null;
-  const harnesses = Array.isArray(p.harnesses) ? p.harnesses.filter((h) => typeof h === "string" && h) : [];
+  // Migration: Cline harness was replaced by Pi (pi.dev). Map stored wire ids.
+  const harnesses = Array.isArray(p.harnesses)
+    ? p.harnesses
+        .filter((h) => typeof h === "string" && h)
+        .map((h) => (h === "cline" ? "pi" : h))
+    : [];
   if (harnesses.length === 0) return null;
   const out = {
     id: typeof p.id === "string" && p.id ? p.id : genId(),
