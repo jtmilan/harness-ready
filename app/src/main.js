@@ -641,32 +641,48 @@ function ensureSession(id) {
           }
           return false;
         }
+        // ⌘+V → try image paste first (clipboard → temp file → send path to PTY).
+        // WKWebView's native paste only handles text; image clipboard items are
+        // silently dropped. Intercept at keydown so we control both paths.
+        // No image → fall back to text paste via term.paste() (bracketed-paste-safe).
+        if (e.type === "keydown" && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+            && (e.key === "v" || e.key === "V")) {
+          e.preventDefault();
+          if (hasTauri()) {
+            invoke("paste_clipboard_image").then((path) => {
+              if (!path) throw new Error("no image");
+              const quoted = "'" + path.replace(/'/g, "'\\''") + "'";
+              if (broadcast) { for (const pid of broadcastTargets()) invoke("send_input", { id: pid, data: quoted + " " }).catch(() => {}); }
+              else invoke("send_input", { id, data: quoted + " " }).catch(() => {});
+              showToast("Image pasted → " + path.split("/").pop());
+            }).catch(() => {
+              navigator.clipboard.readText().then((text) => {
+                if (text) term.paste(text);
+              }).catch(() => {});
+            });
+          }
+          return false;
+        }
         return true;
       });
     }
   } catch (_) { /* Shift+Enter newline degrades gracefully; the pane still registers */ }
-  // ⌘V image paste: WKWebView fires a `paste` event on xterm's helper textarea.
-  // Text pastes work natively (xterm reads clipboardData text), but IMAGE items are
-  // silently dropped. Intercept: if the clipboard holds an image, save it to a temp
-  // file via the backend (osascript clipboard read) and send the path to the PTY.
+  // Paste event fallback: covers right-click → Paste and Edit menu → Paste (⌘V is
+  // already handled in the keydown handler above). Always try image first; fall back
+  // to text from clipboardData. Capture the text synchronously — clipboardData is
+  // recycled once the event handler returns.
   mount.addEventListener("paste", (e) => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    let hasImage = false;
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].type.startsWith("image/")) { hasImage = true; break; }
-    }
-    if (!hasImage) return; // text-only paste → let xterm handle it
+    const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
     e.preventDefault();
     e.stopPropagation();
     invoke("paste_clipboard_image").then((path) => {
-      if (!path) return;
+      if (!path) throw new Error("no image");
       const quoted = "'" + path.replace(/'/g, "'\\''") + "'";
       if (broadcast) { for (const pid of broadcastTargets()) invoke("send_input", { id: pid, data: quoted + " " }).catch(() => {}); }
       else invoke("send_input", { id, data: quoted + " " }).catch(() => {});
       showToast("Image pasted → " + path.split("/").pop());
     }).catch(() => {
-      showToast("No image on clipboard (text-only paste)");
+      if (text) term.paste(text);
     });
   }, true);
   term.onData((d) => {
