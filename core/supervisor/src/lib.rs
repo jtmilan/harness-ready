@@ -1329,7 +1329,19 @@ impl Supervisor {
         // failure degrades to "no MCP in the pane", never a failed spawn (AC-6).
         // Gated on `!is_worker` to mirror the inject_mcp_config gate above (PR #137 —
         // autonomous workers skip the sidecar).
-        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode | Harness::OpenCode) {
+        // Pi shares the `.mcp.json` project-root discovery with commandcode/opencode (the
+        // standard MCP project config format). UNVERIFIED: pi's MCP auto-discovery is not
+        // yet confirmed (the codebase says "ALL headless pi behavior is UNVERIFIED"). This
+        // injection is best-effort: if pi does not discover `.mcp.json`, the file is simply
+        // ignored and the pane runs without MCP (never a failed spawn, AC-6). If it DOES
+        // discover it, pi gains the queue + memory + task tools for free. TODO(live-verify):
+        // confirm pi reads `.mcp.json` at the project root before claiming this works.
+        if !spec.is_worker
+            && matches!(
+                spec.harness,
+                Harness::CommandCode | Harness::OpenCode | Harness::Pi
+            )
+        {
             if let Err(e) = inject_commandcode_mcp(
                 &spec.worktree,
                 hooks_dir,

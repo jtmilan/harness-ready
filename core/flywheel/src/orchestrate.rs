@@ -175,6 +175,14 @@ fn harness_capability(harness: &str) -> Option<&'static str> {
             "provider-agnostic coding agent (sst/opencode) with headless `run` and interactive \
              TUI. Use opencode for multi-provider implement/edit work.",
         ),
+        // Grok was silently missing here → the orchestrator had no description for Grok panes,
+        // so it could not intelligently delegate to them (they were invisible in the fan-out
+        // reasoning). Added to match the harness descriptor (Grok Build — xAI's coding TUI).
+        "grok" => Some(
+            "xAI Grok Build TUI agent with sandboxed workspace and MCP-driven tool surface; \
+             autonomous implement/edit work inside a --cwd-scoped project. Use grok for \
+             contained feature work where a sandboxed autonomous loop is wanted.",
+        ),
         _ => None,
     }
 }

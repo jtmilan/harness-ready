@@ -955,6 +955,40 @@ mod tests {
             oc.args.windows(2).any(|p| p[0] == "--dir" && p[1] == "/wt"),
             "opencode must pass --dir <worktree> so it stays inside the sandbox"
         );
+        // grok --cwd must carry the worktree cwd (same class as opencode --dir: grok's headless
+        // `agent` subcommand takes --cwd to scope its sandbox). UNVERIFIED headless, but the argv
+        // shape is the documented invocation; if grok ignores --cwd the failure is a contained
+        // escape (caught by the controller's non-committer guard), not a silent mis-dispatch.
+        let gk = worker_spawn(
+            Harness::Grok,
+            Some("grok-4"),
+            true,
+            &[],
+            std::path::Path::new("/wt-grok"),
+        );
+        assert!(
+            gk.args.windows(2).any(|p| p[0] == "--cwd" && p[1] == "/wt-grok"),
+            "grok must pass --cwd <worktree> so it stays inside the sandbox"
+        );
+        assert_eq!(
+            gk.args.first().map(String::as_str),
+            Some("agent"),
+            "grok headless subcommand is `agent`"
+        );
+        // pi: `-p` must be the FIRST arg (it is the headless-mode selector; the prompt follows
+        // as a trailing positional after --model). UNVERIFIED headless, but the documented shape.
+        let pi = worker_spawn(
+            Harness::Pi,
+            Some("anthropic/claude-sonnet-4"),
+            true,
+            &[],
+            std::path::Path::new("/wt-pi"),
+        );
+        assert_eq!(
+            pi.args.first().map(String::as_str),
+            Some("-p"),
+            "pi headless mode selector `-p` must be the first arg"
+        );
         // codex must NEVER carry `-a` (codex exec has no such flag → exit 2), in either mode.
         for wm in [true, false] {
             let c = worker_spawn(
