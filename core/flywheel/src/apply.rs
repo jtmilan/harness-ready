@@ -1579,7 +1579,7 @@ diff --git a/k b/k
             ("codex", "codex"),
             ("opencode", "opencode"),
             ("commandcode", "commandcode"),
-            ("cline", "cline"),
+            ("pi", "pi"),
             // unknown harness → claude fallback (preserves today's behavior, never a silent push path)
             ("totally-unknown", "claude"),
         ];

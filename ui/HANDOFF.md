@@ -1,7 +1,7 @@
 # Handoff Spec — Agent Supervisor (macOS rebuild)
 
 A local macOS desktop app for supervising interactive AI coding agents (Claude Code,
-Cursor, OpenCode, Codex, Grok, CommandCode, Cline, or bash for smoke tests), each
+Cursor, OpenCode, Codex, Grok, CommandCode, Pi, or bash for smoke tests), each
 isolated in its own **git worktree + PTY**, surfaced through one ranked
 **"who needs you right now"** queue.
 

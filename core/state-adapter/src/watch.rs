@@ -136,7 +136,7 @@ fn parse_latest_line(line: &str) -> Option<(Harness, AgentState)> {
         "codex" => Harness::Codex,
         "commandcode" => Harness::CommandCode,
         "opencode" => Harness::OpenCode,
-        "cline" => Harness::Cline,
+        "pi" => Harness::Pi,
         "grok" => Harness::Grok,
         _ => return None,
     };

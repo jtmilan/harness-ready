@@ -169,23 +169,19 @@ fn bridgeagent_bin() -> Option<PathBuf> {
 }
 
 /// The `{{BRIDGEAGENT}}` template fragment — a leading-comma JSON entry adding the `bridgeagent`
-/// server right after agent-teams, or `""` when BridgeAgent isn't installed (default-off). `nested`
-/// selects cline's transport-nested schema (`transport.{type,command,args}`); `false` is the flat
-/// claude/cursor/commandcode shape (`{command,args}`). PURE → unit-tested. Kept as string templating
-/// (not serde) so the SHIPPED lib stays std-only — the templates are placeholder-rendered, never
-/// JSON-parsed at runtime. `bridge mcp serve` is the stdio command (BridgeAgent's own client snippet).
-fn bridgeagent_fragment(nested: bool, bin: Option<&Path>) -> String {
+/// server right after agent-teams, or `""` when BridgeAgent isn't installed (default-off). Uses the
+/// flat claude/cursor/commandcode shape (`{command,args}`). PURE → unit-tested. Kept as string
+/// templating (not serde) so the SHIPPED lib stays std-only — the templates are placeholder-
+/// rendered, never JSON-parsed at runtime. `bridge mcp serve` is the stdio command
+/// (BridgeAgent's own client snippet).
+fn bridgeagent_fragment(bin: Option<&Path>) -> String {
     let Some(bin) = bin else { return String::new() };
     // Minimal JSON-string escaping of the path value (macOS paths rarely need it — be safe anyway).
     let cmd = bin
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    if nested {
-        format!(",\n      \"bridgeagent\": {{ \"transport\": {{ \"type\": \"stdio\", \"command\": \"{cmd}\", \"args\": [\"mcp\", \"serve\"] }} }}")
-    } else {
-        format!(",\n      \"bridgeagent\": {{ \"command\": \"{cmd}\", \"args\": [\"mcp\", \"serve\"] }}")
-    }
+    format!(",\n      \"bridgeagent\": {{ \"command\": \"{cmd}\", \"args\": [\"mcp\", \"serve\"] }}")
 }
 
 pub fn inject_mcp_config(
@@ -214,7 +210,7 @@ pub fn inject_mcp_config(
         // BridgeAgent isn't installed).
         .replace(
             "{{BRIDGEAGENT}}",
-            &bridgeagent_fragment(false, bridgeagent_bin().as_deref()),
+            &bridgeagent_fragment(bridgeagent_bin().as_deref()),
         );
 
     match write_target {
@@ -288,7 +284,8 @@ pub fn inject_cursor_role(
 /// Like cursor's `.cursor/mcp.json` it OVERWRITES + git-excludes: the worktree is
 /// disposable (`.agent-teams-worktrees/<id>`), so a repo's own committed `.mcp.json` is
 /// shadowed only inside this ephemeral pane, never the real checkout. Additive sibling
-/// to [`inject_mcp_config`] / [`inject_cursor_role`] — do NOT fold in. std-only.
+/// to [`inject_mcp_config`] / [`inject_cursor_role`] — do NOT fold in. std-only. Also
+/// used for OpenCode (same `.mcp.json` project-root discovery mechanism).
 pub fn inject_commandcode_mcp(
     repo_dir: &Path,
     templates_dir: &Path,
@@ -308,7 +305,7 @@ pub fn inject_commandcode_mcp(
         // Cross-agent comms: add BridgeAgent alongside agent-teams (flat schema; "" if not installed).
         .replace(
             "{{BRIDGEAGENT}}",
-            &bridgeagent_fragment(false, bridgeagent_bin().as_deref()),
+            &bridgeagent_fragment(bridgeagent_bin().as_deref()),
         );
 
     let out = repo_dir.join(REL);
@@ -321,116 +318,38 @@ pub fn inject_commandcode_mcp(
     Ok(out)
 }
 
-/// Inject the read-only agent-teams MCP sidecar into a **cline** pane. cline is STATE-BLIND
-/// (no hooks) but a first-class MCP CLIENT — like commandcode — so this gives it the queue +
-/// gated memory/task tools, NOT state reporting (it still never reports back to the queue).
+/// Inject the Agent Teams MCP sidecar into a GROK pane's project-scoped config.
+/// Grok reads `.grok/config.toml` at the project root (discovered by path, like
+/// cursor's `.cursor/mcp.json`). The template is TOML (not JSON) — grok's native
+/// config format. Same provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE).
 ///
-/// cline does NOT auto-discover a per-cwd `.mcp.json` (verified vs v3.0.31 — its resolver takes
-/// no workspace arg; the only MCP file is `<config-root>/data/settings/cline_mcp_settings.json`).
-/// So UNLIKE commandcode/cursor (project-scope file), cline needs a PER-PANE CONFIG ROOT passed
-/// via `cline --config <cline_home>` at spawn (the supervisor adds that flag). We materialize that
-/// root here: `<cline_home>/data/settings/cline_mcp_settings.json`.
-///
-/// `--config` relocates cline's ENTIRE `data/` tree, including `providers.json` (the OAuth token).
-/// An un-seeded root → the pane is `Unauthorized` with no useful UI. So we copy `providers.json`
-/// (+ `cli-notices.json` to suppress the first-run notice) from the user's real `~/.cline` on
-/// **every** spawn (overwrite → freshest live token; OAuth is short-lived ~1h and only refreshes
-/// in `~/.cline`). After seed we **verify** the per-pane `providers.json` exists and is non-empty;
-/// on failure we return a clear `Err` so the supervisor can fall back to plain `~/.cline` (no
-/// `--config`) instead of leaving a silent Unauthorized pane. std-only.
-///
-/// Schema is cline's **transport-nested** shape (`mcpServers.<n>.transport.{type,command,args}`),
-/// NOT the flat `{command,args}` of the commandcode/cursor templates — see `cline-mcp.tmpl.json`.
-/// SAME provenance env block (STATE_DIR/PANE_ID/REPO_KEY/TASK_SCOPE).
-pub fn inject_cline_mcp(
-    cline_home: &Path, // per-pane config ROOT (a state SIBLING — survives the state_root wipe)
-    user_cline_home: &Path, // the user's real ~/.cline (source of providers.json / cli-notices.json)
+/// OVERWRITES + git-excludes: the worktree is disposable, so a repo's own committed
+/// `.grok/config.toml` is shadowed only inside this ephemeral pane. Additive sibling
+/// to [`inject_commandcode_mcp`] / [`inject_mcp_config`] — do NOT fold in. std-only.
+pub fn inject_grok_mcp(
+    repo_dir: &Path,
     templates_dir: &Path,
     sidecar_bin: &Path,
     state_root: &Path,
     pane_id: &str,
     repo_key: &str,
 ) -> io::Result<PathBuf> {
-    // cline appends `data/settings` to whatever `--config` is given (verified) → mirror it here.
-    let settings_dir = cline_home.join("data").join("settings");
-    fs::create_dir_all(&settings_dir)?;
-
-    // Seed auth + first-run state from the user's real ~/.cline FIRST (before MCP write) so a
-    // failed seed never leaves a --config root that would open Unauthorized. Always overwrite
-    // so a re-spawn picks up the freshest token from the live ~/.cline file.
-    let user_settings = user_cline_home.join("data").join("settings");
-    for name in ["providers.json", "cli-notices.json"] {
-        let src = user_settings.join(name);
-        if src.is_file() {
-            fs::copy(&src, settings_dir.join(name)).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "cline auth seed: copy of {name} from {} failed: {e}",
-                        src.display()
-                    ),
-                )
-            })?;
-        }
-    }
-
-    // Hard gate: per-pane providers.json must exist and be non-empty. A missing/empty seed is
-    // the Unauthorized footgun — return Err with a clear message (supervisor surfaces it and
-    // falls back to no --config / plain ~/.cline).
-    let providers_dst = settings_dir.join("providers.json");
-    let providers_src = user_settings.join("providers.json");
-    match fs::metadata(&providers_dst) {
-        Ok(meta) if meta.len() > 0 => {}
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "cline auth seed: providers.json is empty at {} (source {}); \
-                     cannot use --config root (would be Unauthorized)",
-                    providers_dst.display(),
-                    providers_src.display()
-                ),
-            ));
-        }
-        Err(_) if !providers_src.is_file() => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "cline auth seed: {} missing; cannot seed per-pane auth \
-                     (would be Unauthorized under --config)",
-                    providers_src.display()
-                ),
-            ));
-        }
-        Err(e) => {
-            return Err(io::Error::new(
-                e.kind(),
-                format!(
-                    "cline auth seed: providers.json missing at {} after copy from {}: {e}",
-                    providers_dst.display(),
-                    providers_src.display()
-                ),
-            ));
-        }
-    }
-
-    let tmpl = fs::read_to_string(templates_dir.join("cline-mcp.tmpl.json"))?;
+    const REL: &str = ".grok/config.toml";
+    let tmpl = fs::read_to_string(templates_dir.join("grok-mcp.tmpl.toml"))?;
     let rendered = tmpl
         .replace("{{SIDECAR}}", &sidecar_bin.to_string_lossy())
         .replace("{{STATE_DIR}}", &state_root.to_string_lossy())
         .replace("{{PANE_ID}}", pane_id)
         .replace("{{REPO_KEY}}", repo_key)
-        .replace("{{TASK_SCOPE}}", pane_id) // own-task transition scope = pane id (mirrors commandcode)
-        // Cross-agent comms: add BridgeAgent alongside agent-teams in cline's TRANSPORT-NESTED schema
-        // ("" if not installed).
-        .replace(
-            "{{BRIDGEAGENT}}",
-            &bridgeagent_fragment(true, bridgeagent_bin().as_deref()),
-        );
+        .replace("{{TASK_SCOPE}}", pane_id);
 
-    let out = settings_dir.join("cline_mcp_settings.json");
-    fs::write(&out, rendered)?;
-    // No git-exclude: the config root lives OUTSIDE the worktree (a state sibling), not in the repo.
+    let out = repo_dir.join(REL);
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_config_guarded(repo_dir, &out, &rendered)?;
+    // keep `git status` clean — generated tooling, not project source (idempotent)
+    exclude_from_git(repo_dir, REL)?;
     Ok(out)
 }
 
@@ -869,138 +788,6 @@ mod mcp_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // cline: per-pane config ROOT at `<home>/data/settings/cline_mcp_settings.json` with the
-    // transport-NESTED schema (NOT the flat commandcode shape), the SAME provenance env block, and
-    // a SEEDED `providers.json` copied from the user's ~/.cline (else a --config root is Unauthorized).
-    #[test]
-    fn cline_config_is_transport_nested_in_per_pane_root_and_auth_is_seeded() {
-        let root = scratch("cline");
-        let cline_home = root.join("cline-homes/ws-cl-p0"); // a state sibling, NOT a worktree
-        let user_home = root.join("user-dot-cline"); // fake ~/.cline
-        let staged = root.join("staged-hooks");
-        let state = root.join("app-state");
-        fs::create_dir_all(&staged).unwrap();
-        // seed a fake user ~/.cline/data/settings with an auth token + first-run notice
-        let user_settings = user_home.join("data/settings");
-        fs::create_dir_all(&user_settings).unwrap();
-        fs::write(user_settings.join("providers.json"), r#"{"token":"abc"}"#).unwrap();
-        fs::write(user_settings.join("cli-notices.json"), "{}").unwrap();
-        fs::copy(
-            templates_dir().join("cline-mcp.tmpl.json"),
-            staged.join("cline-mcp.tmpl.json"),
-        )
-        .unwrap();
-
-        let sidecar = PathBuf::from("/abs/path/to/agent-teams-mcp");
-        let written = inject_cline_mcp(
-            &cline_home,
-            &user_home,
-            &staged,
-            &sidecar,
-            &state,
-            "ws-cl-p0",
-            "ws-cl",
-        )
-        .expect("inject cline");
-
-        // cline appends data/settings to the --config root
-        assert_eq!(
-            written,
-            cline_home.join("data/settings/cline_mcp_settings.json")
-        );
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&written).unwrap()).expect("parseable JSON");
-        let srv = &v["mcpServers"]["agent-teams"];
-        // TRANSPORT-NESTED (cline v3) — command lives inside transport, NOT at the entry top level
-        assert_eq!(srv["transport"]["type"], "stdio");
-        assert_eq!(srv["transport"]["command"], "/abs/path/to/agent-teams-mcp");
-        assert!(srv["transport"]["args"].is_array());
-        assert!(
-            srv.get("command").is_none(),
-            "command must be nested under transport, not top-level"
-        );
-        // same provenance env block as the other harnesses
-        assert_eq!(
-            srv["env"]["AGENT_TEAMS_STATE_DIR"],
-            state.to_string_lossy().as_ref()
-        );
-        assert_eq!(srv["env"]["AGENT_TEAMS_PANE_ID"], "ws-cl-p0");
-        assert_eq!(srv["env"]["AGENT_TEAMS_MEMORY_REPO_KEY"], "ws-cl");
-        assert_eq!(srv["env"]["AGENT_TEAMS_TASK_SCOPE"], "ws-cl-p0");
-        // auth + first-run state seeded into the per-pane root (else --config root is Unauthorized)
-        assert_eq!(
-            fs::read_to_string(cline_home.join("data/settings/providers.json")).unwrap(),
-            r#"{"token":"abc"}"#
-        );
-        assert!(cline_home.join("data/settings/cli-notices.json").is_file());
-
-        // Re-seed overwrites with the freshest user token (stale per-pane copy must not stick).
-        fs::write(user_settings.join("providers.json"), r#"{"token":"fresh"}"#).unwrap();
-        inject_cline_mcp(
-            &cline_home,
-            &user_home,
-            &staged,
-            &sidecar,
-            &state,
-            "ws-cl-p0",
-            "ws-cl",
-        )
-        .expect("re-seed");
-        assert_eq!(
-            fs::read_to_string(cline_home.join("data/settings/providers.json")).unwrap(),
-            r#"{"token":"fresh"}"#
-        );
-
-        // Hard gate: MISSING user providers.json must FAIL inject (clear Err) so the supervisor
-        // can fall back to no --config instead of a silent Unauthorized pane.
-        let empty_user = root.join("empty-user");
-        let err = inject_cline_mcp(
-            &root.join("cline-homes/ws-cl-p1"),
-            &empty_user,
-            &staged,
-            &sidecar,
-            &state,
-            "ws-cl-p1",
-            "ws-cl",
-        )
-        .expect_err("inject cline must fail without a seedable providers.json");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("auth seed") || msg.contains("providers.json"),
-            "error must name the auth-seed failure: {msg}"
-        );
-        // MCP settings must NOT be written when auth seed fails (failed early, before template write).
-        assert!(
-            !root
-                .join("cline-homes/ws-cl-p1/data/settings/cline_mcp_settings.json")
-                .exists(),
-            "must not write MCP settings after a failed auth seed"
-        );
-
-        // Empty providers.json source also fails the hard gate.
-        let empty_token_user = root.join("empty-token-user");
-        let empty_token_settings = empty_token_user.join("data/settings");
-        fs::create_dir_all(&empty_token_settings).unwrap();
-        fs::write(empty_token_settings.join("providers.json"), "").unwrap();
-        let err_empty = inject_cline_mcp(
-            &root.join("cline-homes/ws-cl-p2"),
-            &empty_token_user,
-            &staged,
-            &sidecar,
-            &state,
-            "ws-cl-p2",
-            "ws-cl",
-        )
-        .expect_err("empty providers.json must fail inject");
-        assert!(
-            err_empty.to_string().contains("empty")
-                || err_empty.to_string().contains("providers.json"),
-            "error must mention empty/providers: {err_empty}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
     // BridgeAgent cross-agent comms: the fragment is "" without BridgeAgent (default-off), and the
     // RENDERED real templates (agent-teams + bridgeagent) stay VALID JSON with the correct per-schema
     // shape — the comma placement is the risky part, so parse the actual templates end-to-end.
@@ -1010,19 +797,14 @@ mod mcp_tests {
 
         // default-off: no bin → empty fragment → template renders with ONLY agent-teams, valid JSON.
         assert_eq!(
-            bridgeagent_fragment(false, None),
+            bridgeagent_fragment(None),
             "",
             "no bin → empty fragment"
-        );
-        assert_eq!(
-            bridgeagent_fragment(true, None),
-            "",
-            "no bin → empty fragment (nested)"
         );
 
         // helper: render a real template's placeholders + the bridgeagent fragment.
         let render =
-            |name: &str, nested: bool, bin: Option<&std::path::Path>| -> serde_json::Value {
+            |name: &str, bin: Option<&std::path::Path>| -> serde_json::Value {
                 let tmpl = fs::read_to_string(templates_dir().join(name)).unwrap();
                 let s = tmpl
                     .replace("{{SIDECAR}}", "/sc")
@@ -1030,7 +812,7 @@ mod mcp_tests {
                     .replace("{{PANE_ID}}", "p0")
                     .replace("{{REPO_KEY}}", "rk")
                     .replace("{{TASK_SCOPE}}", "p0")
-                    .replace("{{BRIDGEAGENT}}", &bridgeagent_fragment(nested, bin));
+                    .replace("{{BRIDGEAGENT}}", &bridgeagent_fragment(bin));
                 serde_json::from_str(&s)
                     .unwrap_or_else(|e| panic!("{name} not valid JSON: {e}\n{s}"))
             };
@@ -1042,7 +824,7 @@ mod mcp_tests {
             "commandcode-mcp.tmpl.json",
         ] {
             // no bin → only agent-teams, still valid JSON.
-            let off = render(name, false, None);
+            let off = render(name, None);
             assert!(
                 off["mcpServers"]["agent-teams"].is_object(),
                 "{name}: agent-teams present"
@@ -1052,7 +834,7 @@ mod mcp_tests {
                 "{name}: no bridgeagent when absent"
             );
             // with bin → both servers, agent-teams untouched.
-            let on = render(name, false, Some(bridge));
+            let on = render(name, Some(bridge));
             assert!(
                 on["mcpServers"]["agent-teams"].is_object(),
                 "{name}: agent-teams preserved"
@@ -1069,29 +851,5 @@ mod mcp_tests {
                 "{name}: flat schema, no transport"
             );
         }
-
-        // cline: transport-nested bridgeagent, agent-teams preserved.
-        let on = render("cline-mcp.tmpl.json", true, Some(bridge));
-        assert!(
-            on["mcpServers"]["agent-teams"]["transport"].is_object(),
-            "cline agent-teams preserved"
-        );
-        let ban = &on["mcpServers"]["bridgeagent"];
-        assert_eq!(ban["transport"]["type"], "stdio");
-        assert_eq!(
-            ban["transport"]["command"],
-            "/Users/x/.bridgeagent/bin/bridge"
-        );
-        assert_eq!(ban["transport"]["args"][1], "serve");
-        assert!(
-            ban.get("command").is_none(),
-            "cline nests command under transport"
-        );
-        // cline default-off still valid JSON.
-        let cloff = render("cline-mcp.tmpl.json", true, None);
-        assert!(
-            cloff["mcpServers"]["bridgeagent"].is_null(),
-            "cline: no bridgeagent when absent"
-        );
     }
 }

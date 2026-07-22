@@ -24,6 +24,9 @@ export function coerceTemplateAgents(agents) {
     let role = typeof a.role === "string" ? a.role : "";
     if (!kind) {
       kind = DEFAULT_TEMPLATE_KIND;
+    } else if (kind === "cline") {
+      // Migration: Cline harness was replaced by Pi (pi.dev).
+      kind = "pi";
     } else if (!KIND_SET.has(kind)) {
       // Persona mistaken for harness: keep the label as role when role is empty.
       if (!role.trim()) role = kind;

@@ -8,9 +8,9 @@
 // owns the rendering; this owns the decision so it can be unit-tested.
 //
 // Keep this set in sync with the backend harness descriptors' inject policy: codex /
-// commandcode / opencode / cline are inject:None (state-blind); claude / cursor / gemini
+// commandcode / opencode / pi are inject:None (state-blind); claude / cursor / gemini
 // report state and are NOT listed here.
-export const STATE_BLIND = new Set(["codex", "commandcode", "opencode", "cline"]);
+export const STATE_BLIND = new Set(["codex", "commandcode", "opencode", "pi"]);
 
 export const STATE_BLIND_BADGE_LABEL = "status not reported";
 

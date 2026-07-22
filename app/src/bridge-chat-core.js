@@ -7,7 +7,7 @@
 // consecutive same-phase turn ("thinking…" semantics), and pane updates fold into
 // ONE live status turn while it stays last in the timeline.
 
-export const KNOWN_HARNESSES = ["claude", "codex", "cursor", "opencode", "commandcode", "cline", "grok"];
+export const KNOWN_HARNESSES = ["claude", "codex", "cursor", "opencode", "commandcode", "pi", "grok"];
 
 const TURN_CAP = 200;
 // In-flight phases that render as a transient agent status line.

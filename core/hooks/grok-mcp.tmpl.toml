@@ -1,0 +1,13 @@
+# Agent Teams — per-pane MCP sidecar for Grok Build (project-scoped).
+# Rendered by inject_grok_mcp; written to <worktree>/.grok/config.toml.
+# Grok discovers this file by path (project scope); no CLI flag needed.
+[mcp_servers.agent-teams]
+command = "{{SIDECAR}}"
+args = []
+enabled = true
+
+[mcp_servers.agent-teams.env]
+AGENT_TEAMS_STATE_DIR = "{{STATE_DIR}}"
+AGENT_TEAMS_PANE_ID = "{{PANE_ID}}"
+AGENT_TEAMS_MEMORY_REPO_KEY = "{{REPO_KEY}}"
+AGENT_TEAMS_TASK_SCOPE = "{{TASK_SCOPE}}"

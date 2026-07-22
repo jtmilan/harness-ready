@@ -30,14 +30,19 @@
 //!    transcript filename — cwd/encoding-independent, so a pane launched at cwd `/`
 //!    whose project dir slugs to a bare `-` is still found; C1), then falling back to
 //!    the encoded-worktree-dir suffix match when no session id was recorded.
-//! 3. **live scrollback** (gap-7, `phase-b-mutations` builds only) — when every disk
+//! 3. **cursor transcript** `~/.cursor/projects/*<id>/agent-transcripts/...` — same
+//!    id-suffix worktree match as claude's fallback.
+//! 4. **grok transcript** `~/.grok/sessions/<url-encoded-cwd>/<session>/chat_history.jsonl`
+//!    — clean on-disk chat history (JSONL `{type,content}`); without this reader the
+//!    tool fell through to live scrollback (raw ANSI TUI frames) or none.
+//! 5. **live scrollback** (gap-7, `phase-b-mutations` builds only) — when every disk
 //!    source misses but the live registry says the pane EXISTS, dial the running app's
 //!    socket (`SocketRequest::ReadOutput`) for a tail of the pane's IN-MEMORY PTY
 //!    scrollback. This is what makes state-blind harnesses (commandcode/codex/opencode/
-//!    cline — no on-disk transcript at all) readable. UNVERIFIED live data (may be
+//!    pi — no on-disk transcript at all) readable. UNVERIFIED live data (may be
 //!    mid-stream); app-down / gate-off / any error falls through honestly. Base
 //!    (read-only) builds compile the disk-only behavior — no socket dial exists.
-//! 4. **honest "none"** — nothing on disk AND no live read possible; say so rather
+//! 6. **honest "none"** — nothing on disk AND no live read possible; say so rather
 //!    than fabricate (noting when a live read was attempted).
 
 use std::fs;
@@ -75,8 +80,8 @@ pub struct PaneOutputResult {
     /// The pane's harness from the live registry (`claude`/`cursor`/…), if known.
     pub harness: Option<String>,
     /// Where the content came from: `orchestrate_report` | `claude_transcript` |
-    /// `cursor_transcript` | `live_scrollback` (a live in-memory tail from the running
-    /// app — unverified, may be mid-stream) | `none`.
+    /// `cursor_transcript` | `grok_transcript` | `live_scrollback` (a live in-memory
+    /// tail from the running app — unverified, may be mid-stream) | `none`.
     pub source: String,
     /// Absolute path of the artifact read, if any.
     pub path: Option<String>,
@@ -146,33 +151,46 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     //        (~/.cursor/projects/*<id>/agent-transcripts). Tried regardless of the registry's
     //        harness label (robust to a missing/mislabeled harness); each returns None when
     //        absent (so this degrades gracefully when no session id was recorded).
+    //    2c) grok session transcript — `~/.grok/sessions/<url-encoded-cwd>/<session>/
+    //        chat_history.jsonl` via registry repo → worktree cwd candidates, then
+    //        active_sessions.json, then encoded-dir suffix match on the pane id.
     let transcript = session_id
         .as_deref()
         .filter(|s| validate_session_id(s))
         .and_then(newest_claude_transcript_by_session)
         .map(|t| ("claude_transcript", t))
         .or_else(|| newest_claude_transcript(id).map(|t| ("claude_transcript", t)))
-        .or_else(|| newest_cursor_transcript(id).map(|t| ("cursor_transcript", t)));
+        .or_else(|| newest_cursor_transcript(id).map(|t| ("cursor_transcript", t)))
+        .or_else(|| newest_grok_transcript(id, repo.as_deref()).map(|t| ("grok_transcript", t)));
     if let Some((source, (path, body))) = transcript {
-        let text = extract_transcript_text(&body);
-        let (content, truncated) = tail_to(&text, cap);
-        audit_read(state_dir, id, content.len(), source);
-        return PaneOutputResult {
-            id: id.to_string(),
-            harness,
-            source: source.into(),
-            path: Some(path),
-            content: Some(content),
-            truncated,
-            note: None,
+        let text = if source == "grok_transcript" {
+            // Grok JSONL uses top-level `type`/`content` (not claude/cursor's
+            // message.content[]). Prefer the last non-empty assistant message.
+            extract_grok_last_assistant(&body).unwrap_or_default()
+        } else {
+            extract_transcript_text(&body)
         };
+        // Empty extract → fall through to live/none rather than return empty "success".
+        if !text.trim().is_empty() {
+            let (content, truncated) = tail_to(&text, cap);
+            audit_read(state_dir, id, content.len(), source);
+            return PaneOutputResult {
+                id: id.to_string(),
+                harness,
+                source: source.into(),
+                path: Some(path),
+                content: Some(content),
+                truncated,
+                note: None,
+            };
+        }
     }
 
     // 3) LIVE SCROLLBACK (gap-7, phase-b builds only): every disk source missed, but the
     //    live registry says the pane EXISTS — ask the RUNNING app for a tail of the
     //    pane's IN-MEMORY PTY scrollback over the socket (`SocketRequest::ReadOutput`,
     //    admitted app-side by the coordinator/external-orchestrator gate). This is what
-    //    makes state-blind harnesses (commandcode/codex/opencode/cline) readable at all.
+    //    makes state-blind harnesses (commandcode/codex/opencode/pi) readable at all.
     //    Any failure (app down / gate off / no buffer) falls through to the honest
     //    "none" with a note that the live read was attempted. The base (read-only)
     //    build compiles NONE of this — disk-only behavior, byte-for-byte.
@@ -248,6 +266,9 @@ fn live_scrollback_via_socket(state_dir: &Path, id: &str, cap: usize) -> Option<
     let req = SocketRequest::ReadOutput {
         id: id.to_string(),
         max_bytes: Some(cap as u64),
+        // Always request clean text — programmatic consumers of live_scrollback
+        // should not have to strip CSI/OSC/TUI frames client-side.
+        strip_ansi: Some(true),
     };
     let resp = crate::phase_b::dial_selected(&sock, state_dir, &req, true).ok()?;
     if !resp.ok {
@@ -441,6 +462,230 @@ fn newest_cursor_transcript(id: &str) -> Option<(String, String)> {
     Some((path.to_string_lossy().into_owned(), body))
 }
 
+/// Percent-encode a filesystem path the way grok keys `~/.grok/sessions/<encoded-cwd>/`.
+/// Unreserved bytes (`A-Z a-z 0-9 - . _ ~`) pass through; everything else (including `/`)
+/// becomes `%XX` (uppercase hex). Matches Python `urllib.parse.quote(path, safe='')` so
+/// `/Users/foo/bar` → `%2FUsers%2Ffoo%2Fbar` and `.` stays `.`.
+fn grok_encode_cwd(cwd: &str) -> String {
+    let mut out = String::with_capacity(cwd.len().saturating_mul(3));
+    for &b in cwd.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                // Uppercase hex — matches urllib / encodeURIComponent.
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Locate the newest grok `chat_history.jsonl` for a pane under `~/.grok/sessions/`.
+/// See [`newest_grok_transcript_in`] for the resolution strategy (testable core).
+fn newest_grok_transcript(id: &str, repo: Option<&str>) -> Option<(String, String)> {
+    let home = std::env::var_os("HOME")?;
+    let home = Path::new(&home);
+    let sessions_root = home.join(".grok").join("sessions");
+    let active = home.join(".grok").join("active_sessions.json");
+    newest_grok_transcript_in(&sessions_root, Some(&active), id, repo)
+}
+
+/// Testable core of [`newest_grok_transcript`]. Resolves the grok session cwd dir, then
+/// the newest session subdir's `chat_history.jsonl`.
+///
+/// Resolution order for the session-cwd directory under `sessions_root`:
+/// 1. **Registry-derived cwd candidates** (when `repo` is known):
+///    - `{repo}/.agent-teams-worktrees/{id}` — the standard agent-teams worktree cwd
+///    - `{repo}` itself — bare-folder fallback (no worktree)
+/// 2. **`active_sessions.json`** entries whose `cwd` ends with the pane id (or equals a
+///    registry-derived candidate) — live sessions map `session_id → cwd`.
+/// 3. **Suffix match** on `sessions_root/*` dir names that end with the pane id (the
+///    URL-encoded path keeps `[A-Za-z0-9_-]` ids as a literal suffix, same idea as
+///    claude/cursor id-suffix locators).
+///
+/// Within a cwd dir, prefer an `active_sessions.json` `session_id` subdir when present;
+/// otherwise pick the newest `chat_history.jsonl` by mtime across session subdirs.
+fn newest_grok_transcript_in(
+    sessions_root: &Path,
+    active_sessions_path: Option<&Path>,
+    id: &str,
+    repo: Option<&str>,
+) -> Option<(String, String)> {
+    let active_entries = active_sessions_path
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+        .unwrap_or_default();
+
+    // Cwd candidates (absolute paths as strings) in preference order.
+    let mut cwd_candidates: Vec<String> = Vec::new();
+    if let Some(r) = repo {
+        let wt = Path::new(r)
+            .join(".agent-teams-worktrees")
+            .join(id)
+            .to_string_lossy()
+            .into_owned();
+        cwd_candidates.push(wt);
+        cwd_candidates.push(r.to_string());
+    }
+    for entry in &active_entries {
+        let cwd = entry.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        if cwd.is_empty() {
+            continue;
+        }
+        // Match when the live session's cwd is this pane's worktree (ends with /{id}
+        // or equals a candidate we already have).
+        let is_pane = cwd.ends_with(id)
+            || cwd_candidates.iter().any(|c| c == cwd);
+        if is_pane && !cwd_candidates.iter().any(|c| c == cwd) {
+            cwd_candidates.push(cwd.to_string());
+        }
+    }
+
+    // Prefer session_id from active_sessions for a matched cwd (live session wins over
+    // stale mtime peers under the same encoded-cwd dir).
+    let preferred_session_for = |cwd: &str| -> Option<&str> {
+        active_entries.iter().find_map(|e| {
+            let e_cwd = e.get("cwd").and_then(|c| c.as_str())?;
+            if e_cwd == cwd {
+                e.get("session_id").and_then(|s| s.as_str())
+            } else {
+                None
+            }
+        })
+    };
+
+    // Try registry/active cwd candidates first (exact encoded path).
+    for cwd in &cwd_candidates {
+        let dir = sessions_root.join(grok_encode_cwd(cwd));
+        if let Some(found) = newest_chat_history_in_cwd_dir(&dir, preferred_session_for(cwd)) {
+            return Some(found);
+        }
+    }
+
+    // Suffix match: encoded session-cwd dirs end with the pane id (unreserved charset).
+    let entries = fs::read_dir(sessions_root).ok()?;
+    let mut best_cwd_dir: Option<(PathBuf, SystemTime)> = None;
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(id) {
+            continue;
+        }
+        let md = match ent.metadata() {
+            Ok(m) if m.is_dir() => m,
+            _ => continue,
+        };
+        let mt = md.modified().unwrap_or(UNIX_EPOCH);
+        if best_cwd_dir.as_ref().is_none_or(|(_, bt)| mt > *bt) {
+            best_cwd_dir = Some((ent.path(), mt));
+        }
+    }
+    if let Some((dir, _)) = best_cwd_dir {
+        // No preferred session_id without an exact cwd match; newest by mtime.
+        if let Some(found) = newest_chat_history_in_cwd_dir(&dir, None) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Within one `~/.grok/sessions/<encoded-cwd>/` dir, pick a session subdir's
+/// `chat_history.jsonl`. Prefer `preferred_session_id` when that subdir exists and has a
+/// non-empty history; otherwise the newest non-empty `chat_history.jsonl` by mtime.
+fn newest_chat_history_in_cwd_dir(
+    cwd_dir: &Path,
+    preferred_session_id: Option<&str>,
+) -> Option<(String, String)> {
+    if let Some(sid) = preferred_session_id {
+        // session_id is registry/active_sessions-sourced (UUID-shaped), used only as a
+        // single path component — never caller-supplied via team_read_output args.
+        if !sid.is_empty() && !sid.contains('/') && !sid.contains('\\') && !sid.contains("..") {
+            let candidate = cwd_dir.join(sid).join("chat_history.jsonl");
+            if let Ok(body) = fs::read_to_string(&candidate) {
+                if !body.is_empty() {
+                    return Some((candidate.to_string_lossy().into_owned(), body));
+                }
+            }
+        }
+    }
+
+    let sessions = fs::read_dir(cwd_dir).ok()?;
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    for ent in sessions.flatten() {
+        let history = ent.path().join("chat_history.jsonl");
+        if let Ok(md) = fs::metadata(&history) {
+            if md.is_file() && md.len() > 0 {
+                let mt = md.modified().unwrap_or(UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(_, bt)| mt > *bt) {
+                    best = Some((history, mt));
+                }
+            }
+        }
+    }
+    let (path, _) = best?;
+    let body = fs::read_to_string(&path).ok()?;
+    Some((path.to_string_lossy().into_owned(), body))
+}
+
+/// Extract the last non-empty assistant message text from a grok `chat_history.jsonl`.
+/// Grok lines use top-level `type` (or `role`) + `content` where content is a string or
+/// an array of `{type:"text", text}` blocks. Tool-call-only assistant turns often have
+/// empty `content` — those are skipped so the caller gets the latest real response.
+/// Returns `None` when no assistant text exists.
+fn extract_grok_last_assistant(jsonl: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in jsonl.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let role = v
+            .get("role")
+            .or_else(|| v.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if role != "assistant" {
+            continue;
+        }
+        let text = grok_message_text(&v);
+        if !text.trim().is_empty() {
+            last = Some(text);
+        }
+    }
+    last
+}
+
+/// Pull readable text out of one grok JSONL message value's `content` field.
+fn grok_message_text(v: &serde_json::Value) -> String {
+    match v.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|b| {
+                // Prefer explicit text blocks; also accept bare strings in the array.
+                if let Some(s) = b.as_str() {
+                    return Some(s.to_string());
+                }
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    return b
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string);
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// Render a harness transcript JSONL (claude OR cursor) into readable `[role] text`
 /// lines, keeping only user/assistant text blocks (drops tool-call/result noise). Both
 /// stores share the `{role-or-type, message.content[]}` shape — claude carries the role in
@@ -528,6 +773,16 @@ fn audit_read(state_dir: &Path, id: &str, bytes: usize, source: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that temporarily rewrite `$HOME` so parallel cargo test
+    /// workers cannot clobber each other's environment.
+    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn unique_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -734,8 +989,15 @@ mod tests {
                 }
                 let req: SocketRequest = serde_json::from_str(line.trim_end()).unwrap();
                 assert!(
-                    matches!(&req, SocketRequest::ReadOutput { id: rid, max_bytes: Some(_) } if rid == "ws9-p3"),
-                    "app must receive ReadOutput for the pane: {req:?}"
+                    matches!(
+                        &req,
+                        SocketRequest::ReadOutput {
+                            id: rid,
+                            max_bytes: Some(_),
+                            strip_ansi: Some(true),
+                        } if rid == "ws9-p3"
+                    ),
+                    "app must receive ReadOutput for the pane (with strip_ansi): {req:?}"
                 );
                 let mut out = serde_json::to_string(
                     &SocketResponse::ok("live scrollback tail").with_data(SocketData::Output {
@@ -838,6 +1100,268 @@ mod tests {
             note.contains("team_orchestrate"),
             "tells the brain what to do: {note}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grok_encode_cwd_percent_encodes_slashes_keeps_dots() {
+        assert_eq!(
+            grok_encode_cwd("/Users/foo/bar"),
+            "%2FUsers%2Ffoo%2Fbar",
+            "slash → %2F (uppercase hex)"
+        );
+        assert_eq!(
+            grok_encode_cwd("/Users/foo/bar.baz"),
+            "%2FUsers%2Ffoo%2Fbar.baz",
+            "dot stays unencoded"
+        );
+        assert_eq!(
+            grok_encode_cwd("/tmp/a b"),
+            "%2Ftmp%2Fa%20b",
+            "space → %20"
+        );
+        // Worktree-shaped path used by agent-teams panes.
+        let wt = "/Users/jeffrymilan/repo/.agent-teams-worktrees/ws9-p3";
+        assert_eq!(
+            grok_encode_cwd(wt),
+            "%2FUsers%2Fjeffrymilan%2Frepo%2F.agent-teams-worktrees%2Fws9-p3"
+        );
+    }
+
+    #[test]
+    fn extract_grok_last_assistant_skips_empty_tool_turns() {
+        let jsonl = [
+            r#"{"type":"system","content":"You are Grok"}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"do the work"}]}"#,
+            // tool-call-only assistant turn — empty content, must NOT win
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write"}]}"#,
+            r#"{"type":"tool_result","content":"ok"}"#,
+            // last non-empty assistant = the pane's real response
+            r#"{"type":"assistant","content":"**Report written:** reports/out.md\n\nDone.","model_id":"grok-4.5"}"#,
+            // trailing empty assistant (e.g. final tool call) must not clobber
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"update_goal"}]}"#,
+            "not json",
+        ]
+        .join("\n");
+        let out = extract_grok_last_assistant(&jsonl).expect("finds last non-empty assistant");
+        assert!(
+            out.contains("Report written"),
+            "returns the last non-empty assistant body: {out}"
+        );
+        assert!(!out.is_empty());
+
+        // role-shaped lines also accepted (defensive — real grok uses `type`)
+        let role_shape = r#"{"role":"assistant","content":"via role field"}"#;
+        assert_eq!(
+            extract_grok_last_assistant(role_shape).as_deref(),
+            Some("via role field")
+        );
+
+        // array content blocks
+        let arr = r#"{"type":"assistant","content":[{"type":"text","text":"block a"},{"type":"text","text":"block b"}]}"#;
+        let joined = extract_grok_last_assistant(arr).unwrap();
+        assert!(joined.contains("block a") && joined.contains("block b"));
+
+        // no assistant text at all
+        assert!(extract_grok_last_assistant(r#"{"type":"user","content":"hi"}"#).is_none());
+    }
+
+    #[test]
+    fn newest_grok_transcript_resolves_via_repo_worktree_encoding() {
+        let root = unique_root("grok-repo");
+        let sessions = root.join("sessions");
+        let id = "ws9-p3";
+        let repo = "/tmp/fake-repo-for-grok";
+        let wt = format!("{repo}/.agent-teams-worktrees/{id}");
+        let session = "019f87a9-4cd3-7ba0-8eeb-25e3259b0d6b";
+        let hist_dir = sessions
+            .join(grok_encode_cwd(&wt))
+            .join(session);
+        fs::create_dir_all(&hist_dir).unwrap();
+        fs::write(
+            hist_dir.join("chat_history.jsonl"),
+            [
+                r#"{"type":"user","content":"ship it"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"name":"write"}]}"#,
+                r#"{"type":"assistant","content":"GROK PANE OUTPUT from worktree cwd"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let found = newest_grok_transcript_in(&sessions, None, id, Some(repo))
+            .expect("locates chat_history via repo→worktree encoding");
+        assert!(
+            found.0.ends_with("chat_history.jsonl"),
+            "path is the history file: {}",
+            found.0
+        );
+        assert!(found.1.contains("GROK PANE OUTPUT"));
+        let text = extract_grok_last_assistant(&found.1).unwrap();
+        assert_eq!(text, "GROK PANE OUTPUT from worktree cwd");
+
+        // Unknown pane id → None
+        assert!(newest_grok_transcript_in(&sessions, None, "ws9-p99", Some(repo)).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn newest_grok_transcript_prefers_active_session_id_and_suffix_match() {
+        let root = unique_root("grok-active");
+        let sessions = root.join("sessions");
+        let id = "ws9-p4";
+        // No repo provided — must find via suffix match on the encoded cwd dir name.
+        let cwd = format!("/Users/test/.agent-teams-worktrees/{id}");
+        let old_sid = "00000000-0000-0000-0000-000000000001";
+        let live_sid = "00000000-0000-0000-0000-000000000099";
+        let enc = grok_encode_cwd(&cwd);
+        let old_dir = sessions.join(&enc).join(old_sid);
+        let live_dir = sessions.join(&enc).join(live_sid);
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::write(
+            old_dir.join("chat_history.jsonl"),
+            r#"{"type":"assistant","content":"OLD session"}"#,
+        )
+        .unwrap();
+        // Ensure live is newer by writing second + active_sessions preference.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fs::write(
+            live_dir.join("chat_history.jsonl"),
+            r#"{"type":"assistant","content":"LIVE session response"}"#,
+        )
+        .unwrap();
+
+        let active_path = root.join("active_sessions.json");
+        fs::write(
+            &active_path,
+            serde_json::json!([
+                { "session_id": live_sid, "pid": 1, "cwd": cwd, "opened_at": "2026-07-22T00:00:00Z" }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        // Via active_sessions + suffix (no repo): preferred session_id wins.
+        let found = newest_grok_transcript_in(&sessions, Some(&active_path), id, None)
+            .expect("suffix + active_sessions finds the session");
+        assert!(
+            found.0.contains(live_sid),
+            "prefers active session_id path: {}",
+            found.0
+        );
+        assert!(found.1.contains("LIVE session response"));
+
+        // Suffix-only (no active file): newest mtime wins.
+        let found2 = newest_grok_transcript_in(&sessions, None, id, None)
+            .expect("suffix match alone works");
+        assert!(
+            found2.1.contains("LIVE session response") || found2.1.contains("OLD session"),
+            "returns some session body: {}",
+            found2.1
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_serves_grok_transcript_when_registry_repo_matches() {
+        // End-to-end: point HOME at a temp tree so newest_grok_transcript's $HOME reader
+        // finds our fixture. Serialized via home_lock so parallel tests stay safe.
+        let _guard = home_lock();
+        let root = unique_root("grok-resolve");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let id = "ws9-p5";
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".agent-teams-worktrees").join(id)).unwrap();
+
+        let home = root.join("home");
+        let wt = repo.join(".agent-teams-worktrees").join(id);
+        let hist_dir = home
+            .join(".grok")
+            .join("sessions")
+            .join(grok_encode_cwd(&wt.to_string_lossy()))
+            .join("019f0000-1111-2222-3333-444444444444");
+        fs::create_dir_all(&hist_dir).unwrap();
+        fs::write(
+            hist_dir.join("chat_history.jsonl"),
+            [
+                r#"{"type":"user","content":"status?"}"#,
+                r#"{"type":"assistant","content":"","tool_calls":[{"name":"run_terminal_command"}]}"#,
+                r#"{"type":"assistant","content":"E2E GROK TRANSCRIPT BODY"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let reg = serde_json::json!({
+            "schema": 1,
+            "workspaces": [{
+                "id": id,
+                "harness": "grok",
+                "repo": repo.to_string_lossy(),
+            }]
+        });
+        fs::write(root.join("agent-teams-live.json"), reg.to_string()).unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let r = resolve(&state, id, None);
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(r.source, "grok_transcript", "note={:?}", r.note);
+        assert_eq!(r.harness.as_deref(), Some("grok"));
+        assert_eq!(r.content.as_deref(), Some("E2E GROK TRANSCRIPT BODY"));
+        assert!(
+            r.path
+                .as_deref()
+                .unwrap_or("")
+                .ends_with("chat_history.jsonl"),
+            "path points at history: {:?}",
+            r.path
+        );
+        assert!(!r.truncated);
+
+        let audit = fs::read_to_string(root.join("agent-teams-external-reads.jsonl")).unwrap();
+        assert!(audit.contains("\"source\":\"grok_transcript\""));
+        assert!(!audit.contains("E2E GROK"), "audit must NOT carry content");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_honest_none_for_grok_without_transcript() {
+        let _guard = home_lock();
+        let root = unique_root("grok-none");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let id = "ws9-p6";
+        let reg = serde_json::json!({
+            "schema": 1,
+            "workspaces": [ { "id": id, "harness": "grok", "repo": "/tmp/no-such-grok-repo" } ]
+        });
+        fs::write(root.join("agent-teams-live.json"), reg.to_string()).unwrap();
+
+        // Isolate from the developer's real ~/.grok by pointing HOME at empty tree.
+        let home = root.join("empty-home");
+        fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let r = resolve(&state, id, None);
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(r.source, "none");
+        assert_eq!(r.harness.as_deref(), Some("grok"));
+        assert!(r.content.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }

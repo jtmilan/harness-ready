@@ -44,7 +44,7 @@ export function randomLine() {
 }
 
 // Mock web-preview fleet. Every `kind` is a HARNESS_WIRE key (claude-code, cursor,
-// codex, opencode, commandcode, cline, grok, bash) — same closed set the template
+// codex, opencode, commandcode, pi, grok, bash) — same closed set the template
 // builder offers — so preview and Tauri spawn agree after K4 drops || "bash".
 const INITIAL = [
   { kind: "claude-code", status: "working" },
@@ -54,7 +54,7 @@ const INITIAL = [
   { kind: "grok", status: "working" },
   { kind: "claude-code", status: "needs_input" },
   { kind: "commandcode", status: "starting" },
-  { kind: "cline", status: "blocked" },
+  { kind: "pi", status: "blocked" },
   { kind: "claude-code", status: "working" },
   { kind: "bash", status: "idle" },
   { kind: "cursor", status: "working" },

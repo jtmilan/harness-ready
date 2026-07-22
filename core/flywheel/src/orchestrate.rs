@@ -166,10 +166,14 @@ fn harness_capability(harness: &str) -> Option<&'static str> {
              feature work where consistency with the surrounding code matters. Prefer \
              commandcode for \"build this the way the codebase already does it\" work.",
         ),
-        "cline" => Some(
-            "autonomous act-mode coding agent with built-in auto-approve; broad provider/model \
-             choice. Use cline for general implement/edit work where an always-on autonomous \
-             loop is wanted.",
+        "pi" => Some(
+            "minimal pi.dev coding agent harness; extensible tools/skills with broad \
+             provider/model choice. Use pi for general implement/edit work where a light \
+             autonomous loop is wanted.",
+        ),
+        "opencode" => Some(
+            "provider-agnostic coding agent (sst/opencode) with headless `run` and interactive \
+             TUI. Use opencode for multi-provider implement/edit work.",
         ),
         _ => None,
     }

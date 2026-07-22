@@ -81,7 +81,7 @@ This **always** writes an empty `live_ids` vector (not conditional on instance l
 
 ### RC5 — `state_blind` is a separate axis (hooks / events), not registry membership
 
-**VERIFIED:** `state_blind: true` for CommandCode, Cline, Grok (`core/harness/src/lib.rs` ~193–232). Synthetic `SessionStart` via `write_spawn_ready_event` at spawn (`core/supervisor/src/lib.rs` ~1167–1183).
+**VERIFIED:** `state_blind: true` for CommandCode, Pi, Grok (`core/harness/src/lib.rs` descriptors). Synthetic `SessionStart` via `write_spawn_ready_event` at spawn (`core/supervisor/src/lib.rs`). OpenCode remains `state_blind: false` (plugin turn-end).
 
 **VERIFIED:** p9 (CommandCode) has `events.jsonl` but was still absent from queue when not in `live.json`. p10/p11 have events and are **not** state_blind — same absence pattern.
 

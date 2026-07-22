@@ -60,6 +60,12 @@ use agent_teams_core::{compute_queue_identified, list_workspaces, read_registry,
 #[cfg(feature = "phase-b-mutations")]
 mod phase_b;
 
+/// `team_prompt_all` — broadcast one prompt to every live pane and collect responses
+/// in a single tool call (SendInput per pane + poll `read_output`). Feature-gated
+/// with Phase B mutations (sends input); registered on the mutation router.
+#[cfg(feature = "phase-b-mutations")]
+mod prompt_all;
+
 /// `team_read_output` — read a pane's produced report/transcript off disk. ALWAYS-ON
 /// (registered in the base read router), ungated local file I/O. The caller passes a
 /// pane id; the server resolves the source (orchestrate `.md` → claude transcript →
@@ -167,14 +173,90 @@ fn strip_numeric_formats_in_value(value: &mut serde_json::Value) {
     }
 }
 
-/// Apply [`strip_numeric_formats`] to every registered tool's input + output schema
-/// (walks `$defs` too). Called once after the routers are merged, so every served
-/// tool — read, memory, task, mutation — is sanitized regardless of feature flags.
+/// Some MCP clients keep ONLY the top-level `properties`/`required` of a tool's
+/// `inputSchema` when converting it into a provider tools payload and silently DROP
+/// `$defs` (Command Code's `mcpToolToSchema` does exactly this) — so any nested
+/// `$ref: "#/$defs/…"` dangles and strict providers reject EVERY request up front
+/// (Moonshot/Kimi: HTTP 400 "$defs not found for reference: #/$defs/PaneSpecArg").
+/// schemars emits `$defs` + refs for ANY nested struct field (e.g.
+/// `CreateWorkspaceArgs.panes: Vec<PaneSpecArg>`), so inline every local
+/// `#/$defs/…` ref in place and drop the `$defs` block: the served schema is fully
+/// self-contained under `properties` and survives lossy clients.
+fn inline_local_defs(map: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::Value;
+    let defs = match map.remove("$defs") {
+        Some(Value::Object(defs)) => defs,
+        Some(other) => {
+            // A non-object $defs (schemars never emits one) — restore untouched.
+            map.insert("$defs".to_string(), other);
+            return;
+        }
+        None => return,
+    };
+    // Expansion budget: a genuinely RECURSIVE type (a def whose body refs itself)
+    // would loop forever without it. None exist today; on exhaustion a leftover ref
+    // is no worse than the pre-inline status quo.
+    let mut budget = 256usize;
+    let mut root = Value::Object(std::mem::take(map));
+    inline_refs_in_value(&mut root, &defs, &mut budget);
+    if let Value::Object(m) = root {
+        *map = m;
+    }
+}
+
+fn inline_refs_in_value(
+    value: &mut serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    budget: &mut usize,
+) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let ref_name = match map.get("$ref") {
+                Some(Value::String(r)) => r.strip_prefix("#/$defs/").map(str::to_owned),
+                _ => None,
+            };
+            if let Some(name) = ref_name {
+                if *budget > 0 {
+                    if let Some(Value::Object(def)) = defs.get(&name) {
+                        let mut resolved = Value::Object(def.clone());
+                        *budget -= 1;
+                        // Resolve refs nested inside the def body BEFORE splicing.
+                        inline_refs_in_value(&mut resolved, defs, budget);
+                        if let Value::Object(resolved) = resolved {
+                            *map = resolved;
+                            return;
+                        }
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                inline_refs_in_value(v, defs, budget);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                inline_refs_in_value(item, defs, budget);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply [`strip_numeric_formats`] + [`inline_local_defs`] to every registered
+/// tool's input + output schema. Called once after the routers are merged, so every
+/// served tool — read, memory, task, mutation — is sanitized regardless of feature
+/// flags. Strip runs FIRST so the def bodies get their formats stripped before being
+/// inlined.
 fn sanitize_tool_schemas(router: &mut ToolRouter<TeamServer>) {
     for route in router.map.values_mut() {
-        strip_numeric_formats(std::sync::Arc::make_mut(&mut route.attr.input_schema));
+        let input = std::sync::Arc::make_mut(&mut route.attr.input_schema);
+        strip_numeric_formats(input);
+        inline_local_defs(input);
         if let Some(output) = route.attr.output_schema.as_mut() {
-            strip_numeric_formats(std::sync::Arc::make_mut(output));
+            let output = std::sync::Arc::make_mut(output);
+            strip_numeric_formats(output);
+            inline_local_defs(output);
         }
     }
 }
@@ -262,14 +344,16 @@ impl TeamServer {
             NOT a filesystem path; the server resolves the source from the id and reads \
             only Agent-Teams-controlled artifacts. Source precedence: (1) the \
             orchestrate/bridge <id>.md report (harness-agnostic — what a dispatched pane \
-            wrote); (2) for claude panes, the pane's own transcript; (3) for a LIVE pane \
-            with nothing on disk (commandcode/codex/opencode/cline keep no transcript), \
-            a live tail of its in-memory scrollback read from the running app \
-            (source='live_scrollback' — UNVERIFIED, may be mid-stream; needs the app \
-            running and the external-read gate armed); (4) otherwise an honest 'none' \
-            with a note. Returns {id, harness, source, path, content, truncated, note}; \
-            content is the newest tail capped at max_bytes (default 65536). Read-only \
-            (never mutates a pane); every read is audited (id+size, not content)."
+            wrote); (2) claude/cursor pane transcripts on disk; (3) grok session \
+            chat_history.jsonl (source='grok_transcript' — clean assistant text, not \
+            ANSI TUI frames); (4) for a LIVE pane with nothing on disk \
+            (commandcode/codex/opencode/pi keep no transcript), a live tail of its \
+            in-memory scrollback from the running app (source='live_scrollback' — \
+            UNVERIFIED, may be mid-stream; needs the app running and the external-read \
+            gate armed); (5) otherwise an honest 'none' with a note. Returns {id, \
+            harness, source, path, content, truncated, note}; content is the newest \
+            tail capped at max_bytes (default 65536). Read-only (never mutates a pane); \
+            every read is audited (id+size, not content)."
     )]
     async fn team_read_output(
         &self,
@@ -359,8 +443,9 @@ on-disk discovery; it can disagree with the live queue by design (the app-down i
 or null.\n\
 - team_read_output {id, max_bytes?} -> the OUTPUT a pane produced (its report/transcript), \
 NOT just status. Pass the FULL pane id; the server resolves the source (orchestrate <id>.md \
-report first, then a claude pane's transcript, then — for a LIVE pane with nothing on disk — \
-a live in-memory scrollback tail from the running app, source='live_scrollback', unverified/\
+report first, then claude/cursor transcripts, then grok chat_history.jsonl as \
+source='grok_transcript', then — for a LIVE pane with nothing on disk — a live \
+in-memory scrollback tail from the running app, source='live_scrollback', unverified/\
 may be mid-stream) and reads only AT-controlled artifacts — you NEVER pass a path. {source, \
 path, content, truncated, note}; source='none' (with a note) when nothing is readable.\n\
 - team_audit_log {limit?, kind?} -> the audit trail of EXTERNAL orchestrator actions, NEWEST \
@@ -518,6 +603,59 @@ impl TeamServer {
     }
 
     #[tool(
+        name = "team_prompt_all",
+        description = "Broadcast ONE prompt line to every live pane in a workspace and \
+            COLLECT their responses in a single call — the coordinator's \
+            send→wait→read_output loop as one tool. Flow: (1) read the live registry, \
+            filter by target_workspace (default: caller's workspace from \
+            $AGENT_TEAMS_PANE_ID, else the registry active workspace) and exclude_roles \
+            (default: exclude 'coordinator' so you don't prompt yourself); (2) SendInput \
+            the prompt to each remaining pane; (3) poll team_read_output resolution \
+            (disk transcript → live scrollback) until each pane yields a response newer \
+            than the prompt, or timeout_secs elapses (default 60, max 300). Returns \
+            {responses:[{id,harness,response,source}], errors:[{id,error,detail?}], \
+            elapsed_secs}. Requires the app running AND send_input_enabled=true (same \
+            narrow gate as team_send_input — each pane is prompted via SendInput); the \
+            app also enforces the coordinator peer-pid gate on each send. Model A: \
+            delivers the operator's text verbatim — NEVER auto-approves a pending prompt."
+    )]
+    async fn team_prompt_all(
+        &self,
+        Parameters(args): Parameters<prompt_all::PromptAllArgs>,
+    ) -> Result<Json<prompt_all::PromptAllResult>, ErrorData> {
+        use agent_teams_core::read_mcp_config;
+
+        // Same narrow gate as team_send_input: each pane is prompted via SendInput.
+        // App re-enforces authoritatively; this is the UX pre-check so we don't burn
+        // the timeout on guaranteed FORBIDDEN/SEND_INPUT_DISABLED replies.
+        if !read_mcp_config(&self.state_dir).send_input_enabled {
+            return Err(ErrorData::invalid_request(
+                "SEND_INPUT_DISABLED: agent→agent send-input is off (arm it in Settings → \
+                 set send_input_enabled=true). team_prompt_all prompts each pane via \
+                 SendInput, so the same gate applies. The app also enforces this gate."
+                    .to_string(),
+                None,
+            ));
+        }
+        // Reject multi-line prompts up front (app would reject each send the same way).
+        if args.prompt.contains('\n') || args.prompt.contains('\r') {
+            return Err(ErrorData::invalid_params(
+                "BAD_REQUEST: prompt must be a single line (no interior newlines)".to_string(),
+                None,
+            ));
+        }
+
+        let state_dir = self.state_dir.clone();
+        // Blocking: N SendInput dials + a poll loop of read_output (file I/O and
+        // possible live-scrollback socket dials) up to timeout_secs — never on the
+        // async runtime.
+        let out = tokio::task::spawn_blocking(move || prompt_all::run(&state_dir, args))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("prompt_all task join: {e}"), None))?;
+        Ok(Json(out))
+    }
+
+    #[tool(
         name = "team_handoff",
         description = "Context Router: relay ONE single-line handoff message \
             (provenance 'from' + your instruction) to pane 'to' through the gate — \
@@ -557,8 +695,8 @@ impl TeamServer {
             PANE_IDS MODE (sidecar-driven): `pane_ids` = FULL pane ids (e.g. \
             \"ws50144x0-p4\", max 16) from ANY team — hand-spawned included, no \
             orchestrate dance. Each pane's output is resolved exactly like \
-            team_read_output (report -> transcript -> live scrollback tail from the \
-            running app for a live pane with nothing on disk -> honest source:\"none\", \
+            team_read_output (report -> claude/cursor/grok transcript -> live scrollback \
+            tail from the running app for a live pane with nothing on disk -> honest source:\"none\", \
             never silently dropped) and MERGED VERBATIM (no LLM pass) into one markdown \
             doc (summary table + per-pane sections), returned in the result \
             (data.content) AND written to a server-chosen synth dir beside the \
@@ -907,9 +1045,11 @@ impl ServerHandler for TeamServer {
              by id). Context Router tools (06-03, allow_mutations gate): team_orchestrate \
              (synthesize the goal into per-pane tasks; dispatch=false PREVIEWS the \
              mapping, dispatch=true fans it out), team_broadcast (one line to every \
-             live pane → {sent,skipped}), team_handoff (relay one line from→to, one \
-             hop), team_synthesize (fan-in, two modes — dir: consolidate an orchestrate \
-             run dir's pane reports into final.md + per-pane verdicts \
+             live pane → {sent,skipped}), team_prompt_all (broadcast one prompt to every \
+             live pane in a workspace, wait/collect responses via read_output; gated by \
+             send_input_enabled like team_send_input), team_handoff (relay one line \
+             from→to, one hop), team_synthesize (fan-in, two modes — dir: consolidate an \
+             orchestrate run dir's pane reports into final.md + per-pane verdicts \
              ok/empty/incomplete/missing; pane_ids: sidecar-driven verbatim merge of ANY \
              panes' outputs resolved like team_read_output (max 16, works app-closed, \
              ungated) — both CLAIMED, not verified).",
@@ -1170,5 +1310,132 @@ mod format_strip_tests {
             v["$defs"]["Row"]["properties"]["when"]["format"],
             "date-time"
         );
+    }
+}
+
+#[cfg(test)]
+mod inline_defs_tests {
+    use super::inline_local_defs;
+    use serde_json::json;
+
+    #[test]
+    fn inlines_local_defs_and_drops_the_defs_block() {
+        let mut v = json!({
+            "type": "object",
+            "properties": {
+                "panes": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/PaneSpecArg" }
+                },
+                "repo": { "type": "string" }
+            },
+            "$defs": {
+                "PaneSpecArg": {
+                    "type": "object",
+                    "properties": { "harness": { "type": "string" } },
+                    "required": ["harness"]
+                }
+            }
+        });
+        inline_local_defs(v.as_object_mut().unwrap());
+        // The ref is replaced by the def body, verbatim.
+        assert_eq!(
+            v["properties"]["panes"]["items"],
+            json!({
+                "type": "object",
+                "properties": { "harness": { "type": "string" } },
+                "required": ["harness"]
+            })
+        );
+        // $defs is gone; untouched siblings survive.
+        assert!(v.get("$defs").is_none());
+        assert_eq!(v["properties"]["repo"], json!({ "type": "string" }));
+        // Nothing ref-shaped remains anywhere.
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("\"$ref\"") && !s.contains("\"$defs\""), "{s}");
+    }
+
+    #[test]
+    fn resolves_refs_nested_inside_def_bodies() {
+        let mut v = json!({
+            "type": "object",
+            "properties": { "outer": { "$ref": "#/$defs/Outer" } },
+            "$defs": {
+                "Outer": {
+                    "type": "object",
+                    "properties": { "inner": { "$ref": "#/$defs/Inner" } }
+                },
+                "Inner": { "type": "string" }
+            }
+        });
+        inline_local_defs(v.as_object_mut().unwrap());
+        assert_eq!(
+            v["properties"]["outer"]["properties"]["inner"],
+            json!({ "type": "string" })
+        );
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("\"$ref\"") && !s.contains("\"$defs\""), "{s}");
+    }
+
+    #[test]
+    fn recursive_defs_terminate_instead_of_looping() {
+        // A self-referencing def can never be fully inlined; the budget caps the
+        // expansion so the call TERMINATES (the leftover ref is the status quo).
+        let mut v = json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/Node" } },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": { "child": { "$ref": "#/$defs/Node" } }
+                }
+            }
+        });
+        inline_local_defs(v.as_object_mut().unwrap());
+        assert_eq!(v["properties"]["node"]["type"], "object");
+        assert!(v.get("$defs").is_none());
+    }
+
+    #[test]
+    fn no_defs_is_a_noop() {
+        let mut v = json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
+        });
+        let before = v.clone();
+        inline_local_defs(v.as_object_mut().unwrap());
+        assert_eq!(v, before);
+    }
+
+    /// The client-visible contract: lossy MCP clients keep only each tool schema's
+    /// top-level `properties`/`required`, so NOTHING under the served schema may
+    /// contain `$ref`/`$defs` — for EVERY tool, whatever the feature set. Under
+    /// `--features phase-b-mutations` this covers `team_create_workspace`
+    /// (`Vec<PaneSpecArg>` — the Moonshot 400 regression).
+    #[test]
+    fn every_served_tool_schema_is_ref_free() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-mcp-schematest-{}",
+            std::process::id()
+        ));
+        let server = crate::TeamServer::new(dir);
+        assert!(
+            !server.tool_router.map.is_empty(),
+            "router must register tools"
+        );
+        for (name, route) in server.tool_router.map.iter() {
+            let input = serde_json::to_string(&route.attr.input_schema).unwrap();
+            assert!(
+                !input.contains("\"$ref\"") && !input.contains("\"$defs\""),
+                "tool {name} inputSchema leaks $ref/$defs: {input}"
+            );
+            if let Some(output) = &route.attr.output_schema {
+                let out = serde_json::to_string(output).unwrap();
+                assert!(
+                    !out.contains("\"$ref\"") && !out.contains("\"$defs\""),
+                    "tool {name} outputSchema leaks $ref/$defs: {out}"
+                );
+            }
+        }
     }
 }

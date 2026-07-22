@@ -193,9 +193,9 @@ describe("parseSpawn", () => {
     expect(parseSpawn("spawn cursor")).toEqual({ count: 1, harnesses: ["cursor"] });
   });
 
-  it("parses cline (state-blind harness) like the other non-claude harnesses", () => {
-    expect(parseSpawn("spin up 2 cline agents")).toEqual({ count: 2, harnesses: ["cline", "cline"] });
-    expect(KNOWN_HARNESSES).toContain("cline");
+  it("parses pi (state-blind harness) like the other non-claude harnesses", () => {
+    expect(parseSpawn("spin up 2 pi agents")).toEqual({ count: 2, harnesses: ["pi", "pi"] });
+    expect(KNOWN_HARNESSES).toContain("pi");
   });
 
   it("returns null for garbage and unknown harnesses", () => {

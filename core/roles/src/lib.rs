@@ -651,7 +651,7 @@ pub fn orchestrate_sections(run_dir: &str, id: &str) -> String {
 // model anywhere. So the harness axis collapses to `harness_is_claude` (the same axis
 // [`role_args`] already uses; no third `Harness` enum — two exist already and their
 // exhaustiveness gates are expensive). Non-claude cells are ALL `Default`: cursor/codex/
-// opencode/commandcode/cline take the user's model or their account default, bash has none.
+// opencode/commandcode/pi take the user's model or their account default, bash has none.
 
 /// Which model a dispatch-machinery role runs: the harness's account default (or the
 /// operator's explicit pick — user choice always WINS over this matrix), or a
@@ -833,7 +833,7 @@ mod model_matrix_tests {
 
     #[test]
     fn non_claude_cells_are_all_default() {
-        // No non-claude pin exists today: cursor/codex/opencode/commandcode/cline run the
+        // No non-claude pin exists today: cursor/codex/opencode/commandcode/pi run the
         // user's pick or their account default; bash has no model at all.
         for role in ModelRole::all() {
             assert_eq!(

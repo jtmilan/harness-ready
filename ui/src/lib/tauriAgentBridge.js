@@ -66,7 +66,7 @@ const HARNESS_WIRE = {
   codex: "codex",
   opencode: "opencode",
   commandcode: "commandcode",
-  cline: "cline",
+  pi: "pi",
   grok: "grok",
   bash: "bash",
 };
@@ -200,13 +200,38 @@ export class TauriAgentBridge {
     //    close that gap (mirrors the prod frontend reading over its own session map,
     //    not the queue).
     const ids = Array.from(new Set([...queue.map((r) => r.id), ...Object.keys(this.spawned)]));
+    // Empty-raw recovery (OpenCode blank+(W) class): if a live queue pane has never
+    // accumulated raw bytes, force since=0 so a desynced offset / omitted batch entry
+    // cannot strand the UI on a permanent empty buffer while the PTY is full.
+    for (const id of ids) {
+      if (dead.has(id)) continue;
+      if ((this.raw[id] || "").length > 0) continue;
+      if (!rowById[id] && !this.spawned[id]) continue;
+      this.offsets[id] = 0;
+    }
     const reqs = ids.map((id) => ({ id, since: this.offsets[id] || 0 }));
-    const deltas = reqs.length ? await invoke("read_output_delta_batch", { reqs }) : [];
+    let deltas = reqs.length ? await invoke("read_output_delta_batch", { reqs }) : [];
+    if (!Array.isArray(deltas)) deltas = [];
     // Ghost pruning: `spawned` persists across reloads, but a backend RESTART kills all
     // PTYs and wipes its registry — a persisted id the backend no longer knows returns
     // no delta entry and no queue row forever. Forget an id after ~20 consecutive
     // silent ticks (10s) with no queue row, no delta, and no dead-flag.
-    const answered = new Set(deltas.map((d) => d.id));
+    const answered = new Set(deltas.map((d) => d && d.id).filter(Boolean));
+    // Batch may omit a pane (try_lock skip / race). Fall back to single-pane delta so
+    // OpenCode/OpenTUI never stays 0b forever while Working in the queue.
+    for (const id of ids) {
+      if (answered.has(id) || dead.has(id)) continue;
+      if ((this.raw[id] || "").length > 0) continue;
+      try {
+        const d = await invoke("read_output_delta", { id, since: this.offsets[id] || 0 });
+        if (d && typeof d === "object") {
+          deltas.push({ id, ...d });
+          answered.add(id);
+        }
+      } catch {
+        /* pane gone / transient — next tick */
+      }
+    }
     this._miss = this._miss || {};
     for (const id of Object.keys(this.spawned)) {
       if (rowById[id] || answered.has(id) || dead.has(id)) { delete this._miss[id]; continue; }
@@ -214,7 +239,7 @@ export class TauriAgentBridge {
       if (this._miss[id] > 20) { this._forget(id); delete this._miss[id]; }
     }
     for (const d of deltas) {
-      if (typeof d.data !== "string") continue;
+      if (!d || typeof d.data !== "string") continue;
       // `truncated` = the cursor fell behind the ring buffer's start: the byte window
       // was replayed from a later base, so the accumulated scrollback is stale. Reset
       // this pane's buffer and bump its generation so the terminal does a full RIS.

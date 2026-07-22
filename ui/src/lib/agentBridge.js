@@ -35,7 +35,7 @@ const HARNESS_WIRE = {
   codex: "codex",
   opencode: "opencode",
   commandcode: "commandcode",
-  cline: "cline",
+  pi: "pi",
   grok: "grok",
   bash: "bash",
 };

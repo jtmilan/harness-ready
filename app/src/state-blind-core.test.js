@@ -8,7 +8,7 @@ import {
 
 describe("isStateBlind", () => {
   it("is true for the four inject:None harnesses", () => {
-    for (const h of ["codex", "commandcode", "opencode", "cline"]) {
+    for (const h of ["codex", "commandcode", "opencode", "pi"]) {
       expect(isStateBlind(h)).toBe(true);
     }
   });
@@ -22,7 +22,7 @@ describe("isStateBlind", () => {
   it("is case-insensitive and trims whitespace", () => {
     expect(isStateBlind("Codex")).toBe(true);
     expect(isStateBlind("  OPENCODE  ")).toBe(true);
-    expect(isStateBlind("CLINE")).toBe(true);
+    expect(isStateBlind("PI")).toBe(true);
   });
 
   it("is false for null / undefined / empty (unknown harness → no badge)", () => {
@@ -35,7 +35,7 @@ describe("isStateBlind", () => {
 
   it("exports the exact state-blind membership", () => {
     expect([...STATE_BLIND].sort()).toEqual(
-      ["cline", "codex", "commandcode", "opencode"].sort(),
+      ["pi", "codex", "commandcode", "opencode"].sort(),
     );
   });
 });
@@ -57,7 +57,7 @@ describe("stateBlindBadge", () => {
 
   it("names the harness in the hover/aria title", () => {
     expect(stateBlindBadge("opencode").title).toContain("opencode");
-    expect(stateBlindBadge("cline").title).toContain("cline");
+    expect(stateBlindBadge("pi").title).toContain("pi");
   });
 
   it("still badges when case differs but preserves the original casing in the title", () => {
