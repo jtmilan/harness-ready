@@ -13484,7 +13484,20 @@ fn resolve_whisper_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             return Ok(res);
         }
     }
-    Err("ggml-tiny.en.bin model not found (set AGENT_TEAMS_WHISPER_MODEL or bundle it as a resource)".into())
+    // The model is NOT a declared bundle resource (AC-5: declaring it makes `tauri build`/
+    // `tauri dev` HARD-require the 74 MB gitignored file and breaks fresh-clone + offline
+    // builds). It is instead staged into the bundle by `install-app.sh` (and present at the
+    // source path after `fetch-whisper-model.sh`), so resolve it directly from the resource
+    // dir. In dev the resource dir is `app/src-tauri` (model at `models/` post-fetch); in a
+    // packaged app it is `Contents/Resources` (model staged by install-app.sh). Absent model
+    // falls through to the typed Err below → dictation degrades, typing still works.
+    if let Ok(rd) = app.path().resource_dir() {
+        let staged = rd.join("models/ggml-tiny.en.bin");
+        if staged.exists() {
+            return Ok(staged);
+        }
+    }
+    Err("ggml-tiny.en.bin model not found (run scripts/fetch-whisper-model.sh, set AGENT_TEAMS_WHISPER_MODEL, or stage it into the bundle; dictation is unavailable until then — typing still works)".into())
 }
 
 /// Build the hound `WavSpec` matching cpal's reported config (channels / rate / sample

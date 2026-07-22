@@ -47,6 +47,30 @@ if [[ -f "$MODEL" ]]; then
   fi
 fi
 
+# LOUD preflight (plan: never fail silently on a missing model). The model is absent here
+# (the idempotent skip above would have exited otherwise). If we cannot reach the pinned
+# Hugging Face host, `curl --fail` below would still exit non-zero, but its raw HTTP error is
+# NOT actionable — the operator sees a cryptic "beforeBuildCommand failed" and loses hours.
+# So probe connectivity FIRST and fail LOUD with the exact remediation: fetch online, or place
+# the file / set AGENT_TEAMS_WHISPER_MODEL for an offline build. (The build itself no longer
+# hard-requires the model — see tauri.conf.json AC-5 — so this loud failure is the operator's
+# signal, not a build-correctness gate.)
+if ! curl -L --fail --silent --show-error --max-time 20 -o /dev/null \
+      -I "https://huggingface.co/ggerganov/whisper.cpp/resolve/$HF_COMMIT/ggml-tiny.en.bin" 2>/tmp/hf-preflight.err; then
+  echo "ERROR: ggml-tiny.en.bin is MISSING and the pinned Hugging Face host is unreachable." >&2
+  echo "       model path: $MODEL" >&2
+  echo "       url:        $URL" >&2
+  echo "       probe:      $(cat /tmp/hf-preflight.err 2>/dev/null)" >&2
+  echo "       Fix (any one): (a) connect to the network and re-run; the build auto-fetches it;" >&2
+  echo "                      (b) copy ggml-tiny.en.bin (sha256 $MODEL_SHA256) to $MODEL;" >&2
+  echo "                      (c) set AGENT_TEAMS_WHISPER_MODEL=/abs/path/ggml-tiny.en.bin." >&2
+  echo "       NOTE: the app now BUILDS without the model (AC-5) — only dictation needs it;" >&2
+  echo "       typed replies still work. This failure is loud by design so the absence is never silent." >&2
+  rm -f /tmp/hf-preflight.err
+  exit 1
+fi
+rm -f /tmp/hf-preflight.err
+
 echo "==> downloading ggml-tiny.en.bin (~74 MB, pinned rev $HF_COMMIT) -> $MODEL"
 curl -L --fail --progress-bar -o "$MODEL" "$URL"
 

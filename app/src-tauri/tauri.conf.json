@@ -4,7 +4,7 @@
   "version": "0.9.0",
   "identifier": "com.jeffrymilan.harnessready",
   "build": {
-    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeDevCommand": "bash -c 'bash ../scripts/fetch-whisper-model.sh || { [ -f ../app/src-tauri/models/ggml-tiny.en.bin ] || [ -f src-tauri/models/ggml-tiny.en.bin ] || echo \"WARN: whisper model absent + offline — dev will start, dictation unavailable (run scripts/fetch-whisper-model.sh online).\"; }'; npm --prefix ../ui run dev",
     "beforeBuildCommand": "bash ../scripts/fetch-whisper-model.sh && npm --prefix ../ui run build",
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:5173"
@@ -37,8 +37,7 @@
       "../../core/hooks/claude-mcp.tmpl.json": "hooks/claude-mcp.tmpl.json",
       "../../core/hooks/cursor-mcp.tmpl.json": "hooks/cursor-mcp.tmpl.json",
       "../../core/hooks/commandcode-mcp.tmpl.json": "hooks/commandcode-mcp.tmpl.json",
-      "../../core/hooks/cursor-role.tmpl.md": "hooks/cursor-role.tmpl.md",
-      "models/ggml-tiny.en.bin": "models/ggml-tiny.en.bin"
+      "../../core/hooks/cursor-role.tmpl.md": "hooks/cursor-role.tmpl.md"
     },
     "icon": [
       "icons/32x32.png",
