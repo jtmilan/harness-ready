@@ -52,6 +52,16 @@ export default defineConfig({
     },
   },
   build: {
+    // DISABLE minification (root-cause fix for the "frozen terminal / can't see what
+    // I type" bug in installed builds). esbuild's minified output breaks xterm.js's
+    // requestAnimationFrame render loop in the production bundle: the terminal paints
+    // its first backlog frame (the welcome banner) then stops repainting, so keystroke
+    // echo + streaming output never appear even though the backend delivers every byte
+    // and term.write runs (proven by send_input/read/delta traces + advancing `since`).
+    // Vite dev serves xterm UNminified, which is why `tauri dev` always typed fine and
+    // made the backend-only PR #9 look sufficient. Re-enable later via a tuned minifier
+    // (esbuild keepNames / terser mangle:false) once bundle size matters.
+    minify: false,
     rollupOptions: {
       output: {
         manualChunks,

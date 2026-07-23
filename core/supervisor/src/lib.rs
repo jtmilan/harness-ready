@@ -1340,24 +1340,27 @@ fn remove_codex_mcp(pane_id: &str) {
 /// a ghost MCP server that fails setup and shows "N setup issues: MCP" on every
 /// subsequent codex launch). Idempotent (no-op when the file is clean) + serialized
 /// under [`CODEX_CONFIG_LOCK`] so it can't race with a concurrent inject. Best-effort:
-/// a missing config or unreadable file is Ok(()).
-pub fn purge_all_managed_codex_mcp() {
-    let Some(config) = codex_config_path() else { return };
+/// a missing config or unreadable file yields 0. Returns the number of managed blocks
+/// removed (0 when the file was already clean), so callers can log what was recovered.
+pub fn purge_all_managed_codex_mcp() -> usize {
+    let Some(config) = codex_config_path() else { return 0 };
     if !config.is_file() {
-        return;
+        return 0;
     }
     let _guard = CODEX_CONFIG_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let Ok(content) = std::fs::read_to_string(&config) else { return };
+    let Ok(content) = std::fs::read_to_string(&config) else { return 0 };
     if !content.contains(managed_mcp::MARKER_PREFIX) {
-        return; // fast path: nothing managed here
+        return 0; // fast path: nothing managed here
     }
+    let purged = content.matches(managed_mcp::MARKER_PREFIX).count();
     let cleaned = managed_mcp::strip_all_blocks(&content);
     if cleaned == content {
-        return;
+        return 0;
     }
     let _ = std::fs::write(&config, cleaned);
+    purged
 }
 
 /// Deterministic per-pane MCP server name. Pane ids are `[a-zA-Z0-9-]` (e.g.
