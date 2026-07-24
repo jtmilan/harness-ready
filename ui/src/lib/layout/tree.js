@@ -111,6 +111,72 @@ function chainNodes(nodes, dir) {
   return node;
 }
 
+// ── Aligned, role-aware grid (tile mode) ────────────────────────────────────────
+// buildBalancedTree + reconcileTree's incremental splitLeaf both fail to produce the layout
+// operators expect from a team template: a full-height coordinator on the left and the workers
+// in a uniform rows×cols grid whose horizontal seams line up across columns. reconcileTree's
+// alternating splitLeaf builds a maximally-unbalanced staircase (pane0 ≈ 50% of the area, the
+// last pane ≈ 1.5%); buildBalancedTree round-robins into ceil(sqrt(n)) columns of UNEQUAL length,
+// so column 0's row dividers (1/3, 2/3) never match column 1's (1/2) and the grid looks ragged.
+//
+// buildGridLayout fixes both while staying inside the binary-split model (so seam-drag, zoom,
+// move and persistence keep working unchanged): it forces EVERY column to hold exactly `rows`
+// leaves by padding short columns with non-rendered SPACER leaves. Equal column length ⇒ every
+// column's h-chain uses identical ratios ⇒ horizontal seams align. The render loop iterates
+// live panes (not rects), so spacer rects simply paint as empty, gap-aligned cells.
+export const COORD_RATIO = 0.45; // coordinator's share of width when pinned to the left column
+// Spacer leaves pad short columns to equal length so every column's h-chain ratios match and the
+// row seams align. The prefix can never equal a real pane id (wsNNNNNxK-pN), and the render loop
+// iterates live panes (not rects), so a spacer's rect simply paints as an empty, gap-aligned cell.
+const SPACER_PREFIX = "__hr_grid_gap__";
+function spacerId(c, r) {
+  return SPACER_PREFIX + c + "_" + r;
+}
+export function isGridSpacer(id) {
+  return typeof id === "string" && id.slice(0, SPACER_PREFIX.length) === SPACER_PREFIX;
+}
+
+// Column count for an n-pane grid: 1 pane → 1 col; otherwise ≥2 cols near sqrt(n). round() keeps
+// 6 at 2 (a 2×3 grid, matching the reference team-template layout), 4 → 2×2, 9 → 3×3.
+function chooseCols(n) {
+  if (n <= 1) return 1;
+  return Math.max(2, Math.round(Math.sqrt(n)));
+}
+
+// A uniform rows×cols grid over `ids` (row-major fill: index r*cols+c lands in column c, row r).
+// Columns are padded to exactly `rows` leaves with spacer leaves so the h-chain ratios — and
+// therefore the horizontal seams — match across columns. chainNodes gives equal splits, so equal
+// column length ⇒ aligned rows.
+function gridBlock(ids) {
+  const n = ids.length;
+  if (n === 0) return null;
+  if (n === 1) return leaf(ids[0]);
+  const cols = chooseCols(n);
+  const rows = Math.ceil(n / cols);
+  const columns = [];
+  for (let c = 0; c < cols; c++) {
+    const colLeaves = [];
+    for (let r = 0; r < rows; r++) {
+      const idx = r * cols + c;
+      colLeaves.push(idx < n ? leaf(ids[idx]) : leaf(spacerId(c, r)));
+    }
+    columns.push(chainNodes(colLeaves, "h"));
+  }
+  return chainNodes(columns, "v");
+}
+
+// Tile-mode tree: if `coordinatorId` is in the set, pin it as a full-height left column and grid
+// the rest on the right; otherwise grid the whole set. Pure.
+export function buildGridLayout(paneIds, coordinatorId) {
+  const ids = (paneIds || []).filter(Boolean);
+  if (!ids.length) return null;
+  const coord = coordinatorId && ids.indexOf(coordinatorId) !== -1 ? coordinatorId : null;
+  if (!coord) return gridBlock(ids);
+  const workers = ids.filter((id) => id !== coord);
+  if (!workers.length) return leaf(coord);
+  return { t: "split", dir: "v", ratio: COORD_RATIO, a: leaf(coord), b: gridBlock(workers) };
+}
+
 // Self-heal the tree against the authoritative live set: prune leaves whose pane is no longer
 // live (sibling promoted), drop DUPLICATE leaves (keep first DFS occurrence — legacy index-keyed
 // serialize could rehydrate two different backend panes as the same id), then append any live

@@ -15,6 +15,7 @@ import {
   moveLeaf,
   buildDefaultTree,
   buildBalancedTree,
+  buildGridLayout,
   reconcileTree,
   serializeTree,
   deserializeTree,
@@ -95,6 +96,7 @@ function unpackTree(parsed) {
  * @param {object} opts
  * @param {string[]} opts.paneIds       Authoritative live pane ids for the workspace.
  * @param {string|null} [opts.focusedId] Currently focused pane (anchor for single/focus + reconcile).
+ * @param {string|null} [opts.coordinatorId] Pane id pinned as a full-height left column in tile mode.
  * @param {React.RefObject<HTMLElement>} opts.containerRef Ref to the tiling host element (measured box).
  * @param {string} opts.wsId            Workspace id — namespaces persisted mode + tree.
  * @returns {{
@@ -111,7 +113,7 @@ function unpackTree(parsed) {
  *   restore: (serial: string|object) => boolean,
  * }}
  */
-export function useTiling({ paneIds: rawPaneIds, focusedId = null, containerRef, wsId, onDragFrame = null }) {
+export function useTiling({ paneIds: rawPaneIds, focusedId = null, coordinatorId = null, containerRef, wsId, onDragFrame = null }) {
   const paneIds = React.useMemo(
     () => (Array.isArray(rawPaneIds) ? rawPaneIds : []),
     [rawPaneIds],
@@ -167,12 +169,23 @@ const t = unpackTree(JSON.parse(raw));
   focusedIdRef.current = focusedId;
   const modeRef = React.useRef(mode);
   modeRef.current = mode;
+  const coordinatorIdRef = React.useRef(coordinatorId);
+  coordinatorIdRef.current = coordinatorId;
+
+  // Tile-mode grid builder (role-aware, aligned). Reads the coordinator from a ref so the
+  // reconcile / ws-switch effects need not re-subscribe when only that id changes.
+  const buildGrid = React.useCallback(
+    (ids) => buildGridLayout(ids, coordinatorIdRef.current),
+    [],
+  );
 
   // The authoritative, mutable STRUCTURAL tree (tile/columns). Mutated in place during a seam
   // drag (prod parity — zero alloc per pointermove), rebuilt/reconciled by the effects below.
   const structRef = React.useRef(/** @type {TreeNode|null|undefined} */ (undefined));
   if (structRef.current === undefined) {
-    structRef.current = restoreStructTree(); // lazy init on first render → tree exists for first paint
+    // Tile mode is a deterministic derived view (aligned grid): ignore any persisted structure on
+    // first paint. This also heals workspaces whose stored tree is the old unbalanced staircase.
+    structRef.current = mode === "tile" ? buildGrid(paneIds) : restoreStructTree();
   }
 
   // Measured container box via ResizeObserver (mirrors src/hooks/use-size.jsx). useLayoutEffect
@@ -218,12 +231,20 @@ const t = unpackTree(JSON.parse(raw));
   React.useEffect(() => {
     if (residentWsIdRef.current !== wsId) return;
     if (modeRef.current === "single" || modeRef.current === "focus") return;
-    structRef.current =
-      reconcileTree(structRef.current, paneIds, focusedId).tree || buildDefaultTree(paneIds);
+    if (modeRef.current === "tile") {
+      // Tile = deterministic aligned grid derived from the live set + coordinator role. Rebuild
+      // (not reconcile) so batch arrivals (template launch) and reloads never degrade into
+      // reconcileTree's unbalanced staircase; persisted drags reset on structural change — the
+      // contract for an "auto" tile view.
+      structRef.current = buildGrid(paneIds);
+    } else {
+      structRef.current =
+        reconcileTree(structRef.current, paneIds, focusedId).tree || buildDefaultTree(paneIds);
+    }
     persistStruct();
     bump();
     // paneKey stands in for the paneIds array (identity churns each render); reconcile is idempotent.
-  }, [paneKey, focusedId, persistStruct, wsId]);
+  }, [paneKey, focusedId, coordinatorId, buildGrid, persistStruct, wsId]);
 
   // Workspace switch: reload the persisted mode + structural tree for the new ws. Skipped on
   // mount (the lazy init above already built the tree for the first ws). Marks residence so the
@@ -235,7 +256,8 @@ const t = unpackTree(JSON.parse(raw));
       residentWsIdRef.current = wsId;
       return;
     }
-    structRef.current = restoreStructTree();
+    structRef.current =
+      modeRef.current === "tile" ? buildGrid(paneIdsRef.current) : restoreStructTree();
     residentWsIdRef.current = wsId;
     const savedMode = lsGet(modeKey);
     if (MODES.includes(/** @type {TilingMode} */ (savedMode))) {
@@ -254,7 +276,7 @@ const t = unpackTree(JSON.parse(raw));
       setModeState(m);
       lsSet(modeKey, m);
       if (m === "tile") {
-        structRef.current = buildBalancedTree(paneIdsRef.current);
+        structRef.current = buildGrid(paneIdsRef.current);
         persistStruct();
       } else if (m === "columns") {
         structRef.current = buildDefaultTree(paneIdsRef.current);
