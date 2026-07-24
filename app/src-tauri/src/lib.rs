@@ -9392,6 +9392,7 @@ fn loop_iteration(
         model,
         cfg.workspace_id.clone(),
         "human",
+        None, // loop-fired delegate has no caller workspace identity
     );
     if resp.ok {
         match resp.data {
