@@ -2403,6 +2403,13 @@ fn write_to_pane(
     id: &str,
     data: &[u8],
     caller_ws: Option<&str>,
+    // operator_bypass: the trusted local webview (the human operator typing into their OWN
+    // panes) passes true so a human's keystrokes are NEVER blocked by the cross-tenant gate —
+    // isolation bounds automated / coordinator cross-workspace CONTROL, not the operator's own
+    // keyboard, and the webview's caller_ws (registry `active`) need not equal the focused
+    // pane's id-prefix workspace. Every automated path (MCP socket send/handoff/delegate, the
+    // GUI bridge) passes false so cross-tenant control stays gated.
+    operator_bypass: bool,
 ) -> Result<(), String> {
     // F1 (Q4 Stage-4): a Daemon-owned pane is typed via the daemon's gated `SendInput` op —
     // the daemon owns the C7 claude prime + the paste/Ink split-submit + the D30 alive gate.
@@ -2415,6 +2422,7 @@ fn write_to_pane(
     // OFF) is read inside `authorize_cross` — inert while off. Same-ws always passes. The
     // AuthErr Display prefix (`CROSS_WORKSPACE:` / `NO_CALLER_WS:`) is the token callers
     // pattern-match on to surface the structured response code.
+    if !operator_bypass {
     if let Some(tws) = ws_of_pane(id) {
         let reg = read_registry(&state.state_root).unwrap_or(LiveRegistry {
             schema: LIVE_REGISTRY_SCHEMA,
@@ -2427,6 +2435,7 @@ fn write_to_pane(
             return Err(e.to_string());
         }
     }
+    } // operator_bypass guard
     // ── Per-pane WRITE SERIALIZER ──
     // Hold THIS pane's write lock across the WHOLE write, INCLUDING the Esc-prime settle and
     // the split-submit settle sleeps below. This is the CONSERVATIVE ordering design: every
@@ -2592,7 +2601,7 @@ fn send_input(state: tauri::State<AppState>, id: String, data: String) -> Result
     // a stale GUI tab writing to a pane that isn't the active workspace) would deny under
     // isolation — expected behavior under the Phase-1 design.
     let caller_ws: Option<String> = read_registry(&state.state_root).and_then(|r| r.active);
-    write_to_pane(&state, &id, data.as_bytes(), caller_ws.as_deref())
+    write_to_pane(&state, &id, data.as_bytes(), caller_ws.as_deref(), true)
 }
 
 /// Send `sig` to a pane's PTY child (shared body of [`pause_pane`]/[`resume_pane`]).
@@ -7059,7 +7068,7 @@ fn send_to_panes(
     let mut sent = Vec::new();
     let mut skipped = Vec::new();
     for (id, line) in targets {
-        match write_to_pane(state, &id, line.as_bytes(), caller_ws) {
+        match write_to_pane(state, &id, line.as_bytes(), caller_ws, false) {
             Ok(()) => sent.push(id),
             // Dead PTY (D30), unknown id, or cross-workspace denial ⇒ skipped, reported —
             // not a silent vanish. The caller inspects the returned `SocketData` to decide
@@ -7447,7 +7456,7 @@ fn socket_handoff(
         Ok(l) => l,
         Err(e) => return SocketResponse::err(response_code::BAD_REQUEST, e),
     };
-    match write_to_pane(&st, to, line.as_bytes(), caller_ws) {
+    match write_to_pane(&st, to, line.as_bytes(), caller_ws, false) {
         Ok(()) => SocketResponse::ok("handoff delivered"),
         Err(e) if e == "no such workspace" => SocketResponse::err(response_code::UNKNOWN_WORKSPACE, e),
         Err(e) if e == "workspace is no longer alive" => SocketResponse::err(response_code::DEAD_PANE, e),
@@ -7880,7 +7889,7 @@ fn handle_socket_request(
                 Err(e) => return SocketResponse::err(response_code::BAD_REQUEST, e),
             };
             let st = app.state::<AppState>();
-            match write_to_pane(&st, &id, data.as_bytes(), caller_ws.as_deref()) {
+            match write_to_pane(&st, &id, data.as_bytes(), caller_ws.as_deref(), false) {
                 Ok(()) => SocketResponse::ok("input delivered"),
                 Err(e) if e == "no such workspace" => {
                     SocketResponse::err(response_code::UNKNOWN_WORKSPACE, e)
@@ -10709,7 +10718,7 @@ impl flywheel::runctx::DynEmitter for TauriEmitter {
             // the MCP caller's ws before this thread was spawned). Derive caller_ws from the
             // parent_id so the write gate sees same-ws and passes.
             let parent_ws = ws_of_pane(&self.parent_id);
-            let _ = write_to_pane(&st, &self.parent_id, line.as_bytes(), parent_ws);
+            let _ = write_to_pane(&st, &self.parent_id, line.as_bytes(), parent_ws, false);
         }
     }
 }
@@ -11321,7 +11330,7 @@ fn delegate_controller(
         beat_in_flight(&app, run_id, msg);
         if let Ok(line) = normalize_input(msg) {
             let st = app.state::<AppState>();
-            let _ = write_to_pane(&st, parent_id, line.as_bytes(), parent_ws.as_deref());
+            let _ = write_to_pane(&st, parent_id, line.as_bytes(), parent_ws.as_deref(), false);
         }
     };
 
