@@ -1017,12 +1017,13 @@ pub const EXTERNAL_SPAWN_MAX_PANES: u32 = 8;
 
 /// The EFFECTIVE external-spawn pane cap for this install: the operator's
 /// `external_spawn_max_panes` (mcp-config.json) if set, else [`EXTERNAL_SPAWN_MAX_PANES`];
-/// clamped to 1..=16 (16 = the daemon's `MAX_DAEMON_PANES` live ceiling — a bigger
-/// per-request cap could never spawn anyway). Pure → unit-tested.
+/// clamped to 1..=32 (tracks the app's raised `max_concurrent` / autonomy ceiling of 32 —
+/// the daemon-owned `MAX_DAEMON_PANES` limit, currently 16, only bites when `daemon_spawn`
+/// is ON and is a separate gate). Pure → unit-tested.
 pub fn external_spawn_cap(cfg: &McpConfig) -> u32 {
     cfg.external_spawn_max_panes
         .unwrap_or(EXTERNAL_SPAWN_MAX_PANES)
-        .clamp(1, 16)
+        .clamp(1, 32)
 }
 
 /// The EFFECTIVE pinned external-orchestrator executable set: the singular
@@ -1624,8 +1625,10 @@ pub struct McpConfig {
     /// EXTERNAL-SPAWN per-request pane cap (#262 ext): how many panes ONE external
     /// `CreateWorkspace` may open (summed across its specs). Absent → the built-in default
     /// [`EXTERNAL_SPAWN_MAX_PANES`] (8). Read through [`external_spawn_cap`], which CLAMPS
-    /// to 1..=16 (16 = the daemon's live-pane ceiling) so a typo can neither zero the spawn
-    /// surface nor unbound it. File-only; not LLM-settable.
+    /// to 1..=32 (tracks the app's raised `max_concurrent` / autonomy ceiling of 32; the
+    /// daemon-owned `MAX_DAEMON_PANES` is a separate, currently-16 gate that only bites when
+    /// `daemon_spawn` is ON) so a typo can neither zero the spawn surface nor unbound it.
+    /// File-only; not LLM-settable.
     #[serde(default)]
     pub external_spawn_max_panes: Option<u32>,
     /// Absolute executable path of the authorized external orchestrator app (e.g. the
@@ -3919,17 +3922,21 @@ mod tests {
 
     #[test]
     fn external_spawn_cap_defaults_and_clamps() {
-        // Absent ⇒ the built-in default.
+        // Absent ⇒ the built-in default (8).
         let mut cfg = McpConfig::default();
         assert_eq!(external_spawn_cap(&cfg), EXTERNAL_SPAWN_MAX_PANES);
+        assert_eq!(external_spawn_cap(&cfg), 8, "default stays 8 even after the ceiling raise");
         // Operator raise within range honored.
         cfg.external_spawn_max_panes = Some(12);
         assert_eq!(external_spawn_cap(&cfg), 12);
-        // Clamped: 0 can't zero the surface; huge can't unbound it past the daemon ceiling.
+        // Clamped: 0 can't zero the surface; huge can't unbound it past the daemon ceiling
+        // (raised 16→32 to track the app's max_concurrent autonomy ceiling).
         cfg.external_spawn_max_panes = Some(0);
         assert_eq!(external_spawn_cap(&cfg), 1);
+        cfg.external_spawn_max_panes = Some(99);
+        assert_eq!(external_spawn_cap(&cfg), 32, "99 hits the raised ceiling of 32");
         cfg.external_spawn_max_panes = Some(999);
-        assert_eq!(external_spawn_cap(&cfg), 16);
+        assert_eq!(external_spawn_cap(&cfg), 32, "999 still clamps to the ceiling of 32");
         // File round-trip: the knob is plain JSON in mcp-config.json.
         let s = Scratch::new("mcp-config-spawncap");
         let p = mcp_config_path(s.path()).unwrap();

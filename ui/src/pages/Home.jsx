@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace, resetWorkspaces } from "@/lib/workspaceStore";
 import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
+import { toast } from "@/components/ui/use-toast";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
 import { isReplyTraffic, isTauri } from "@/lib/tauriAgentBridge";
@@ -222,6 +223,14 @@ export default function Home() {
     workspaces[0]?.id,
   );
   const visibleAgents = agents.filter((a) => visibleIds.includes(a.id));
+  // Tile mode pins a coordinator-role pane (free-text role containing "coordinator"/"orchestrator",
+  // case-insensitive — the header uppercases it to [COORDINATOR]) as a full-height left column and
+  // grids the remaining workers on the right. Roles that don't match ⇒ no pin, the whole fleet
+  // becomes one uniform aligned grid.
+  const coordinatorId =
+    visibleAgents.find(
+      (a) => typeof a.role === "string" && /(coordinator|orchestrator)/i.test(a.role),
+    )?.id ?? null;
 
   // Headless BSP tiling for the visible panes → absolute {x,y,w,h} rects + draggable seams.
   // Direct-DOM frame applier for seam drags (prod relayout parity, main.js:886-935): the hook
@@ -257,6 +266,7 @@ export default function Home() {
   const { rects, mode, setMode, seams, onSeamPointerDown, movePane, zoomId, toggleZoom } = useTiling({
     paneIds: visibleIds,
     focusedId: selectedId,
+    coordinatorId,
     containerRef: tilingHostRef,
     wsId: activeWorkspace,
     onDragFrame: applyDragFrame,
@@ -333,6 +343,49 @@ export default function Home() {
     }).catch(() => {});
     return () => {
       cancelled = true;
+      if (typeof unlisten === "function") {
+        try { unlisten(); } catch { /* ignore */ }
+      }
+    };
+  }, []);
+
+  // Backend emits "spawn-cap-warning" when a spawn is parked at the global concurrent-pane
+  // cap (the queue path that used to be totally silent). Belt-and-suspenders with the bridge's
+  // own queued-toast: this also fires for spawn paths that don't go through spawnAgents
+  // (external/delegate). Coalesced — one toast per burst, not one per queued pane.
+  useEffect(() => {
+    if (!isTauri()) return undefined;
+    const listen = window.__TAURI__?.event?.listen;
+    if (typeof listen !== "function") return undefined;
+    let unlisten = null;
+    let cancelled = false;
+    let timer = null;
+    let last = null;
+    listen("spawn-cap-warning", (e) => {
+      const p = (e && e.payload) || {};
+      last = p;
+      if (timer) return; // coalesce a burst of queued spawns into a single toast
+      timer = setTimeout(() => {
+        timer = null;
+        const q = last || {};
+        toast({
+          title: "Agent cap reached — spawns are queued",
+          description:
+            `${q.working ?? "?"}/${q.max ?? "?"} panes running. New panes wait in line ` +
+            "(#" + (q.position ?? "?") + "). Close idle panes or raise the cap to run more.",
+          variant: "destructive",
+        });
+      }, 400);
+    }).then((fn) => {
+      if (cancelled) {
+        try { fn(); } catch { /* ignore */ }
+        return;
+      }
+      unlisten = fn;
+    }).catch(() => { /* event API absent / reject — browser-safe */ });
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
       if (typeof unlisten === "function") {
         try { unlisten(); } catch { /* ignore */ }
       }
@@ -458,18 +511,57 @@ export default function Home() {
   };
 
   const activeCount = agents.filter((a) => a.status === "working").length;
+  // B: per-workspace working count + the global admission cap (from the bridge's 1s
+  // get_capacity poll). atCap gates NEW AGENT / TEMPLATES; nearCap shows a HUD warning.
+  const localWorking = visibleAgents.filter((a) => a.status === "working").length;
+  const capacity = bridge.getCapacity ? bridge.getCapacity() : null;
+  const capMax = capacity?.max ?? null;
+  const capWorking = capacity?.working ?? activeCount;
+  const atCap = capMax != null && capWorking >= capMax;
+  const nearCap = capMax != null && !atCap && capWorking >= capMax - 2;
+  const guardedNewAgent = () => {
+    if (atCap) {
+      toast({
+        title: "At the agent cap",
+        description: `${capWorking}/${capMax} panes running. Close an idle pane or raise the cap (Scheduler) to add more.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    if (nearCap) {
+      toast({ title: "Near the agent cap", description: `${capWorking}/${capMax} panes running.` });
+    }
+    setOverlay("new-agent");
+  };
+  const guardedTemplates = () => {
+    if (atCap) {
+      toast({
+        title: "At the agent cap",
+        description: `${capWorking}/${capMax} panes running — a template's spawns would queue. Free slots first.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    if (nearCap) {
+      toast({ title: "Near the agent cap", description: `${capWorking}/${capMax} panes running — a big template may queue.` });
+    }
+    setOverlay("templates");
+  };
 
   return (
     <div className="h-screen flex flex-col bg-[#0D1117] scanlines overflow-hidden">
       <TitleBar />
       <TopBar
         activeCount={activeCount}
+        localWorking={localWorking}
+        capMax={capMax}
+        atCap={atCap}
         broadcastActive={broadcast}
         onBroadcastToggle={() => setBroadcast((b) => !b)}
-        onNewAgent={() => setOverlay("new-agent")}
+        onNewAgent={guardedNewAgent}
         onBroadcast={() => setOverlay("broadcast")}
         onDelegate={() => setOverlay("delegate")}
-        onTemplates={() => setOverlay("templates")}
+        onTemplates={guardedTemplates}
         onCloseWorkspace={() => setOverlay("close-workspace")}
       />
       {agents.length === 0 ? (
@@ -547,6 +639,20 @@ export default function Home() {
               className="bg-transparent hover:bg-cyan-400/30 transition-colors"
             />
           ))}
+          {visibleAgents.length === 0 && workspaces.length > 1 && activeWorkspace !== workspaces[0]?.id && (
+            <div className="absolute inset-0 flex items-center justify-center p-8 pointer-events-none">
+              <div className="max-w-md text-center border border-cyan-900/70 bg-[#0A1219]/80 rounded-sm px-6 py-5">
+                <div className="font-heading text-[11px] tracking-[0.3em] text-cyan-400 font-bold mb-2">
+                  NO AGENTS IN THIS WORKSPACE
+                </div>
+                <div className="font-mono text-[11px] text-cyan-700/90 leading-relaxed">
+                  The fleet is at its concurrent-pane cap, so this workspace's spawns are queued
+                  or failed — watch for the toast. Close idle panes or raise the cap (Scheduler),
+                  or launch a template here.
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-[1fr_1.3fr_1.3fr_1fr] gap-4 p-4 pt-0 h-64 shrink-0">
