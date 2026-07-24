@@ -2,7 +2,7 @@ import React from "react";
 import { Plus } from "lucide-react";
 import WorkspaceTile from "@/components/command/WorkspaceTile";
 
-export default function WorkspacesPanel({ workspaces, activeId, onSelect, onAdd, onRename, onDelete }) {
+export default function WorkspacesPanel({ workspaces, activeId, onSelect, onAdd, onRename, onDelete, memberCounts, onToggleSharing }) {
   // Never offer delete on the last remaining workspace.
   const deletable = workspaces.length > 1 ? onDelete : undefined;
   return (
@@ -15,7 +15,16 @@ export default function WorkspacesPanel({ workspaces, activeId, onSelect, onAdd,
       </div>
       <div className="p-3 grid grid-cols-3 gap-2.5 content-start overflow-y-auto terminal-scroll">
         {workspaces.map((ws) => (
-          <WorkspaceTile key={ws.id} ws={ws} active={activeId === ws.id} onSelect={onSelect} onRename={onRename} onDelete={deletable} />
+          <WorkspaceTile
+            key={ws.id}
+            ws={ws}
+            active={activeId === ws.id}
+            onSelect={onSelect}
+            onRename={onRename}
+            onDelete={deletable}
+            memberCount={memberCounts ? memberCounts[ws.id] ?? 0 : 0}
+            onToggleSharing={onToggleSharing}
+          />
         ))}
       </div>
     </div>

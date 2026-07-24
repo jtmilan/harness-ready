@@ -102,6 +102,35 @@ export function isTauri() {
 // Ported verbatim from agent-teams app/src/main.js:82.
 const DEAD_RE = /no longer alive|no such workspace|not alive/i;
 
+// Backend cross-workspace isolation reject (phase 1): any send/broadcast/handoff
+// that targets a pane outside the caller's workspace is refused with a string
+// starting "CROSS_WORKSPACE:". Surface it loudly (toast + re-throw) instead of
+// swallowing — the operator must see the boundary, not wonder why a keystroke
+// went silent.
+function isCrossWs(err) {
+  return /CROSS_WORKSPACE/i.test(String(err && err.message ? err.message : err));
+}
+
+function toastCrossWs(e) {
+  toast({
+    title: "Blocked: cross-workspace",
+    description: String(e && e.message ? e.message : e).slice(0, 240),
+    variant: "destructive",
+  });
+}
+
+// Backend sharing-state fetch (phase 1): per-ws allow_sharing map. Empty object
+// on failure / old backend without the command — the UI then renders every ws
+// as isolated, which is the safe default.
+async function fetchSharingStates() {
+  try {
+    const m = await invoke("get_workspace_sharing_states");
+    return m && typeof m === "object" ? m : {};
+  } catch {
+    return {};
+  }
+}
+
 // Terminal REPLY traffic. xterm emits these through the SAME onData channel as
 // keystrokes, but UNPROMPTED — no user key is behind them: SGR mouse reports
 // (\x1b[<…M/m), focus in/out (\x1b[I / \x1b[O), and OSC query replies (\x1b]11;rgb:…,
@@ -134,6 +163,9 @@ export class TauriAgentBridge {
     this.capacity = null;    // { max, working } from get_capacity (1s poll); null until first read
     this._capTimer = null;
     this._capDisabled = false; // backend lacks get_capacity (old build) → stop polling
+    this.sharing = {};       // wsId → bool from get_workspace_sharing_states (1.5s poll); {} until first read
+    this._shareTimer = null;
+    this._shareDisabled = false; // backend lacks get_workspace_sharing_states (old build) → stop polling
     this.raw = {};           // pane id → accumulated RAW PTY bytes (fed verbatim to xterm)
     this.gen = {};           // pane id → generation; bumps on a `truncated` history gap → term reset
     this.spawned = loadSpawned(); // pane id → {kind, role} the adapter itself spawned; read set is
@@ -187,11 +219,53 @@ export class TauriAgentBridge {
       tick();
       this._capTimer = setInterval(tick, 1000);
     }
+    // Sharing state (per-ws allow_sharing) — mirrored from the backend on a 1.5s timer
+    // (same shape as the capacity poll, NOT the 120ms hot loop). Backend is authoritative;
+    // localStorage never persists this. Folded into _emit so subscribers re-render on change.
+    if (!this._shareTimer && !this._shareDisabled) {
+      const shareTick = async () => {
+        if (this._shareDisabled) return;
+        const m = await fetchSharingStates();
+        // Cheap equality: only re-emit when a key changed (avoids no-op renders every 1.5s).
+        const prev = this.sharing;
+        const prevKeys = Object.keys(prev);
+        const nextKeys = Object.keys(m);
+        const changed =
+          prevKeys.length !== nextKeys.length ||
+          nextKeys.some((k) => !!prev[k] !== !!m[k]);
+        if (changed) {
+          this.sharing = m;
+          this._emit();
+        }
+      };
+      shareTick();
+      this._shareTimer = setInterval(shareTick, 1500);
+    }
   }
 
   // Latest admission cap + working count (null until the first get_capacity resolves).
   getCapacity() {
     return this.capacity;
+  }
+
+  // Latest backend sharing map (wsId → bool). Empty until the first fetch resolves; the
+  // UI treats every ws as isolated in that window (safe default).
+  getSharing() {
+    return this.sharing;
+  }
+
+  // Toggle a workspace's allow_sharing flag on the backend. Resolves to the new value
+  // the backend persisted; rejects with a string on failure. The caller is responsible for
+  // optimistic UI + rollback on reject.
+  async setWorkspaceSharing(wsId, enabled) {
+    return await invoke("set_workspace_sharing", { ws_id: wsId, enabled });
+  }
+
+  // One-shot sharing-state fetch (the timer-driven mirror is fetchSharingStates at
+  // module scope). Exposed so Home can poll on its own cadence and merge into the
+  // workspaces[] shape without waiting for the bridge's next _emit.
+  async fetchSharingStates() {
+    return fetchSharingStates();
   }
 
   async _poll() {
@@ -441,18 +515,47 @@ export class TauriAgentBridge {
     this._poll();
   }
 
-  sendInput(id, text) { return invoke("send_input", { id, data: text + "\n" }); }
+  sendInput(id, text) {
+    return invoke("send_input", { id, data: text + "\n" }).catch((e) => {
+      if (isCrossWs(e)) { toastCrossWs(e); }
+      throw e;
+    });
+  }
   // Raw keystrokes from the xterm terminal — sent verbatim (NO trailing newline; the
   // terminal already includes \r etc.). Distinct from sendInput's line-submit path.
-  sendRaw(id, data) { return invoke("send_input", { id, data }); }
+  sendRaw(id, data) {
+    return invoke("send_input", { id, data }).catch((e) => {
+      if (isCrossWs(e)) { toastCrossWs(e); }
+      throw e;
+    });
+  }
   // NO .catch here: the rejection is the AgentPane's signal to keep its "acked
   // dims" guard open and retry — resize_pty races the multi-second spawn_workspace
   // (optimistic pane mounts first → "no such workspace"), and swallowing that left
   // the PTY at its 30×100 spawn size forever while xterm re-fit without it.
   resizePane(id, rows, cols) { return invoke("resize_pty", { id, rows, cols }); }
-  delegate(id, task) { return this.sendInput(id, task); }
-  broadcast(text) { return Promise.all(this.agents.map((a) => this.sendInput(a.id, text))); }
-  broadcastTo(ids, text) { return Promise.all(ids.map((id) => this.sendInput(id, text))); }
+  delegate(id, task) {
+    return this.sendInput(id, task).catch((e) => {
+      if (isCrossWs(e)) toastCrossWs(e);
+      throw e;
+    });
+  }
+  broadcast(text) {
+    return Promise.all(this.agents.map((a) =>
+      this.sendInput(a.id, text).catch((e) => {
+        if (isCrossWs(e)) toastCrossWs(e);
+        throw e;
+      }),
+    ));
+  }
+  broadcastTo(ids, text) {
+    return Promise.all(ids.map((id) =>
+      this.sendInput(id, text).catch((e) => {
+        if (isCrossWs(e)) toastCrossWs(e);
+        throw e;
+      }),
+    ));
+  }
 
   // Broadcast TOGGLE mode: one keystroke → every LIVE pane, verbatim (sendRaw's payload
   // shape — NO trailing "\n"; the terminal's own bytes already carry \r). Distinct from
@@ -470,6 +573,14 @@ export class TauriAgentBridge {
       // Swallow it (an unhandled rejection per keystroke per corpse is noise) and let
       // _noteDeadPane both drop it from the rest of the burst and light its error state.
       this.sendRaw(a.id, data).catch((e) => {
+        // Cross-workspace reject beats the dead-pane regex: isolation is a policy
+        // boundary the operator MUST see, not a silent PTY death. Toast + log distinct
+        // (do NOT silently swallow — the dead path would otherwise hide it).
+        if (isCrossWs(e)) {
+          toastCrossWs(e);
+          console.warn("[TauriAgentBridge] broadcast cross-workspace blocked:", a.id);
+          return;
+        }
         if (DEAD_RE.test(String(e))) this._noteDeadPane(a.id);
         else console.error("[TauriAgentBridge] broadcast send_input failed:", a.id, e);
       })
