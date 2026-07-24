@@ -18,6 +18,7 @@
 import { randomAgentName } from "@/lib/agentNames";
 import { reconcilePaneLabels } from "@/lib/paneLabels";
 import { assignMany, unassign } from "@/lib/workspaceAssign";
+import { toast } from "@/components/ui/use-toast";
 
 // Prod parity: POLL_TICK_MS = 120 in agent-teams app/src/poll-core.js:7 — 500ms reads a beat
 // behind a streaming TUI. Guarded against overlap in _poll (120ms can undercut a slow invoke).
@@ -346,12 +347,26 @@ export class TauriAgentBridge {
       this.spawned[id] = { kind: cfg.kind, role: cfg.role, repo };
       this.offsets[id] = 0;
       try {
-        await invoke("spawn_workspace", {
+        // Capture the result: SpawnResult.queued means the global concurrent-pane cap
+        // (max_concurrent) parked this spawn instead of running it. The pane stays
+        // optimistically registered (renders "starting") but the operator MUST see why a
+        // workspace looks stuck — historically this Ok was discarded and the pane silently
+        // never appeared (the "3rd+ workspace is blank" bug).
+        const res = await invoke("spawn_workspace", {
           id,
           harness,
           repo,
           role: cfg.role,
         });
+        if (res && res.queued) {
+          toast({
+            title: "Pane queued — at the agent cap",
+            description:
+              `${id} is #${res.position} in line (cap ${res.max}). ` +
+              "It starts when a pane frees up. Close idle panes or raise the cap (Scheduler) to run more.",
+            variant: "destructive",
+          });
+        }
         if (cfg.role) await invoke("set_pane_roles", { roles: [[id, cfg.role]] });
         minted.push(id);
       } catch (e) {
@@ -359,8 +374,16 @@ export class TauriAgentBridge {
         // Drop ghost registration AND any pre-assign so the id does not stick on a ws.
         delete this.spawned[id];
         if (assignTo) unassign(id);
-        this.raw[id] = "\r\n\x1b[31m[spawn failed] " + String(e && e.message ? e.message : e) + "\x1b[0m\r\n";
+        const errMsg = String(e && e.message ? e.message : e);
+        this.raw[id] = "\r\n\x1b[31m[spawn failed] " + errMsg + "\x1b[0m\r\n";
         console.error("[TauriAgentBridge] spawn_workspace failed:", id, e);
+        // The raw line above has no terminal to render into once the id is unregistered,
+        // so also surface it as a toast — otherwise the failure is console-only.
+        toast({
+          title: "Agent failed to spawn",
+          description: `${id}: ${errMsg}`,
+          variant: "destructive",
+        });
       }
     }
     this._saveSpawned();

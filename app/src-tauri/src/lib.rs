@@ -1746,6 +1746,9 @@ fn arm_early_death_respawn(app: tauri::AppHandle, ps: PendingSpawn) {
 #[allow(clippy::too_many_arguments)] // Tauri command: the args ARE the frontend invoke() contract
 fn spawn_workspace(
     state: tauri::State<AppState>,
+    // Tauri-injected (not a frontend arg) so we can emit a "you hit the cap" warning when a
+    // spawn is queued. Frontend invoke() is unaffected — AppHandle is supplied by the framework.
+    app: tauri::AppHandle,
     id: String,
     harness: String,
     repo: String,
@@ -1831,6 +1834,18 @@ fn spawn_workspace(
                 .position(|p| p.id == id)
                 .map(|i| i + 1)
                 .unwrap_or_else(|| pend.len());
+            // The cap is GLOBAL across workspaces, so a queued spawn here is exactly the
+            // "3rd+ workspace silently gets nothing" case. Warn the operator instead of
+            // returning an Ok that the frontend used to discard — the bridge toasts on it.
+            let _ = app.emit(
+                "spawn-cap-warning",
+                serde_json::json!({
+                    "id": id,
+                    "position": position,
+                    "working": wc,
+                    "max": max,
+                }),
+            );
             return Ok(SpawnResult { queued: true, position });
         }
     }
@@ -6535,7 +6550,7 @@ struct ExternalPaneGroup {
 /// (all-or-nothing), and enforce the SUMMED count cap with a SATURATING add (so a wrapping
 /// `u32` sum can never slip past the cap). `cap` is the install's EFFECTIVE per-request
 /// pane cap — the caller resolves it via `external_spawn_cap(&cfg)` (operator-configurable
-/// `external_spawn_max_panes`, default 8, clamped 1..=16). Returns the groups + total, or
+/// `external_spawn_max_panes`, default 8, clamped 1..=32). Returns the groups + total, or
 /// `(code, detail)` to refuse. Trusted-repo is enforced separately (it needs `AppState`);
 /// this fn is dep-free so the gate's WHAT-logic is fully covered by tests.
 fn normalize_external_spawn(
@@ -6581,7 +6596,7 @@ fn normalize_external_spawn(
             response_code::BAD_REQUEST,
             format!(
                 "external spawn: total panes out of range (1..={cap} across all specs; \
-                 raise external_spawn_max_panes in mcp-config.json up to 16 if you need more)"
+                 raise external_spawn_max_panes in mcp-config.json up to 32 if you need more)"
             ),
         ));
     }
@@ -6636,7 +6651,7 @@ fn add_pane_ceiling_check(
             format!(
                 "external add_pane: workspace {ws} is already at the pane ceiling \
                  ({live_count}/{cap}) — close a pane or raise external_spawn_max_panes \
-                 in mcp-config.json (max 16)"
+                 in mcp-config.json (max 32)"
             ),
         ));
     }
@@ -10479,18 +10494,133 @@ fn bridge_open_pr(state: tauri::State<AppState>, dir: String) -> Result<String, 
 
 /// Default concurrency cap, scaled from the host core count. Leaves one core for the UI/
 /// system, FLOORS at 3 (the historical default — never regress below it), and HARD-CAPS at
-/// 16 (raised 8→16 alongside DELEGATE_MAX_WORKERS=10 so the fairness budget `cap-1` can admit
-/// up to 10 delegate workers + 1 reserved human slot) so even a huge box never auto-arms an
-/// unbounded pane fleet. The cap is the autonomy safety bound; the operator can still raise/
-/// lower it at runtime via `set_max_concurrent`. Pure (core count in → cap out) so the clamp
-/// is unit-tested without touching the host.
+/// 32 (the autonomy safety bound — raised 8→16→32 so memory-rich boxes aren't pinned to the
+/// core-count formula when RAM/fd headroom admits more; still bounded so even a huge box
+/// never auto-arms an unbounded pane fleet). The operator can still raise/lower it at
+/// runtime via `set_max_concurrent`. Pure (core count in → cap out) so the clamp is
+/// unit-tested without touching the host.
 fn clamp_default_cap(cores: usize) -> usize {
-    cores.saturating_sub(1).clamp(3, 16)
+    cores.saturating_sub(1).clamp(3, 32)
+}
+
+// Per-agent memory budget used to derive a RAM-aware cap. A coding-agent TUI (claude/grok/
+// codex) plus its MCP sidecar + a 4 MiB PaneBuffer + xterm lands around here on average; peak
+// can be higher, so this is a conservative *average* for headroom math, not a hard per-pane cap.
+const AGENT_MEM_BUDGET_BYTES: u64 = 350 * 1024 * 1024;
+// RAM reserved for the OS + the single shared webview + daemon + the app itself.
+const RESERVED_MEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+// File descriptors reserved for Tauri/daemon/sockets/stdio so the per-pane PTY fds (≈3 each)
+// never drive the process into the macOS default soft `ulimit -n` (256) cliff.
+const RESERVED_FDS: u64 = 64;
+const FDS_PER_PANE: u64 = 3;
+
+// Available physical memory in bytes via mach `host_statistics64`, portable across Apple-Silicon
+// and Intel macs (raw sysctl, no extra crate). Returns None off-mac or on failure → caller falls
+// back to the core-count cap. Lets an 8 GB box auto-clamp below a 16 GB one instead of OOMing.
+#[cfg(target_os = "macos")]
+fn available_memory_bytes() -> Option<u64> {
+    use std::mem;
+    #[repr(C)]
+    struct VmStat64 {
+        free: u64,
+        active: u64,
+        inactive: u64,
+        wire: u64,
+        zero_fill: u64,
+        reactivations: u64,
+        pageins: u64,
+        pageouts: u64,
+        faults: u64,
+        cow_faults: u64,
+        lookups: u64,
+        hits: u64,
+        purges: u64,
+        purgeable_count: u64,
+        speculative_count: u64,
+        decompressions: u64,
+        compressions: u64,
+        swapins: u64,
+        swapouts: u64,
+        compressor_page_count: u64,
+        throttled_count: u64,
+        external_page_count: u64,
+        internal_page_count: u64,
+        total_uncompressed_pages_in_compressor: u64,
+    }
+    unsafe {
+        #[allow(deprecated)] // mach_host_self is deprecated in libc 0.2.186 but has no portable replacement here
+        let port = libc::mach_host_self();
+        let mut stat = mem::MaybeUninit::<VmStat64>::uninit();
+        let mut count = (mem::size_of::<VmStat64>() / mem::size_of::<u32>()) as libc::mach_msg_type_number_t;
+        let r = libc::host_statistics64(
+            port,
+            libc::HOST_VM_INFO64,
+            stat.as_mut_ptr() as libc::host_info64_t,
+            &mut count,
+        );
+        if r != libc::KERN_SUCCESS {
+            return None;
+        }
+        let s = stat.assume_init();
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as u64;
+        // free + inactive + purgeable + speculative ≈ reclaimable/available memory.
+        Some((s.free + s.inactive + s.purgeable_count + s.speculative_count).saturating_mul(page))
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn available_memory_bytes() -> Option<u64> {
+    None
+}
+
+// Soft open-file-descriptor limit (RLIMIT_NOFILE); None on failure → caller ignores the fd cap.
+fn nofile_soft_limit() -> Option<u64> {
+    unsafe {
+        let mut rl = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rl.as_mut_ptr()) == 0 {
+            Some(rl.assume_init().rlim_cur as u64)
+        } else {
+            None
+        }
+    }
+}
+
+// RAM-aware pane cap: how many AGENT_MEM_BUDGET agents fit in reclaimable memory after the
+// reservation. None when memory can't be probed (non-mac / failure) → no constraint from RAM.
+fn mem_headroom_cap() -> Option<usize> {
+    available_memory_bytes().map(|avail| {
+        (avail.saturating_sub(RESERVED_MEM_BYTES) / AGENT_MEM_BUDGET_BYTES) as usize
+    })
+}
+
+// fd-aware pane cap from the soft NOFILE limit. Always Some on unix; the core-count cap wins on
+// big limits, this only bites if someone raises max_concurrent toward the ~80-pane fd cliff.
+fn fd_headroom_cap() -> Option<usize> {
+    nofile_soft_limit().map(|soft| {
+        (soft.saturating_sub(RESERVED_FDS) / FDS_PER_PANE) as usize
+    })
 }
 
 fn default_max_concurrent() -> usize {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    clamp_default_cap(cores)
+    let core_cap = clamp_default_cap(cores);
+    // Core count is a FLOOR; RAM headroom governs UPWARD so a memory-rich box isn't pinned to
+    // the core-count formula (the user's M2 Pro 32GB has mem headroom for ~57, so it should not
+    // be stuck at the 12-core formula). File-descriptor headroom is the OPPOSITE — a hard
+    // CEILING, not a floor boost: on stock macOS `ulimit -n` is 256 → fd_headroom_cap ≈ 64, so
+    // max()-ing it would force EVERY mac to the autonomy ceiling and kill the small-RAM guard
+    // (an 8 GB box would get 32 panes ≈ 11 GB → swap death). So: cap = max(core, mem), then fd
+    // can only LOWER it (a safety net for the ~80-pane fd cliff if the ceiling is ever raised
+    // past it). Probes that fail (non-mac) contribute no change and core_cap stands.
+    // clamp_default_cap then bounds the result to [3, 32] (the autonomy safety ceiling); the
+    // operator can raise it at runtime via set_max_concurrent.
+    let mut cap = core_cap;
+    if let Some(m) = mem_headroom_cap() {
+        cap = cap.max(m);
+    }
+    if let Some(f) = fd_headroom_cap() {
+        cap = cap.min(f);
+    }
+    clamp_default_cap(cap)
 }
 
 /// Count OCCUPIED concurrency slots among the live panes, for the delegate budget gate. A
@@ -18729,17 +18859,21 @@ mod socket_seam_tests {
     }
 
     // P2 cap fix: the auto-default scales with cores but FLOORS at the old default (3) and
-    // HARD-CAPS at 8 — the autonomy bound never silently widens past the ceiling.
+    // HARD-CAPS at 32 — the autonomy bound never silently widens past the ceiling (raised
+    // 8→16→32 as the resource-aware formula admits bigger boxes).
     #[test]
-    fn clamp_default_cap_floors_at_three_and_ceils_at_sixteen() {
+    fn clamp_default_cap_floors_at_three_and_ceils_at_thirty_two() {
         assert_eq!(clamp_default_cap(0), 3, "0 cores → floor 3 (never below the old default)");
         assert_eq!(clamp_default_cap(1), 3, "1 core → sub-one underflows → floor 3");
+        assert_eq!(clamp_default_cap(2), 3, "2 cores → 1 → floor 3 (task-spec floor probe)");
         assert_eq!(clamp_default_cap(4), 3, "4 cores → 3 (leave one for the UI)");
         assert_eq!(clamp_default_cap(5), 4, "5 cores → 4");
         assert_eq!(clamp_default_cap(9), 8, "9 cores → 8 (one less than cores)");
+        assert_eq!(clamp_default_cap(10), 9, "10 cores → 9 (mid-range passthrough)");
         assert_eq!(clamp_default_cap(12), 11, "12 cores → 11 → budget cap-1=10 → 10 delegate workers reachable");
-        assert_eq!(clamp_default_cap(17), 16, "17 cores → 16 (hits the ceiling)");
-        assert_eq!(clamp_default_cap(33), 16, "32+ cores → still 16 (hard ceiling, raised 8→16)");
+        assert_eq!(clamp_default_cap(17), 16, "17 cores → 16 (mid-range, below the ceiling)");
+        assert_eq!(clamp_default_cap(33), 32, "33 cores → 32 (hits the hard ceiling)");
+        assert_eq!(clamp_default_cap(99), 32, "99 cores → 32 (ceiling holds, raised 16→32)");
     }
 
     // P2 cap fix: occupancy frees a slot ONLY for a settled idle/done pane; everything else
