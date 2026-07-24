@@ -131,6 +131,9 @@ export class TauriAgentBridge {
   constructor() {
     this.agents = [];        // our UI agent shape, keyed by pane id
     this.offsets = {};       // pane id → last `next` cursor for read_output_delta_batch
+    this.capacity = null;    // { max, working } from get_capacity (1s poll); null until first read
+    this._capTimer = null;
+    this._capDisabled = false; // backend lacks get_capacity (old build) → stop polling
     this.raw = {};           // pane id → accumulated RAW PTY bytes (fed verbatim to xterm)
     this.gen = {};           // pane id → generation; bumps on a `truncated` history gap → term reset
     this.spawned = loadSpawned(); // pane id → {kind, role} the adapter itself spawned; read set is
@@ -165,6 +168,30 @@ export class TauriAgentBridge {
   start() {
     if (this.timer) return;
     this.timer = setInterval(() => this._poll(), POLL_MS);
+    // Capacity (max + working) drives the HUD "N / max" + the NEW AGENT / TEMPLATES gate.
+    // Polled on its own 1s timer (NOT the 120ms hot poll — working_count scans state files),
+    // and folded into the normal _emit so the existing subscribe→render path picks it up.
+    if (!this._capTimer && !this._capDisabled) {
+      const tick = async () => {
+        if (this._capDisabled) return;
+        try {
+          const c = await invoke("get_capacity");
+          if (c && (this.capacity?.max !== c.max || this.capacity?.working !== c.working)) {
+            this.capacity = c;
+            this._emit();
+          }
+        } catch {
+          this._capDisabled = true; // backend without get_capacity — don't spam
+        }
+      };
+      tick();
+      this._capTimer = setInterval(tick, 1000);
+    }
+  }
+
+  // Latest admission cap + working count (null until the first get_capacity resolves).
+  getCapacity() {
+    return this.capacity;
   }
 
   async _poll() {

@@ -6,12 +6,18 @@ import { Megaphone, Network, Radio, LayoutTemplate, Plus, Power } from "lucide-r
 // `onBroadcast`, which opens the one-shot "send this text once" prompt.
 // Fleet Pause/Stop/Skip (playmode cluster) removed: Pause was local-only state, Stop was
 // an unconfirmed closeWorkspace duplicate of CLOSE WORKSPACE, Skip was a no-op stub.
-export default function TopBar({ activeCount, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace }) {
+export default function TopBar({ activeCount, localWorking = 0, capMax = null, atCap = false, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace }) {
   return (
     <div className="flex items-center gap-6 px-5 py-4 border-b border-cyan-900/60 bg-[#0A0E13]">
       <button
         onClick={onNewAgent}
-        className="flex items-center gap-2 px-5 py-2.5 bg-cyan-400/15 border-2 border-cyan-400 text-cyan-300 font-heading tracking-[0.2em] text-sm font-bold shadow-[0_0_14px_rgba(0,229,255,0.3)] hover:bg-cyan-400/25 transition-colors"
+        disabled={atCap}
+        title={atCap ? `At the agent cap (${capMax}). Close a pane or raise the cap to add more.` : "New agent"}
+        className={`flex items-center gap-2 px-5 py-2.5 border-2 font-heading tracking-[0.2em] text-sm font-bold transition-colors ${
+          atCap
+            ? "border-cyan-900 text-cyan-700 bg-cyan-400/5 opacity-50 cursor-not-allowed"
+            : "bg-cyan-400/15 border-cyan-400 text-cyan-300 shadow-[0_0_14px_rgba(0,229,255,0.3)] hover:bg-cyan-400/25"
+        }`}
       >
         <Plus className="w-4 h-4" /> NEW AGENT
       </button>

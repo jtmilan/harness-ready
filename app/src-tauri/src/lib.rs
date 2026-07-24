@@ -1882,6 +1882,29 @@ fn set_max_concurrent(state: tauri::State<AppState>, n: usize) -> usize {
     clamped
 }
 
+/// Read the admission cap + the current working-pane count (the same global union the spawn
+/// gate uses) so the HUD can show "N / max" and gate NEW AGENT / TEMPLATES at the ceiling.
+/// Cheap (one state-file scan); the frontend polls it on a 1s timer, off the 120ms hot poll.
+#[tauri::command]
+fn get_capacity(state: tauri::State<AppState>) -> serde_json::Value {
+    let mut live: std::collections::HashSet<String> =
+        state.sups.live_ids().into_iter().collect();
+    live.extend(
+        state
+            .daemon_panes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned(),
+    );
+    let working = working_count(&state.state_root, &live);
+    let max = *state
+        .max_concurrent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    serde_json::json!({ "max": max, "working": working })
+}
+
 /// Force-admit a specific pending spawn NOW, bypassing the cap (the "run now"
 /// override). Errs if the id isn't currently pending.
 /// (async): `do_spawn` runs `git worktree add` + `git status` subprocesses and a PTY
@@ -14016,6 +14039,7 @@ pub fn run() {
             bridge_verify,
             apply_update,
             set_max_concurrent,
+            get_capacity,
             run_now,
             speak,
             // 09-04 Slice 1 read-only diff viewer (AC-5). PLAIN entries (not in the

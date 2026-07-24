@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
 import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace, resetWorkspaces } from "@/lib/workspaceStore";
 import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
+import { toast } from "@/components/ui/use-toast";
 import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
 import { isReplyTraffic, isTauri } from "@/lib/tauriAgentBridge";
@@ -510,18 +511,57 @@ export default function Home() {
   };
 
   const activeCount = agents.filter((a) => a.status === "working").length;
+  // B: per-workspace working count + the global admission cap (from the bridge's 1s
+  // get_capacity poll). atCap gates NEW AGENT / TEMPLATES; nearCap shows a HUD warning.
+  const localWorking = visibleAgents.filter((a) => a.status === "working").length;
+  const capacity = bridge.getCapacity ? bridge.getCapacity() : null;
+  const capMax = capacity?.max ?? null;
+  const capWorking = capacity?.working ?? activeCount;
+  const atCap = capMax != null && capWorking >= capMax;
+  const nearCap = capMax != null && !atCap && capWorking >= capMax - 2;
+  const guardedNewAgent = () => {
+    if (atCap) {
+      toast({
+        title: "At the agent cap",
+        description: `${capWorking}/${capMax} panes running. Close an idle pane or raise the cap (Scheduler) to add more.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    if (nearCap) {
+      toast({ title: "Near the agent cap", description: `${capWorking}/${capMax} panes running.` });
+    }
+    setOverlay("new-agent");
+  };
+  const guardedTemplates = () => {
+    if (atCap) {
+      toast({
+        title: "At the agent cap",
+        description: `${capWorking}/${capMax} panes running — a template's spawns would queue. Free slots first.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    if (nearCap) {
+      toast({ title: "Near the agent cap", description: `${capWorking}/${capMax} panes running — a big template may queue.` });
+    }
+    setOverlay("templates");
+  };
 
   return (
     <div className="h-screen flex flex-col bg-[#0D1117] scanlines overflow-hidden">
       <TitleBar />
       <TopBar
         activeCount={activeCount}
+        localWorking={localWorking}
+        capMax={capMax}
+        atCap={atCap}
         broadcastActive={broadcast}
         onBroadcastToggle={() => setBroadcast((b) => !b)}
-        onNewAgent={() => setOverlay("new-agent")}
+        onNewAgent={guardedNewAgent}
         onBroadcast={() => setOverlay("broadcast")}
         onDelegate={() => setOverlay("delegate")}
-        onTemplates={() => setOverlay("templates")}
+        onTemplates={guardedTemplates}
         onCloseWorkspace={() => setOverlay("close-workspace")}
       />
       {agents.length === 0 ? (
