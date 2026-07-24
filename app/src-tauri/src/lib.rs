@@ -1633,6 +1633,7 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
             // the launch-cwd encoding of the project dir. None for cursor / no-session spawns.
             session_id: ps.session_id.clone(),
             spawned_at: Some(now),
+            allow_sharing: false,
         });
     });
     // One-shot early-death auto-respawn (operator-approved): some harness binaries crash
@@ -17582,6 +17583,7 @@ mod scheduler_tests {
                 tag: None,
                 session_id: None,
                 spawned_at: None,
+                allow_sharing: false,
             }],
         );
         // ...startup rewrites with our pid + an EMPTY set (the "clear stale" contract).
@@ -18548,6 +18550,7 @@ mod socket_seam_tests {
             tag: tag.map(String::from),
             session_id: None,
             spawned_at: None,
+            allow_sharing: false,
         }
     }
     fn lreg(entries: Vec<LiveWorkspace>) -> LiveRegistry {
