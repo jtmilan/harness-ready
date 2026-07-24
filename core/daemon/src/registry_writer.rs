@@ -42,6 +42,7 @@ pub fn build_registry(daemon_pid: u32, workspace_pids: &HashMap<String, u32>) ->
             tag: None,
             session_id: None,
             spawned_at: None,
+            allow_sharing: false,
         })
         .collect();
     // Deterministic order (HashMap iteration is unordered) so the on-disk file is stable

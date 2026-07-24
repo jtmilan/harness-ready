@@ -86,6 +86,41 @@ pub fn ws_prefix(id: &str) -> &str {
     }
 }
 
+/// Strict parser: extract the workspace prefix from a pane id of the form
+/// `${wsId}-p${idx}` where `idx` is a non-empty ASCII digit sequence. Returns
+/// `None` if the id has no `-p` tail, the tail is empty, or the tail contains
+/// non-digit bytes. This is the TENANT-KEY parser for workspace isolation —
+/// only well-formed pane ids yield a workspace; bare workspace ids or malformed
+/// tails are rejected so cross-tenant checks never silently pass.
+///
+/// # Examples
+/// - `ws76101x0-p0` → `Some("ws76101x0")`
+/// - `ws76101x0-p12` → `Some("ws76101x0")`
+/// - `ws76101x0` (bare) → `None`
+/// - `noPtail` → `None`
+/// - `ws1x0-pX` (non-digit tail) → `None`
+/// - `ws1x0-p` (empty tail) → `None`
+pub fn ws_of_pane(id: &str) -> Option<&str> {
+    let (ws, tail) = id.rsplit_once("-p")?;
+    if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+        Some(ws)
+    } else {
+        None
+    }
+}
+
+/// Symmetric shared-scope predicate: returns `true` iff some live entry in the
+/// registry whose workspace (parsed via [`ws_of_pane`], falling back to the raw
+/// id for bare workspace ids) equals `ws` has `allow_sharing=true`. Unknown
+/// workspace → `false` (fail closed). This is the READ-side check for
+/// cross-workspace visibility; the WRITE-side gate is [`authorize_cross`].
+pub fn sharing_enabled(registry: &LiveRegistry, ws: &str) -> bool {
+    registry.workspaces.iter().any(|entry| {
+        let entry_ws = ws_of_pane(&entry.id).unwrap_or(&entry.id);
+        entry_ws == ws && entry.allow_sharing
+    })
+}
+
 /// `Harness` → wire string (`adapter.rs:134-139`).
 fn harness_str(h: Harness) -> &'static str {
     match h {
@@ -340,6 +375,16 @@ pub struct LiveWorkspace {
     /// Spawn time (unix millis), if recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at: Option<u64>,
+    /// Workspace-isolation shared-scope opt-in: when `true`, this workspace
+    /// participates in symmetric cross-workspace sharing (another workspace with
+    /// `allow_sharing=true` may read/write its scoped state, subject to the
+    /// backend gates). Default `false` ⇒ isolated; the workspace's state is
+    /// visible only to its own panes. Serde-additive (older registry JSON
+    /// deserializes as `false`); NOT `skip_serializing_if` because the explicit
+    /// `false` must round-trip so an operator can flip it off and see the off
+    /// state in the serialized registry.
+    #[serde(default)]
+    pub allow_sharing: bool,
 }
 
 /// The live registry the app writes at spawn (sibling of `state_root`). Carries
@@ -1499,6 +1544,10 @@ pub mod response_code {
     pub const SEND_INPUT_DISABLED: &str = "SEND_INPUT_DISABLED";
     /// The request line was not a valid [`SocketRequest`].
     pub const BAD_REQUEST: &str = "BAD_REQUEST";
+    /// Cross-workspace op denied — the caller and target are in different
+    /// workspaces and at least one has `allow_sharing=false` (or the caller
+    /// has no workspace identity). Workspace isolation enforced.
+    pub const CROSS_WORKSPACE: &str = "CROSS_WORKSPACE";
     /// `autonomy_ceiling` is L0 (default) — autonomous delegation refused (suggest-only).
     pub const AUTONOMY_DISABLED: &str = "AUTONOMY_DISABLED";
     /// depth>1 requested — recursion is out of scope for the MVP (FR-12 deferred).
@@ -1566,6 +1615,98 @@ pub mod response_code {
     /// an absent id — answering ok here would let the caller drop its anchor while the
     /// in-flight spawn lands a LIVE pane moments later. The caller retries once it settles.
     pub const CLOSE_PENDING: &str = "CLOSE_PENDING";
+}
+
+/// Workspace-isolation authorization error. Returned by [`authorize_cross`] when
+/// a cross-workspace op is denied. The `Display` impl produces a self-describing
+/// message prefixed with the error token so callers can pattern-match on the
+/// string if needed (though the enum itself is the canonical type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthErr {
+    /// Cross-workspace op denied: caller and target are in different workspaces
+    /// and at least one has `allow_sharing=false`.
+    CrossWorkspace {
+        caller_ws: String,
+        target_ws: String,
+        op: String,
+    },
+    /// Cross-workspace op denied: caller has no workspace identity (external or
+    /// malformed). The caller must map this to a hard deny for write ops.
+    NoCallerWs {
+        op: String,
+    },
+}
+
+impl std::fmt::Display for AuthErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthErr::CrossWorkspace { caller_ws, target_ws, op } => {
+                write!(
+                    f,
+                    "CROSS_WORKSPACE: cross-workspace op '{}' denied: caller_ws='{}', target_ws='{}' (at least one has allow_sharing=false)",
+                    op, caller_ws, target_ws
+                )
+            }
+            AuthErr::NoCallerWs { op } => {
+                write!(
+                    f,
+                    "NO_CALLER_WS: cross-workspace op '{}' denied: caller has no workspace identity",
+                    op
+                )
+            }
+        }
+    }
+}
+
+/// Workspace-isolation authorization check. Returns `Ok(())` if the op is
+/// permitted; `Err(AuthErr)` if denied.
+///
+/// # Kill-switch semantics
+/// The `ws_isolation_enabled` flag in `McpConfig` is the KILL-SWITCH. When
+/// `false` (the default), this function returns `Ok(())` unconditionally —
+/// isolation is inert, all ops pass. When `true`, the following rules apply:
+///
+/// - **Same workspace**: `caller_ws == target_ws` → `Ok(())` (intra-workspace
+///   ops are always permitted).
+/// - **Cross workspace**: both `caller_ws` and `target_ws` must have
+///   `allow_sharing=true` in the live registry → `Ok(())`. If either has
+///   `allow_sharing=false` → `Err(CrossWorkspace)`.
+/// - **No caller workspace**: `caller_ws` is `None` → `Err(NoCallerWs)`. The
+///   caller (D1 hard-deny for external/no-caller) maps this to a deny for
+///   write ops.
+///
+/// # Testability
+/// This function reads the config via `read_mcp_config(state_root)` to check
+/// the kill-switch. For unit tests, pass a `state_root` pointing to a temp dir
+/// with a hand-written `mcp-config.json` (or no file, which yields the default
+/// config with `ws_isolation_enabled=false`).
+pub fn authorize_cross(
+    caller_ws: Option<&str>,
+    target_ws: &str,
+    registry: &LiveRegistry,
+    state_root: &Path,
+    op: &str,
+) -> Result<(), AuthErr> {
+    // KILL-SWITCH FIRST: if isolation is OFF, all ops pass.
+    let cfg = read_mcp_config(state_root);
+    if !cfg.ws_isolation_enabled {
+        return Ok(());
+    }
+    match caller_ws {
+        Some(c) if c == target_ws => Ok(()),
+        Some(c) => {
+            if sharing_enabled(registry, c) && sharing_enabled(registry, target_ws) {
+                Ok(())
+            } else {
+                Err(AuthErr::CrossWorkspace {
+                    caller_ws: c.into(),
+                    target_ws: target_ws.into(),
+                    op: op.into(),
+                })
+            }
+        }
+        None => Err(AuthErr::NoCallerWs { op: op.into() }),
+    }
 }
 
 /// MCP runtime config (SIBLING of `state_root`). SAFE defaults: every capability
@@ -1832,6 +1973,17 @@ pub struct McpConfig {
     /// run. File-only for now; not LLM-settable.
     #[serde(default)]
     pub memory_capture: bool,
+    /// WORKSPACE-ISOLATION KILL-SWITCH (Phase 1): when `true`, [`authorize_cross`]
+    /// enforces the workspace boundary — cross-workspace ops require symmetric
+    /// `allow_sharing=true` on both workspaces; same-workspace ops always pass;
+    /// no-caller ops yield `NoCallerWs`. When `false` (the DEFAULT), isolation
+    /// is INERT: `authorize_cross` returns `Ok(())` unconditionally, so every
+    /// op passes regardless of workspace identity. This is the single flag that
+    /// gates the entire isolation feature; backend gates / MCP scoping / UI
+    /// follow in later phases. File-only; not LLM-settable. Operator flips it
+    /// in `mcp-config.json` to arm isolation after the backend gates land.
+    #[serde(default)]
+    pub ws_isolation_enabled: bool,
     /// UNKNOWN-KEY PRESERVATION (Settings RMW safety): every key this build does not
     /// model — a NEWER build's gate, or an unrelated tool's sibling setting kept in the
     /// same file (e.g. `insforge_dashboard`, read as raw JSON elsewhere) — is captured
@@ -1879,6 +2031,7 @@ impl Default for McpConfig {
             memory_autoconsult: false,
             memory_harvest: false,
             memory_capture: false,
+            ws_isolation_enabled: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -2581,6 +2734,7 @@ mod tests {
             tag: Some("audit-run".into()),
             session_id: None,
             spawned_at: None,
+            allow_sharing: false,
         };
         let json = serde_json::to_string(&w).unwrap();
         assert!(json.contains(r#""role":"scout""#));
@@ -2876,6 +3030,7 @@ mod tests {
                 tag: None,
                 session_id: None,
                 spawned_at: None,
+                allow_sharing: false,
             }]),
         });
         let s = serde_json::to_string(&full).unwrap();
@@ -4809,5 +4964,285 @@ mod tests {
             v.get("extra").is_none(),
             "flatten: no literal `extra` key on the wire"
         );
+    }
+
+    #[test]
+    fn ws_of_pane_strict_parser() {
+        // Well-formed pane ids → Some(ws)
+        assert_eq!(ws_of_pane("ws76101x0-p0"), Some("ws76101x0"));
+        assert_eq!(ws_of_pane("ws76101x0-p12"), Some("ws76101x0"));
+        // Bare workspace id (no -p tail) → None
+        assert_eq!(ws_of_pane("ws76101x0"), None);
+        // No -p at all → None
+        assert_eq!(ws_of_pane("noPtail"), None);
+        // Non-digit tail → None
+        assert_eq!(ws_of_pane("ws1x0-pX"), None);
+        // Empty tail → None
+        assert_eq!(ws_of_pane("ws1x0-p"), None);
+    }
+
+    #[test]
+    fn sharing_enabled_default_false_and_true_case() {
+        // Default: allow_sharing=false → sharing_enabled returns false
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+            ],
+        };
+        assert!(!sharing_enabled(&reg, "ws1x0"));
+        assert!(!sharing_enabled(&reg, "ws2x0")); // unknown ws → false
+
+        // True case: allow_sharing=true → sharing_enabled returns true
+        let reg2 = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: true,
+                },
+            ],
+        };
+        assert!(sharing_enabled(&reg2, "ws1x0"));
+        assert!(!sharing_enabled(&reg2, "ws2x0")); // unknown ws → false
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_off_ok_even_cross_ws() {
+        // Kill-switch OFF (default) → Ok even for cross-ws
+        let s = Scratch::new("auth-cross-off");
+        // No mcp-config.json → default config with ws_isolation_enabled=false
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+                LiveWorkspace {
+                    id: "ws2x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+            ],
+        };
+        assert!(authorize_cross(Some("ws1x0"), "ws2x0", &reg, s.state.as_path(), "read").is_ok());
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_on_same_ws_ok() {
+        // Kill-switch ON + same-ws → Ok
+        let s = Scratch::new("auth-cross-same");
+        let cfg_path = s.root.join("mcp-config.json");
+        fs::write(&cfg_path, r#"{"ws_isolation_enabled":true}"#).unwrap();
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+            ],
+        };
+        assert!(authorize_cross(Some("ws1x0"), "ws1x0", &reg, s.state.as_path(), "read").is_ok());
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_on_both_sharing_ok() {
+        // Kill-switch ON + both sharing → Ok
+        let s = Scratch::new("auth-cross-both");
+        let cfg_path = s.root.join("mcp-config.json");
+        fs::write(&cfg_path, r#"{"ws_isolation_enabled":true}"#).unwrap();
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: true,
+                },
+                LiveWorkspace {
+                    id: "ws2x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: true,
+                },
+            ],
+        };
+        assert!(authorize_cross(Some("ws1x0"), "ws2x0", &reg, s.state.as_path(), "read").is_ok());
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_on_one_sharing_err() {
+        // Kill-switch ON + one sharing → Err(CrossWorkspace)
+        let s = Scratch::new("auth-cross-one");
+        let cfg_path = s.root.join("mcp-config.json");
+        fs::write(&cfg_path, r#"{"ws_isolation_enabled":true}"#).unwrap();
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: true,
+                },
+                LiveWorkspace {
+                    id: "ws2x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+            ],
+        };
+        let err = authorize_cross(Some("ws1x0"), "ws2x0", &reg, s.state.as_path(), "read").unwrap_err();
+        assert!(matches!(err, AuthErr::CrossWorkspace { .. }));
+        assert!(err.to_string().starts_with("CROSS_WORKSPACE:"));
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_on_neither_sharing_err() {
+        // Kill-switch ON + neither sharing → Err(CrossWorkspace)
+        let s = Scratch::new("auth-cross-neither");
+        let cfg_path = s.root.join("mcp-config.json");
+        fs::write(&cfg_path, r#"{"ws_isolation_enabled":true}"#).unwrap();
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+                LiveWorkspace {
+                    id: "ws2x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: false,
+                },
+            ],
+        };
+        let err = authorize_cross(Some("ws1x0"), "ws2x0", &reg, s.state.as_path(), "read").unwrap_err();
+        assert!(matches!(err, AuthErr::CrossWorkspace { .. }));
+    }
+
+    #[test]
+    fn authorize_cross_kill_switch_on_no_caller_err() {
+        // Kill-switch ON + caller None → Err(NoCallerWs)
+        let s = Scratch::new("auth-cross-nocaller");
+        let cfg_path = s.root.join("mcp-config.json");
+        fs::write(&cfg_path, r#"{"ws_isolation_enabled":true}"#).unwrap();
+        let reg = LiveRegistry {
+            schema: 1,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: vec![
+                LiveWorkspace {
+                    id: "ws1x0-p0".into(),
+                    pid: None,
+                    harness: None,
+                    repo: None,
+                    role: None,
+                    tag: None,
+                    session_id: None,
+                    spawned_at: None,
+                    allow_sharing: true,
+                },
+            ],
+        };
+        let err = authorize_cross(None, "ws1x0", &reg, s.state.as_path(), "read").unwrap_err();
+        assert!(matches!(err, AuthErr::NoCallerWs { .. }));
+        assert!(err.to_string().starts_with("NO_CALLER_WS:"));
     }
 }

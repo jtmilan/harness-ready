@@ -31,6 +31,7 @@ export default function Home() {
   const [activeWorkspace, setActiveWorkspace] = useState(() => loadWorkspaces()[0].id);
   const [overlay, setOverlay] = useState(null); // 'broadcast' | 'delegate' | 'bulk-broadcast' | 'templates' | 'delete-workspace' | ...
   const [wsToDelete, setWsToDelete] = useState(null); // ws id pending delete confirmation
+  const [wsPendingSharing, setWsPendingSharing] = useState(null); // ws id pending enable-sharing confirm
   const [checkedIds, setCheckedIds] = useState([]);
   const [trend, setTrend] = useState([]);
   // Broadcast-toggle mode (⌘⇧I): every keystroke mirrors live into all panes, except terminal
@@ -50,7 +51,54 @@ export default function Home() {
     return unsubscribe;
   }, []);
 
-  useEffect(() => { saveWorkspaces(workspaces); }, [workspaces]);
+  // Merge backend sharing state into workspaces on mount + on a 1.5s poll.
+  // Backend is authoritative for allow_sharing — never persisted in localStorage
+  // (workspaceStore.js writes every other ws field but explicitly skips this one).
+  // The bridge's own 1.5s timer also folds sharing into its _emit, but we read
+  // on our own interval so the workspaces[] shape stays in sync with the ws tab
+  // row even when no agent event tickled the bridge's listener set.
+  useEffect(() => {
+    let cancelled = false;
+    const merge = async () => {
+      if (cancelled) return;
+      try {
+        const fetchSharing =
+          (bridge.fetchSharingStates && bridge.fetchSharingStates.bind(bridge)) ||
+          null;
+        // Prefer the bridge's own fetch when available; fall back to a direct invoke
+        // is intentionally NOT provided here — the mock bridge lacks the command and
+        // must stay isolated, so a missing fetchSharing is a silent no-op.
+        const m = fetchSharing ? await fetchSharing() : (bridge.getSharing ? bridge.getSharing() : {});
+        if (cancelled) return;
+        setWorkspaces((prev) => {
+          let changed = false;
+          const next = prev.map((w) => {
+            const want = !!(m && m[w.id]);
+            if (!!w.allow_sharing === want) return w;
+            changed = true;
+            return { ...w, allow_sharing: want };
+          });
+          return changed ? next : prev;
+        });
+      } catch {
+        /* old backend / transient — safe default: every ws stays isolated */
+      }
+    };
+    merge();
+    const t = setInterval(merge, 1500);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [activeWorkspace]);
+
+  // Strip allow_sharing before persisting — backend is the sharing source of truth;
+  // localStorage must never carry it (a stale persisted flag would outlive a backend
+  // kill-switch flip and render the wrong badge on next load).
+  useEffect(() => {
+    saveWorkspaces(workspaces.map((w) => {
+      if (!("allow_sharing" in w)) return w;
+      const { allow_sharing: _drop, ...rest } = w;
+      return rest;
+    }));
+  }, [workspaces]);
 
   const handleAddWorkspace = () => {
     const ws = { id: `ws-${Date.now()}`, name: `WORKSPACE ${workspaces.length + 1}` };
@@ -82,6 +130,39 @@ export default function Home() {
     const next = deleteWorkspace(id);
     setWorkspaces(next);
     if (activeWorkspace === id) setActiveWorkspace(next[0]?.id);
+  };
+
+  // Sharing toggle (phase 1): enabling RELAXES the isolation boundary (agents in
+  // other workspaces that also enable sharing can interact here) — gated behind a
+  // ConfirmOverlay. Disabling TIGHTENS it and is immediate. Backend is authoritative;
+  // optimistically flip the local flag then roll back on reject so a failed toggle
+  // never leaves the badge lying about the real state.
+  const applySharing = async (wsId, enabled) => {
+    setWsPendingSharing(null);
+    const prev = workspaces.find((w) => w.id === wsId)?.allow_sharing;
+    setWorkspaces((p) => p.map((w) => (w.id === wsId ? { ...w, allow_sharing: enabled } : w)));
+    try {
+      await bridge.setWorkspaceSharing(wsId, enabled);
+    } catch (e) {
+      setWorkspaces((p) =>
+        p.map((w) => (w.id === wsId ? { ...w, allow_sharing: !!prev } : w)),
+      );
+      toast({
+        title: "Sharing toggle failed",
+        description: String(e && e.message ? e.message : e).slice(0, 200),
+        variant: "destructive",
+      });
+    }
+  };
+  const requestToggleSharing = (wsId, next) => {
+    if (next) {
+      // Enable is a boundary relaxation — confirm.
+      setWsPendingSharing(wsId);
+      setOverlay("enable-sharing");
+    } else {
+      // Disable is tightening — no confirm.
+      void applySharing(wsId, false);
+    }
   };
 
   // Sample fleet activity for the performance trend
@@ -217,10 +298,20 @@ export default function Home() {
   // Only the active workspace's panes are visible. Unassigned panes fall into the first workspace
   // (default bucket) so a fresh fleet renders entirely under the active tab. forceRerender re-reads
   // the assignment after a cross-workspace move.
+  const allPaneIds = agents.map((a) => a.id);
   const visibleIds = paneIdsForWorkspace(
     activeWorkspace,
-    agents.map((a) => a.id),
+    allPaneIds,
     workspaces[0]?.id,
+  );
+  // Per-workspace member count (every ws, not just the active one) — feeds the
+  // WorkspacesPanel tile footer so the operator can see fleet distribution at a
+  // glance without tab-hopping. Cheap: one pass per render over a small agent list.
+  const memberCounts = Object.fromEntries(
+    workspaces.map((w) => [
+      w.id,
+      paneIdsForWorkspace(w.id, allPaneIds, workspaces[0]?.id).length,
+    ]),
   );
   const visibleAgents = agents.filter((a) => visibleIds.includes(a.id));
   // Tile mode pins a coordinator-role pane (free-text role containing "coordinator"/"orchestrator",
@@ -658,7 +749,7 @@ export default function Home() {
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-[1fr_1.3fr_1.3fr_1fr] gap-4 p-4 pt-0 h-64 shrink-0">
         <AgentDirectory agents={agents} selectedId={selectedId} onSelect={handleSelect} />
         <PerformanceWidget trend={trend} agents={agents} />
-        <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} onDelete={requestDeleteWorkspace} />
+        <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} onDelete={requestDeleteWorkspace} memberCounts={memberCounts} onToggleSharing={requestToggleSharing} />
         {/* running is always true: fleet Pause was local-only and is gone; SessionInfo still
             expects the prop (that file is out of this lane). */}
         <SessionInfo sessionId={SESSION_ID} startTime={SESSION_START} running />
@@ -706,6 +797,21 @@ export default function Home() {
             confirmLabel="DELETE"
             onConfirm={handleDeleteWorkspace}
             onClose={() => { setOverlay(null); setWsToDelete(null); }}
+          />
+        );
+      })()}
+      {overlay === "enable-sharing" && (() => {
+        const ws = workspaces.find((w) => w.id === wsPendingSharing);
+        return (
+          <ConfirmOverlay
+            title="ENABLE CROSS-WORKSPACE SHARING"
+            description={
+              `// relax workspace isolation — agents in other workspaces that also enable sharing ` +
+              `will be able to interact with panes and read data here (${ws?.name ?? wsPendingSharing})`
+            }
+            confirmLabel="ENABLE SHARING"
+            onConfirm={() => applySharing(wsPendingSharing, true)}
+            onClose={() => { setOverlay(null); setWsPendingSharing(null); }}
           />
         );
       })()}

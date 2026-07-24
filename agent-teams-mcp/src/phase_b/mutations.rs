@@ -168,6 +168,17 @@ pub fn mutation_error_message(e: &MutationError) -> String {
         MutationError::Rejected { code, .. } if code == response_code::DELEGATION_IN_FLIGHT => {
             "DELEGATION_IN_FLIGHT: a delegation is already running (one at a time) — wait for its write-back".to_string()
         }
+        // WORKSPACE-ISOLATION (Phase 1): empty-detail fallback for the cross-workspace
+        // denial. The app-side AuthErr Display ALWAYS carries a non-empty detail (it
+        // includes the caller/target ws ids + op name), so this branch fires only on a
+        // future regression or a stripped reply. The "do not retry" hint is preserved
+        // so the coordinator agent reads it and does not spin retry loops against the
+        // boundary.
+        MutationError::Rejected { code, .. } if code == response_code::CROSS_WORKSPACE => {
+            "CROSS_WORKSPACE: cross-workspace op denied by workspace isolation (the caller \
+             and target workspaces are not mutually sharing, or the caller has no workspace \
+             identity) — do not retry without operator intervention".to_string()
+        }
         MutationError::Rejected { code, .. } => format!("rejected by the app: {code}"),
         MutationError::Incomplete(s) => (*s).to_string(),
     }
@@ -818,6 +829,24 @@ mod tests {
         assert!(
             f.contains("no detail") && f.contains("trusted-repos"),
             "{f}"
+        );
+        // WORKSPACE-ISOLATION (Phase 1): CROSS_WORKSPACE with empty detail yields the
+        // canned "do not retry" message (the common case carries a non-empty detail
+        // from AuthErr's Display — relayed verbatim by the detail-is-nonempty arm).
+        let cw = mutation_error_message(&rej(response_code::CROSS_WORKSPACE, ""));
+        assert!(
+            cw.contains("CROSS_WORKSPACE") && cw.contains("do not retry"),
+            "{cw}"
+        );
+        // CROSS_WORKSPACE with detail: the app's authoritative detail is relayed verbatim
+        // (the coordinator agent reads the "caller_ws=…, target_ws=…" text).
+        let cwd = mutation_error_message(&rej(
+            response_code::CROSS_WORKSPACE,
+            "CROSS_WORKSPACE: cross-workspace op 'write_to_pane' denied: caller_ws='ws1', target_ws='ws2' (at least one has allow_sharing=false)",
+        ));
+        assert!(
+            cwd.contains("CROSS_WORKSPACE") && cwd.contains("allow_sharing=false"),
+            "{cwd}"
         );
         // an UNRECOGNIZED code falls through to the generic arm (echoing the code).
         let g = mutation_error_message(&rej("WAT_UNKNOWN", ""));
