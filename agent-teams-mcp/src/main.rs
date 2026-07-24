@@ -50,7 +50,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use agent_teams_core::{compute_queue_identified, list_workspaces, read_registry, QueueRow};
+use agent_teams_core::{
+    compute_queue_identified, list_workspaces, read_registry, sharing_enabled, ws_of_pane,
+    QueueRow,
+};
 
 /// PHASE B — the LIVE mutation tool surface (Unix-socket dial + wire protocol).
 /// Compiled only under `--features phase-b-mutations` and WIRED: the separate
@@ -93,6 +96,16 @@ mod task;
 #[derive(Clone)]
 struct TeamServer {
     state_dir: PathBuf,
+    /// The caller's workspace, derived from `$AGENT_TEAMS_PANE_ID` at construction
+    /// time (`ws_of_pane` over the supervisor-set pane id). `None` when the env
+    /// var is unset or malformed — operator / dev / test panes that have no pane
+    /// identity. When `None`, the read tools preserve their PRE-isolation global
+    /// view (back-compat) and emit a one-time stderr warning; when `Some`, every
+    /// read tool is scoped to this workspace UNION any workspace that has
+    /// `allow_sharing=true` in the live registry (symmetric, read-side check).
+    /// Phase 1: read-side scoping only; memory/task content partitioning is
+    /// Phase 2 and lives in those modules (untouched here).
+    caller_ws: Option<String>,
     // Read by the `#[tool_handler]`-generated dispatch; the dead-code lint can't
     // see through the macro + derived `Clone`, hence the allow.
     #[allow(dead_code)]
@@ -280,8 +293,26 @@ impl TeamServer {
         // Strip non-standard numeric `format` hints (schemars u64/u32 → "uint64"/
         // "uint32") so strict clients (opencode) don't log `unknown format` per field.
         sanitize_tool_schemas(&mut router);
+        // WORKSPACE ISOLATION (Phase 1): cache the caller's workspace once at
+        // construction from the supervisor-set `$AGENT_TEAMS_PANE_ID`. `ws_of_pane`
+        // is the strict parser (rejects bare ws ids / malformed tails), so a rogue
+        // or absent env var yields `None` rather than a fake ws — the read tools
+        // then fall back to the pre-isolation global view with a stderr warning.
+        // The env read happens HERE (single process-start snapshot) so a later
+        // in-process env mutation cannot shift the caller's identity mid-session.
+        let caller_ws = std::env::var("AGENT_TEAMS_PANE_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|id| ws_of_pane(&id).map(str::to_owned));
+        if caller_ws.is_none() {
+            eprintln!(
+                "agent-teams-mcp: no AGENT_TEAMS_PANE_ID — read tools return GLOBAL view \
+                 (isolation bypassed; operator/dev/test back-compat path)"
+            );
+        }
         Self {
             state_dir,
+            caller_ws,
             tool_router: router,
             prompt_router: Self::prompt_router(),
         }
@@ -302,8 +333,11 @@ impl TeamServer {
             live registry, so they are present only while the app records it)."
     )]
     async fn team_get_queue(&self) -> Result<Json<QueueResult>, ErrorData> {
+        // WORKSPACE ISOLATION (Phase 1): drop rows belonging to workspaces the
+        // caller cannot see. No-caller (operator/dev/test) keeps the global
+        // view — see `scope_queue`.
         Ok(Json(QueueResult {
-            queue: identified_queue(&self.state_dir),
+            queue: self.scope_queue(identified_queue(&self.state_dir)),
         }))
     }
 
@@ -313,8 +347,14 @@ impl TeamServer {
             directory under the state dir that has an events.jsonl. Read-only."
     )]
     async fn list_workspaces(&self) -> Result<Json<WorkspacesResult>, ErrorData> {
+        // WORKSPACE ISOLATION (Phase 1): the raw discovery scan would enumerate
+        // EVERY workspace on disk — that is a leak (a coordinator in ws A
+        // learns ws B's id even though B never opted into sharing). Filter to
+        // the caller's own ws UNION workspaces with `allow_sharing=true`; the
+        // caller's own ws is force-included so an app-down registry does not
+        // yield an empty list. See `scope_workspace_list`.
         Ok(Json(WorkspacesResult {
-            workspaces: list_workspaces(&self.state_dir),
+            workspaces: self.scope_workspace_list(list_workspaces(&self.state_dir)),
         }))
     }
 
@@ -330,6 +370,14 @@ impl TeamServer {
         &self,
         Parameters(GetWorkspaceArgs { id }): Parameters<GetWorkspaceArgs>,
     ) -> Result<Json<WorkspaceResult>, ErrorData> {
+        // WORKSPACE ISOLATION (Phase 1): the id argument may be a bare ws id
+        // (`wsNNNNNxK`) or a pane id (`wsNNNNNxK-pN`). `resolve_target_ws`
+        // handles both (ws_of_pane for the pane form, pass-through for bare).
+        // A caller with no identity still gets the global view (back-compat).
+        let target_ws = self.resolve_target_ws(&id).to_owned();
+        if !self.can_see_ws(&target_ws) {
+            return Err(self.cross_workspace_err(&target_ws, "get_workspace"));
+        }
         let workspace = identified_queue(&self.state_dir)
             .into_iter()
             .find(|row| row.id == id);
@@ -359,6 +407,25 @@ impl TeamServer {
         &self,
         Parameters(args): Parameters<read_output::ReadOutputArgs>,
     ) -> Result<Json<read_output::PaneOutputResult>, ErrorData> {
+        // WORKSPACE ISOLATION (Phase 1): gate BEFORE any file I/O or socket
+        // dial. The arg is documented as a FULL pane id, so `ws_of_pane` is
+        // the strict parser — a malformed id (no `-p<digits>` tail) yields no
+        // target ws, which is fail-closed: we refuse rather than silently read
+        // an unknown workspace's output.
+        let Some(target_ws) = ws_of_pane(&args.id).map(str::to_owned) else {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "team_read_output: '{}' is not a valid pane id (expected \
+                     'wsNNNNNxK-pN'); workspace isolation requires a well-formed \
+                     pane id to derive the target workspace",
+                    args.id
+                ),
+                None,
+            ));
+        };
+        if !self.can_see_ws(&target_ws) {
+            return Err(self.cross_workspace_err(&target_ws, "team_read_output"));
+        }
         // spawn_blocking: resolve() is sync file I/O, and on phase-b builds its gap-7
         // live-scrollback fallback DIALS the app socket (blocking std I/O, up to the
         // fast-op window) — never stall the async runtime on it.
@@ -390,11 +457,107 @@ impl TeamServer {
         &self,
         Parameters(args): Parameters<audit_log::AuditLogArgs>,
     ) -> Result<Json<audit_log::AuditLogResult>, ErrorData> {
+        // Phase 2: filter audit entries by ws tag (entries currently carry no ws
+        // tag; the whole log is returned regardless of caller_ws). Trivially
+        // retrofittable once the app stamps ws on each mutation/read row.
         Ok(Json(audit_log::resolve(
             &self.state_dir,
             args.limit,
             args.kind.as_deref(),
         )))
+    }
+}
+
+// ───────────── Workspace-isolation helpers (Phase 1, read-side) ────────────────
+//
+// NOT tool methods — plain `&self` helpers the tool bodies call. The read-side
+// predicate is `sharing_enabled` from core/mcp: symmetric, registry-sourced,
+// fail-closed. The WRITE-side gate (`authorize_cross`) lives in core/mcp and
+// is enforced by the app boundary; the MCP server here only READS the registry
+// to scope the four read tools + the three queue/workspace resources.
+impl TeamServer {
+    /// Symmetric sharing predicate for the caller's scope: re-reads the live
+    /// registry on every call (the registry is tiny — a handful of
+    /// `LiveWorkspace` rows — and caching it here would stale the moment the
+    /// app flips `allow_sharing` in the UI). Returns `false` on a missing /
+    /// unreadable registry: default-deny matches the backend's fail-closed
+    /// posture so a crashed app cannot accidentally leak a workspace.
+    fn sharing_on(&self, ws: &str) -> bool {
+        match read_registry(&self.state_dir) {
+            Some(reg) => sharing_enabled(&reg, ws),
+            None => false,
+        }
+    }
+
+    /// Read-side visibility: can the caller (whose workspace was cached at
+    /// construction) see rows / output belonging to `target_ws`? Same-workspace
+    /// is always visible; cross-workspace requires the TARGET to have opted in
+    /// via `allow_sharing=true` in the live registry (symmetric — core/mcp
+    /// checks the target entry, not the caller's, so a workspace that never
+    /// opted in stays private regardless of the caller's setting).
+    fn can_see_ws(&self, target_ws: &str) -> bool {
+        match self.caller_ws.as_deref() {
+            Some(cws) => target_ws == cws || self.sharing_on(target_ws),
+            // No caller identity → back-compat global view. The stderr warning
+            // in `new()` already narrated this; no per-call noise.
+            None => true,
+        }
+    }
+
+    /// Build the CROSS_WORKSPACE structured error string. Mirrors the backend
+    /// `AuthErr::CrossWorkspace` Display impl so the coordinator agent and any
+    /// client-side parser sees ONE prefix shape across both layers.
+    fn cross_workspace_err(&self, target_ws: &str, op: &str) -> ErrorData {
+        let cws = self.caller_ws.as_deref().unwrap_or("<none>");
+        let msg = format!(
+            "CROSS_WORKSPACE: {op} caller_ws={cws} target_ws={target_ws} sharing=off \
+             — enable sharing on both workspaces to allow; do not retry"
+        );
+        ErrorData::invalid_request(msg, None)
+    }
+
+    /// Resolve a workspace target from an id that may be a pane id
+    /// (`wsNNNNNxK-pN`) or a bare workspace id (`wsNNNNNxK`). `ws_of_pane`
+    /// rejects malformed tails; a bare id falls through as-is (matches the
+    /// core/mcp `ws_prefix` convention used by `get_workspace`'s row lookup).
+    fn resolve_target_ws<'a>(&self, id: &'a str) -> &'a str {
+        ws_of_pane(id).unwrap_or(id)
+    }
+
+    /// Filter a queue to rows the caller can see. When `caller_ws` is `None`,
+    /// returns the input unchanged (back-compat global view).
+    fn scope_queue(&self, rows: Vec<QueueRow>) -> Vec<QueueRow> {
+        if self.caller_ws.is_none() {
+            return rows;
+        }
+        rows.into_iter()
+            .filter(|r| {
+                let target = r
+                    .workspace
+                    .as_deref()
+                    .unwrap_or_else(|| self.resolve_target_ws(&r.id));
+                self.can_see_ws(target)
+            })
+            .collect()
+    }
+
+    /// Filter a workspace-id list to ws ids the caller can see. When
+    /// `caller_ws` is `None`, returns the input unchanged. The caller's own ws
+    /// is ALWAYS included (even if absent from the live registry) so the
+    /// caller never sees an empty list for itself.
+    fn scope_workspace_list(&self, mut ids: Vec<String>) -> Vec<String> {
+        let Some(cws) = self.caller_ws.as_deref() else {
+            return ids;
+        };
+        ids.retain(|ws| ws == cws || self.sharing_on(ws));
+        // Guarantee the caller's own ws is present — an app-down registry
+        // (None) would otherwise yield an empty list and the client would
+        // wrongly conclude the caller has no workspace.
+        if !ids.iter().any(|ws| ws == cws) {
+            ids.push(cws.to_string());
+            ids.sort();
+        }
+        ids
     }
 }
 
@@ -1103,12 +1266,24 @@ impl ServerHandler for TeamServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
+        // WORKSPACE ISOLATION (Phase 1): resources expose the SAME data as the
+        // read tools, so they MUST apply the SAME scoping — otherwise a client
+        // that prefers resources over tools bypasses isolation trivially. The
+        // per-resource guards mirror team_get_queue / list_workspaces /
+        // get_workspace exactly; `team://workspace/{id}` hard-errors on a
+        // cross-workspace target with the same CROSS_WORKSPACE shape.
         let uri = request.uri.as_str();
         let json = if uri == QUEUE_URI {
-            serde_json::to_string_pretty(&identified_queue(&self.state_dir))
+            serde_json::to_string_pretty(&self.scope_queue(identified_queue(&self.state_dir)))
         } else if uri == WORKSPACES_URI {
-            serde_json::to_string_pretty(&list_workspaces(&self.state_dir))
+            serde_json::to_string_pretty(
+                &self.scope_workspace_list(list_workspaces(&self.state_dir)),
+            )
         } else if let Some(id) = uri.strip_prefix("team://workspace/") {
+            let target_ws = self.resolve_target_ws(id).to_owned();
+            if !self.can_see_ws(&target_ws) {
+                return Err(self.cross_workspace_err(&target_ws, "read_resource"));
+            }
             let row = identified_queue(&self.state_dir)
                 .into_iter()
                 .find(|r| r.id == id);
