@@ -5,8 +5,8 @@
 //! "who needs you" queue (from the Phase-01 state adapter).
 
 use agent_teams_core::{
-    compute_queue, enrich_queue, read_registry, registry_path, LiveRegistry, LiveWorkspace,
-    QueueRow, LIVE_REGISTRY_SCHEMA,
+    authorize_cross, compute_queue, enrich_queue, read_registry, registry_path, sharing_enabled,
+    ws_of_pane, LiveRegistry, LiveWorkspace, QueueRow, LIVE_REGISTRY_SCHEMA,
 };
 // 06-02 Phase-B socket seam: shared SSOT wire protocol + config + path policy.
 // 06-03 Context Router: the structured payload + per-op timeout SSOT.
@@ -1883,6 +1883,64 @@ fn set_max_concurrent(state: tauri::State<AppState>, n: usize) -> usize {
     clamped
 }
 
+/// WORKSPACE-ISOLATION (Phase 1): arm/disarm the per-workspace `allow_sharing` opt-in on
+/// every live pane entry whose workspace (parsed via [`ws_of_pane`], falling back to the
+/// raw id for a bare workspace id) equals `ws_id`. The live registry's `allow_sharing`
+/// flag is the WRITE-side of the symmetric shared-scope predicate (the READ-side is
+/// [`sharing_enabled`]). Both the caller AND the target workspace must have it on for a
+/// cross-ws write to pass [`authorize_cross`].
+///
+/// Returns the new value so the frontend can reflect it (the setting is uniform per
+/// workspace — every entry in the live set for `ws_id` carries the same value). Errors
+/// with `"unknown workspace"` when no live entry matches `ws_id` (the operator flipped
+/// sharing for a workspace with no panes). Idempotent: setting the same value twice is
+/// a no-op rewrite.
+#[tauri::command]
+fn set_workspace_sharing(
+    state: tauri::State<AppState>,
+    ws_id: String,
+    enabled: bool,
+) -> Result<bool, String> {
+    let mut matched = 0usize;
+    live_registry_update(state.inner(), |ws| {
+        for entry in ws.iter_mut() {
+            let entry_ws = ws_of_pane(&entry.id).unwrap_or(&entry.id);
+            if entry_ws == ws_id {
+                entry.allow_sharing = enabled;
+                matched += 1;
+            }
+        }
+    });
+    if matched == 0 {
+        return Err(format!(
+            "unknown workspace: no live registry entry for workspace '{ws_id}' (spawn a pane \
+             in it first, or pass a workspace id like ws76101x0)"
+        ));
+    }
+    Ok(enabled)
+}
+
+/// WORKSPACE-ISOLATION (Phase 1): read the current `allow_sharing` state of every live
+/// workspace. Returns a `{ws_id → bool}` map the HUD renders as a per-workspace toggle.
+/// The map is computed fresh from the live registry on each call (the registry is the
+/// SSOT; no separate state is kept). A workspace with multiple live panes carries a
+/// single uniform value (set_workspace_sharing writes to every entry), so later-write-
+/// wins in the fold below is a no-op in practice.
+#[tauri::command]
+fn get_workspace_sharing_states(
+    state: tauri::State<AppState>,
+) -> std::collections::HashMap<String, bool> {
+    let reg = read_registry(&state.state_root);
+    let mut out = std::collections::HashMap::new();
+    if let Some(r) = reg {
+        for entry in &r.workspaces {
+            let entry_ws = ws_of_pane(&entry.id).unwrap_or(&entry.id).to_string();
+            out.insert(entry_ws, entry.allow_sharing);
+        }
+    }
+    out
+}
+
 /// Read the admission cap + the current working-pane count (the same global union the spawn
 /// gate uses) so the HUD can show "N / max" and gate NEW AGENT / TEMPLATES at the ceiling.
 /// Cheap (one state-file scan); the frontend polls it on a 1s timer, off the 120ms hot poll.
@@ -2325,13 +2383,49 @@ fn reveal_path(path: String) -> Result<(), String> {
 /// `is_alive()` gate lives HERE so every caller (the webview `send_input` command
 /// AND the 06-02 MCP socket handler) inherits the SAME gate — no second is_alive
 /// check, no second write path. Errors: `"no such workspace"` (unknown id) /
-/// `"workspace is no longer alive"` (dead PTY) / the underlying write error.
-fn write_to_pane(state: &AppState, id: &str, data: &[u8]) -> Result<(), String> {
+/// `"workspace is no longer alive"` (dead PTY) / the underlying write error /
+/// `CROSS_WORKSPACE: ...` or `NO_CALLER_WS: ...` (workspace-isolation denial —
+/// the Display prefix is the match token callers pattern-match on).
+///
+/// # Workspace-isolation gate (Phase 1)
+/// `caller_ws` is the caller's workspace (derived from the socket peer's pane id via
+/// `caller_pane_id_of_peer_pid` on the UDS path, or from the active workspace for the
+/// trusted webview). The gate runs AFTER the daemon-routing early-return (daemon-owned
+/// panes are a separate write path with their own auth) and BEFORE the per-pane write
+/// lock so a denied write never acquires the lock. When `id` has no parseable workspace
+/// prefix (`ws_of_pane` returns `None`), the gate is SKIPPED — the pane id is malformed
+/// and will fail at the supervisor lookup anyway; we never silently allow a cross-ws
+/// write on a malformed id, but we also don't double-deny with a misleading auth error.
+/// When the registry is absent, build an empty one so the kill-switch path still runs;
+/// `sharing_enabled=false` on an empty registry ⇒ cross-ws denies, same-ws still ok.
+fn write_to_pane(
+    state: &AppState,
+    id: &str,
+    data: &[u8],
+    caller_ws: Option<&str>,
+) -> Result<(), String> {
     // F1 (Q4 Stage-4): a Daemon-owned pane is typed via the daemon's gated `SendInput` op —
     // the daemon owns the C7 claude prime + the paste/Ink split-submit + the D30 alive gate.
     // Route + return BEFORE any local prime/lock/write runs (the app holds no PTY for this id).
     if pane_owner_is_daemon(state, id) {
         return daemon_client::daemon_send_input(&state.state_root, id, data);
+    }
+    // WORKSPACE-ISOLATION GATE (Phase 1): refuse cross-workspace writes BEFORE the per-pane
+    // lock so a denied write never touches the PTY. Kill-switch (ws_isolation_enabled, default
+    // OFF) is read inside `authorize_cross` — inert while off. Same-ws always passes. The
+    // AuthErr Display prefix (`CROSS_WORKSPACE:` / `NO_CALLER_WS:`) is the token callers
+    // pattern-match on to surface the structured response code.
+    if let Some(tws) = ws_of_pane(id) {
+        let reg = read_registry(&state.state_root).unwrap_or(LiveRegistry {
+            schema: LIVE_REGISTRY_SCHEMA,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: Vec::new(),
+        });
+        if let Err(e) = authorize_cross(caller_ws, tws, &reg, &state.state_root, "write_to_pane") {
+            return Err(e.to_string());
+        }
     }
     // ── Per-pane WRITE SERIALIZER ──
     // Hold THIS pane's write lock across the WHOLE write, INCLUDING the Esc-prime settle and
@@ -2490,7 +2584,15 @@ fn harness_needs_split_submit(h: Harness) -> bool {
 /// tradeoff comment there.
 #[tauri::command(async)]
 fn send_input(state: tauri::State<AppState>, id: String, data: String) -> Result<(), String> {
-    write_to_pane(&state, &id, data.as_bytes())
+    // WEBVIEW caller_ws: the webview is same-process / trusted, so we derive caller_ws from
+    // the registry's `active` field (what `set_active_workspace` recorded). TOCTOU: the
+    // active ws can flip between this read and the write_to_pane gate below — accepted
+    // because the webview is the operator's own UI, and the gate is a same-ws pass in the
+    // common case (a human typing in the focused workspace). A cross-ws GUI write (e.g.
+    // a stale GUI tab writing to a pane that isn't the active workspace) would deny under
+    // isolation — expected behavior under the Phase-1 design.
+    let caller_ws: Option<String> = read_registry(&state.state_root).and_then(|r| r.active);
+    write_to_pane(&state, &id, data.as_bytes(), caller_ws.as_deref())
 }
 
 /// Send `sig` to a pane's PTY child (shared body of [`pause_pane`]/[`resume_pane`]).
@@ -6509,6 +6611,44 @@ fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::Agen
     resolve_caller_role_via_ancestry(&pid_roles, parent_pid, peer_pid)
 }
 
+/// Mirror of [`caller_pane_role`]'s ancestry walk that returns the PANE ID whose harness
+/// child pid matched the socket peer's ancestry chain (not the role). Load-bearing for
+/// workspace isolation: the pane id embeds the workspace (`${wsId}-p${idx}`), so this is
+/// how we recover the caller's workspace (`caller_ws`) from a socket peer pid. Snapshot
+/// `{child_pid → id}` under one lock, then walk parent-pid hops (bounded, memoized — same
+/// discipline as `resolve_caller_role_via_ancestry`); first pid hit wins. `None` when no
+/// tracked pane owns the connection (external client / reparented dialer) → the workspace
+/// gate treats the caller as no-workspace (D1 hard-deny for cross-ws writes).
+#[cfg(all(unix, target_os = "macos"))]
+fn caller_pane_id_of_peer_pid(app: &tauri::AppHandle, peer_pid: u32) -> Option<String> {
+    let st = app.state::<AppState>();
+    let pid_ids: HashMap<u32, String> = st.sups.with_map(|m| {
+        m.iter()
+            .filter_map(|(id, sup)| sup.process_id().map(|pid| (pid, id.clone())))
+            .collect()
+    });
+    if pid_ids.is_empty() {
+        return None;
+    }
+    // Bounded walk (mirrors `resolve_role_from_ancestry`'s hop cap + memoization): first
+    // pid whose id is in the live set wins; memoize ppid lookups so a cycling ancestry
+    // can't re-shell `/bin/ps` up to 32× per pid.
+    let mut memo: HashMap<u32, Option<u32>> = HashMap::new();
+    let mut cur = peer_pid;
+    for _ in 0..roles::MAX_ANCESTRY_HOPS {
+        if let Some(id) = pid_ids.get(&cur) {
+            return Some(id.clone());
+        }
+        let p = *memo.entry(cur).or_insert_with(|| parent_pid(cur));
+        match p {
+            None => break,
+            Some(p) if p == cur || p == 0 => break,
+            Some(p) => cur = p,
+        }
+    }
+    None
+}
+
 /// Absolute executable path of `pid` (macOS) via `proc_pidpath`. `None` on any error.
 /// Kernel-reported, unforgeable from an agent prompt (argv[0] tricks don't change it) —
 /// the load-bearing signal for pinning the authorized EXTERNAL orchestrator binary.
@@ -6904,20 +7044,26 @@ fn partition_normalizable(rows: &[Dispatch]) -> (Vec<(String, String)>, Vec<Stri
 }
 
 /// Send one already-`normalize_input`'d line to each id in `targets` through the
-/// EXISTING gated [`write_to_pane`] (inherits D30 is_alive). Partitions ids into
-/// `sent` (write succeeded) vs `skipped` (dead/unknown pane — never silently
-/// dropped). Shared by `Broadcast` (all live panes) and a dispatched `Orchestrate`
-/// (per-pane tasks). `data` is the EXACT bytes to write (the caller normalized).
+/// EXISTING gated [`write_to_pane`] (inherits D30 is_alive + the workspace-isolation
+/// gate). Partitions ids into `sent` (write succeeded) vs `skipped` (dead/unknown pane
+/// or cross-workspace denial — never silently dropped). Shared by `Broadcast` (authority
+/// set — pre-filtered so cross-ws denials here are unexpected) and a dispatched
+/// `Orchestrate` (per-pane tasks, scoped to one workspace). `data` is the EXACT bytes
+/// to write (the caller normalized). `caller_ws` is threaded to the write gate; a
+/// cross-ws denial surfaces as a skipped entry (never a silent vanish).
 fn send_to_panes(
     state: &AppState,
     targets: impl IntoIterator<Item = (String, String)>,
+    caller_ws: Option<&str>,
 ) -> SocketData {
     let mut sent = Vec::new();
     let mut skipped = Vec::new();
     for (id, line) in targets {
-        match write_to_pane(state, &id, line.as_bytes()) {
+        match write_to_pane(state, &id, line.as_bytes(), caller_ws) {
             Ok(()) => sent.push(id),
-            // Dead PTY (D30) or unknown id ⇒ skipped, reported — not a silent vanish.
+            // Dead PTY (D30), unknown id, or cross-workspace denial ⇒ skipped, reported —
+            // not a silent vanish. The caller inspects the returned `SocketData` to decide
+            // whether to surface a structured CROSS_WORKSPACE error.
             Err(_) => skipped.push(id),
         }
     }
@@ -7001,18 +7147,66 @@ fn socket_orchestrate(
     goal: &str,
     dispatch: bool,
     target_workspace: Option<&str>,
+    caller_ws: Option<&str>,
 ) -> SocketResponse {
     let st = app.state::<AppState>();
     let all_panes = live_pane_ctxs(&st);
     if all_panes.is_empty() {
         return SocketResponse::err(response_code::UNKNOWN_WORKSPACE, "no live panes to orchestrate");
     }
+    // WORKSPACE-ISOLATION (Phase 1, orchestrate): default `target_workspace` to the caller's
+    // own workspace when omitted, so a pane dialing `team_orchestrate` without naming a
+    // target fans out within its own workspace (the common case) rather than refusing.
+    // `effective` is the final scope decision input:
+    //   - caller has ws + no target  ⇒ effective = caller_ws (self-scope)
+    //   - caller has ws + target     ⇒ effective = target (explicit scope)
+    //   - caller has no ws + target  ⇒ external orchestrator; D1 requires target_ws to be
+    //                                   sharing_enabled (bypass authorize_cross, which
+    //                                   returns NoCallerWs; we check sharing_enabled
+    //                                   directly — see the D1 external-orchestrator rule)
+    //   - caller has no ws + no target ⇒ refuse (must name target)
+    let effective: Option<&str> = target_workspace.or(caller_ws);
+    if effective.is_none() {
+        // External orchestrator with no target → must name the workspace (D1: we never
+        // blast every workspace on behalf of an unaffiliated caller).
+        return SocketResponse::err(
+            response_code::CROSS_WORKSPACE,
+            "team_orchestrate: caller has no workspace identity AND no target_workspace was \
+             supplied — an external orchestrator must name the target workspace explicitly"
+                .to_string(),
+        );
+    }
+    // D1 external-orchestrator rule: when the caller has no ws but supplied an explicit
+    // target_workspace, the target ws MUST have sharing_enabled. This is the SOLE path
+    // an external caller can fan out; the target opts in via `allow_sharing=true`. We
+    // check sharing_enabled DIRECTLY (not authorize_cross) because authorize_cross
+    // returns NoCallerWs on caller_ws=None, which is wrong for this opt-in bypass.
+    if caller_ws.is_none() {
+        if let Some(tws) = effective {
+            let reg = read_registry(&st.state_root).unwrap_or(LiveRegistry {
+                schema: LIVE_REGISTRY_SCHEMA,
+                app_pid: None,
+                updated_at: None,
+                active: None,
+                workspaces: Vec::new(),
+            });
+            if !sharing_enabled(&reg, tws) {
+                return SocketResponse::err(
+                    response_code::CROSS_WORKSPACE,
+                    format!(
+                        "team_orchestrate: external orchestrator may only target a \
+                         sharing-enabled workspace; target '{tws}' has allow_sharing=false"
+                    ),
+                );
+            }
+        }
+    }
     // B4: SCOPE the fan-out to ONE workspace so a goal never blasts across every live
     // workspace. Pane ids embed the workspace (`${wsId}-p${idx}`), so scoping is a prefix
     // filter; when the target is omitted AND >1 workspace is live we REFUSE rather than
     // blast (the pure decision lives in `scope_panes_to_workspace`, unit-tested). Delegate
     // workers are already excluded upstream by `live_pane_ctxs`.
-    let panes = match scope_panes_to_workspace(all_panes, target_workspace) {
+    let panes = match scope_panes_to_workspace(all_panes, effective) {
         Ok(p) => p,
         Err((code, msg)) => return SocketResponse::err(code, msg),
     };
@@ -7083,8 +7277,14 @@ fn socket_orchestrate(
         .collect();
     // A task that fails normalize (interior newline / control char) is folded into `skipped`,
     // never silently dropped (send_to_panes' contract).
+    // WORKSPACE-ISOLATION (Phase 1, orchestrate writes): thread `effective` as the caller_ws
+    // for the per-write gate. This is the same-ws identity the scope_panes_to_workspace
+    // filter already enforced; for an external orchestrator with an explicit
+    // sharing-enabled target, `effective` is the target_ws (the sharing_enabled check above
+    // was the D1 gate — the per-write gate now treats the orchestrator as "in" the target
+    // ws for the duration of this fan-out, so the writes land).
     let (targets, dropped) = partition_normalizable(&with_report);
-    let (sent, mut skipped) = match send_to_panes(&st, targets) {
+    let (sent, mut skipped) = match send_to_panes(&st, targets, effective) {
         SocketData::Broadcast { sent, skipped } => (sent, skipped),
         _ => (Vec::new(), Vec::new()),
     };
@@ -7104,27 +7304,102 @@ fn socket_orchestrate(
     .with_data(SocketData::Dispatched { run_dir: run_dir_str, sent, skipped })
 }
 
-/// `Broadcast` handler (06-03). Sends `text` to EVERY live pane through the same gate
-/// as `SendInput` (normalize → `write_to_pane`). Returns `{sent, skipped}`. Model-A:
+/// The AUTHORITY SET for a broadcast/fan-out op: the live pane ids a caller may reach
+/// under workspace isolation. Pure decision over the live id snapshot + the registry;
+/// no I/O beyond what the caller already read.
+///
+/// - `caller_ws = None` → empty set (D1 hard-deny: an external/no-caller orchestrator
+///   cannot broadcast). The caller maps the empty set + a non-empty pre-filter live
+///   set to a structured `CROSS_WORKSPACE` error.
+/// - `caller_ws = Some(ws)` → every pane with `ws_of_pane == ws`, UNION (when
+///   `sharing_enabled(registry, ws)`) every pane of every OTHER workspace that also
+///   has `allow_sharing=true` (symmetric shared-scope — both sides opt in). The
+///   `!is_worker` B5 filter is applied INSIDE this function so callers can't forget.
+///
+/// Reads the registry ONCE (the caller passes it in) so the broadcast's authority set
+/// is computed against a single consistent snapshot (no TOCTOU between "list panes"
+/// and "check sharing"). Delegate workers are excluded (same invariant as
+/// `live_pane_ctxs` / the orchestrate path).
+fn coordinator_authority_set(
+    state: &AppState,
+    caller_ws: Option<&str>,
+    registry: &LiveRegistry,
+) -> std::collections::HashSet<String> {
+    let Some(cws) = caller_ws else {
+        return std::collections::HashSet::new();
+    };
+    let caller_shares = sharing_enabled(registry, cws);
+    state.sups.with_map(|m| {
+        m.iter()
+            .filter(|(_, sup)| !sup.is_worker)
+            .filter_map(|(id, _)| {
+                let pane_ws = ws_of_pane(id)?;
+                if pane_ws == cws {
+                    return Some(id.clone());
+                }
+                // Cross-ws: only when BOTH sides opt in (symmetric shared-scope).
+                if caller_shares && sharing_enabled(registry, pane_ws) {
+                    return Some(id.clone());
+                }
+                None
+            })
+            .collect()
+    })
+}
+
+/// `Broadcast` handler (06-03). Sends `text` to every pane in the caller's AUTHORITY
+/// SET (Phase 1 — workspace-isolation scoped fan-out) through the same gate as
+/// `SendInput` (normalize → `write_to_pane`). Returns `{sent, skipped}`. Model-A:
 /// the operator's text VERBATIM after normalize — never an auto-approve, never a
 /// queue read. A bad payload (interior newline / control char) ⇒ `BAD_REQUEST`,
 /// nothing sent.
-fn socket_broadcast(app: &tauri::AppHandle, text: &str) -> SocketResponse {
+///
+/// Phase 1 semantics: the target set is SERVER-COMPUTED (filtered fan-out, not a
+/// hard-error per target). When the filtered set is empty but the pre-filter live
+/// set was non-empty, returns `CROSS_WORKSPACE` with an operator-readable hint —
+/// the broadcast refused because the caller's workspace has no reachable panes
+/// (sharing off, or external caller). When both sets are empty → `UNKNOWN_WORKSPACE`
+/// (no live panes at all).
+fn socket_broadcast(
+    app: &tauri::AppHandle,
+    text: &str,
+    caller_ws: Option<&str>,
+) -> SocketResponse {
     let line = match normalize_input(text) {
         Ok(l) => l,
         Err(e) => return SocketResponse::err(response_code::BAD_REQUEST, e),
     };
     let st = app.state::<AppState>();
+    let reg = read_registry(&st.state_root).unwrap_or(LiveRegistry {
+        schema: LIVE_REGISTRY_SCHEMA,
+        app_pid: None,
+        updated_at: None,
+        active: None,
+        workspaces: Vec::new(),
+    });
     // B5 (Phase-16): exclude delegate WORKERS — a worker is mid-subtask and human-invisible, so an
     // operator's `team_broadcast` must not hijack it. Mirrors `live_pane_ctxs`'s `!is_worker` filter
-    // (the `team_orchestrate` path) so both Context-Router fan-outs honor the SAME invariant. No-op in
-    // the default build (no pane is `is_worker` without `delegate-live`); same alive/dead set as
-    // `live_ids` otherwise (a dead pane folds into `skipped` via the write gate in `send_to_panes`).
-    let ids: Vec<String> = st
+    // (the `team_orchestrate` path) so both Context-Router fan-outs honor the SAME invariant.
+    let pre_filter_count = st
         .sups
-        .with_map(|m| m.iter().filter(|(_, sup)| !sup.is_worker).map(|(id, _)| id.clone()).collect());
-    let targets: Vec<(String, String)> = ids.into_iter().map(|id| (id, line.clone())).collect();
-    let result = send_to_panes(&st, targets);
+        .with_map(|m| m.iter().filter(|(_, sup)| !sup.is_worker).count());
+    let authority = coordinator_authority_set(&st, caller_ws, &reg);
+    if authority.is_empty() && pre_filter_count > 0 {
+        // The caller has live panes but NONE are in their authority set → the workspace
+        // boundary refused the broadcast. D1 (external caller) lands here too (authority
+        // is empty when caller_ws is None).
+        return SocketResponse::err(
+            response_code::CROSS_WORKSPACE,
+            "broadcast: no reachable panes in your workspace (sharing off, or caller has no \
+             workspace identity — an external orchestrator cannot broadcast)"
+                .to_string(),
+        );
+    }
+    let targets: Vec<(String, String)> = authority
+        .into_iter()
+        .map(|id| (id, line.clone()))
+        .collect();
+    let result = send_to_panes(&st, targets, caller_ws);
     SocketResponse::ok("broadcast").with_data(result)
 }
 
@@ -7137,17 +7412,48 @@ fn socket_broadcast(app: &tauri::AppHandle, text: &str) -> SocketResponse {
 /// by design (control-char gate), and LLM-summarizing it would be a SECOND
 /// synthesizer (forbidden). So the `instruction` carries the payload and `from` is
 /// recorded as provenance. The composed line still passes the SAME gate.
-fn socket_handoff(app: &tauri::AppHandle, from: &str, to: &str, instruction: &str) -> SocketResponse {
+fn socket_handoff(
+    app: &tauri::AppHandle,
+    from: &str,
+    to: &str,
+    instruction: &str,
+    caller_ws: Option<&str>,
+) -> SocketResponse {
+    // WORKSPACE-ISOLATION (Phase 1, handoff): validate BOTH ends against the caller's
+    // workspace. `from` and `to` are both write targets (the handoff composes a message
+    // addressed to `to` with `from` as provenance; only `to` receives the write, but
+    // authorizing both prevents a caller from naming an arbitrary remote `from` to spoof
+    // provenance across the boundary). External/no-caller callers → D1 hard-deny via
+    // `NoCallerWs` from `authorize_cross`. The write_to_pane call below also gates on
+    // `to`'s ws (defense-in-depth — the explicit checks here are the load-bearing ones
+    // because they surface a structured CROSS_WORKSPACE before the normalize/lock path).
+    let st = app.state::<AppState>();
+    let reg = read_registry(&st.state_root).unwrap_or(LiveRegistry {
+        schema: LIVE_REGISTRY_SCHEMA,
+        app_pid: None,
+        updated_at: None,
+        active: None,
+        workspaces: Vec::new(),
+    });
+    for (target, label) in [(from, "handoff.from"), (to, "handoff.to")] {
+        if let Some(tws) = ws_of_pane(target) {
+            if let Err(e) = authorize_cross(caller_ws, tws, &reg, &st.state_root, label) {
+                return SocketResponse::err(response_code::CROSS_WORKSPACE, e.to_string());
+            }
+        }
+    }
     let composed = format!("[handoff from {from}] {instruction}");
     let line = match normalize_input(&composed) {
         Ok(l) => l,
         Err(e) => return SocketResponse::err(response_code::BAD_REQUEST, e),
     };
-    let st = app.state::<AppState>();
-    match write_to_pane(&st, to, line.as_bytes()) {
+    match write_to_pane(&st, to, line.as_bytes(), caller_ws) {
         Ok(()) => SocketResponse::ok("handoff delivered"),
         Err(e) if e == "no such workspace" => SocketResponse::err(response_code::UNKNOWN_WORKSPACE, e),
         Err(e) if e == "workspace is no longer alive" => SocketResponse::err(response_code::DEAD_PANE, e),
+        Err(e) if e.starts_with("CROSS_WORKSPACE:") || e.starts_with("NO_CALLER_WS:") => {
+            SocketResponse::err(response_code::CROSS_WORKSPACE, e)
+        }
         Err(e) => SocketResponse::err(response_code::BAD_REQUEST, e),
     }
 }
@@ -7515,7 +7821,17 @@ fn handle_socket_request(
     req: SocketRequest,
     caller_role: Option<roles::AgentRole>,
     peer_pid: Option<u32>,
+    caller_pane_id: Option<String>,
 ) -> SocketResponse {
+    // WORKSPACE-ISOLATION: derive the caller's workspace from the socket peer's pane id
+    // (the UDS path resolves it via `caller_pane_id_of_peer_pid`; the HTTP path passes
+    // None → the gate denies cross-ws writes via `NoCallerWs`). Owned → Option<&str> for
+    // the per-handler calls below; the slice borrows the owned string, which lives for
+    // the whole handler body.
+    let caller_ws: Option<String> = caller_pane_id
+        .as_deref()
+        .and_then(ws_of_pane)
+        .map(str::to_owned);
     // Capability gates — extracted into the PURE `gate_socket_request` (order + deny codes
     // pinned by the per-op table test) so the security-critical decision is unit-testable
     // without an AppHandle. Config is read FRESH from the file per request → flipping a gate
@@ -7564,7 +7880,7 @@ fn handle_socket_request(
                 Err(e) => return SocketResponse::err(response_code::BAD_REQUEST, e),
             };
             let st = app.state::<AppState>();
-            match write_to_pane(&st, &id, data.as_bytes()) {
+            match write_to_pane(&st, &id, data.as_bytes(), caller_ws.as_deref()) {
                 Ok(()) => SocketResponse::ok("input delivered"),
                 Err(e) if e == "no such workspace" => {
                     SocketResponse::err(response_code::UNKNOWN_WORKSPACE, e)
@@ -7572,6 +7888,13 @@ fn handle_socket_request(
                 Err(e) if e == "workspace is no longer alive" => {
                     // D30 dead-pane gate rejected the write — NOT a silent vanish.
                     SocketResponse::err(response_code::DEAD_PANE, e)
+                }
+                // WORKSPACE-ISOLATION (Phase 1): surface the structured CROSS_WORKSPACE
+                // code so the MCP sidecar relays it verbatim (the detail carries the
+                // "do not retry" hint the coordinator agent reads). The Display prefix
+                // is the match token; `NO_CALLER_WS:` is the D1 hard-deny sibling.
+                Err(e) if e.starts_with("CROSS_WORKSPACE:") || e.starts_with("NO_CALLER_WS:") => {
+                    SocketResponse::err(response_code::CROSS_WORKSPACE, e)
                 }
                 Err(e) => SocketResponse::err(response_code::BAD_REQUEST, e),
             }
@@ -7583,11 +7906,11 @@ fn handle_socket_request(
         // 06-03 Context Router. All three inherit the capability gate checked above
         // and route through the EXISTING gated paths (no second synthesizer/write).
         SocketRequest::Orchestrate { goal, dispatch, target_workspace } => {
-            socket_orchestrate(app, &goal, dispatch, target_workspace.as_deref())
+            socket_orchestrate(app, &goal, dispatch, target_workspace.as_deref(), caller_ws.as_deref())
         }
-        SocketRequest::Broadcast { text } => socket_broadcast(app, &text),
+        SocketRequest::Broadcast { text } => socket_broadcast(app, &text, caller_ws.as_deref()),
         SocketRequest::Handoff { from, to, instruction } => {
-            socket_handoff(app, &from, &to, &instruction)
+            socket_handoff(app, &from, &to, &instruction, caller_ws.as_deref())
         }
         // 06-05 fan-in: consolidate a run dir's pane reports into final.md + return the
         // per-pane verify_dispatched verdicts. Inherits the capability gate above; runs the
@@ -7602,7 +7925,7 @@ fn handle_socket_request(
             // button's `delegate` command, which threads the operator's choice through.
             // MCP/agent path: no workspace scope, initiator = "agent" (self-delegation → hidden from
             // the human History view).
-            socket_delegate(app, &parent_id, &goal, max_workers, depth, Harness::Claude, None, String::new(), "agent")
+            socket_delegate(app, &parent_id, &goal, max_workers, depth, Harness::Claude, None, String::new(), "agent", caller_ws.as_deref())
         }
         // 08 Sub-build 3 role-inversion READ ops (ListLive/Attach/Detach). These are
         // additive WIRE types served by the DAEMON's accept loop (slice 2/3), where the
@@ -7799,6 +8122,7 @@ fn socket_delegate(
     // "human" (UI-fired) vs "agent" (MCP self-delegation). Stored on the audit record.
     workspace_id: String,
     initiator: &str,
+    caller_ws: Option<&str>,
 ) -> SocketResponse {
     // One short critical section to read every runtime fact the gates need.
     let (autonomy_ceiling, cap, parent_known) = {
@@ -7810,6 +8134,26 @@ fn socket_delegate(
     };
     if let Err((code, detail)) = delegate_precheck(autonomy_ceiling, depth, goal, parent_known) {
         return SocketResponse::err(code, detail);
+    }
+    // WORKSPACE-ISOLATION (Phase 1, delegate): validate the parent_id's workspace against
+    // the caller's workspace. Workers inherit the parent's ws (they're spawned into the
+    // parent's workspace_id), so only the parent end needs the gate. External/no-caller
+    // callers → D1 hard-deny via `NoCallerWs` (the authorize_cross return maps to the
+    // structured CROSS_WORKSPACE response code below).
+    if let Some(parent_ws) = ws_of_pane(parent_id) {
+        let st = app.state::<AppState>();
+        let reg = read_registry(&st.state_root).unwrap_or(LiveRegistry {
+            schema: LIVE_REGISTRY_SCHEMA,
+            app_pid: None,
+            updated_at: None,
+            active: None,
+            workspaces: Vec::new(),
+        });
+        if let Err(e) =
+            authorize_cross(caller_ws, parent_ws, &reg, &st.state_root, "delegate.parent")
+        {
+            return SocketResponse::err(response_code::CROSS_WORKSPACE, e.to_string());
+        }
     }
     // FR-7 fairness: clamp to min(requested, cap-1, hard cap), floored at 1.
     let workers = agent_teams_core::delegate_admit(max_workers, cap);
@@ -9647,7 +9991,13 @@ fn delegate(
     };
     let model = model.filter(|m| !m.trim().is_empty());
     // UI/human path: carry the workspace scope + initiator = "human" (shows in YOUR History).
-    let resp = socket_delegate(&app, &parent_id, &goal, max_workers.unwrap_or(3), depth.unwrap_or(1), harness, model, workspace_id.unwrap_or_default(), "human");
+    // WORKSPACE-ISOLATION (Phase 1, GUI delegate): the webview is same-process / trusted;
+    // derive caller_ws from the active workspace (same TOCTOU posture as `send_input`).
+    let gui_caller_ws: Option<String> = {
+        let st = app.state::<AppState>();
+        read_registry(&st.state_root).and_then(|r| r.active)
+    };
+    let resp = socket_delegate(&app, &parent_id, &goal, max_workers.unwrap_or(3), depth.unwrap_or(1), harness, model, workspace_id.unwrap_or_default(), "human", gui_caller_ws.as_deref());
     if resp.ok {
         match resp.data {
             Some(agent_teams_core::SocketData::Delegate { run_id, workers }) => {
@@ -10353,7 +10703,12 @@ impl flywheel::runctx::DynEmitter for TauriEmitter {
         beat_in_flight(&self.app, &self.run_id, msg);
         if let Ok(line) = normalize_input(msg) {
             let st = self.app.state::<AppState>();
-            let _ = write_to_pane(&st, &self.parent_id, line.as_bytes());
+            // WORKSPACE-ISOLATION (Phase 1): the delegate controller writes to its OWN parent
+            // pane (same-ws by construction — socket_delegate authorized the parent's ws against
+            // the MCP caller's ws before this thread was spawned). Derive caller_ws from the
+            // parent_id so the write gate sees same-ws and passes.
+            let parent_ws = ws_of_pane(&self.parent_id);
+            let _ = write_to_pane(&st, &self.parent_id, line.as_bytes(), parent_ws);
         }
     }
 }
@@ -10955,12 +11310,17 @@ fn delegate_controller(
             || read_mcp_config(&st.state_root).autonomy_ceiling < 1
     };
     // ONE normalized line back to the PARENT pane (a real human PTY — write_to_pane works).
+    // WORKSPACE-ISOLATION (Phase 1): same discipline as the `notice` path — the delegate
+    // controller writes to its own parent (same-ws by construction). Derive caller_ws from
+    // parent_id once and reuse it across the closure's calls (ws_of_pane is a pure parse,
+    // no I/O).
+    let parent_ws: Option<String> = ws_of_pane(parent_id).map(str::to_owned);
     let say_back = |msg: &str| {
         // HUD heartbeat: every controller progress line is also a liveness beat + phase label.
         beat_in_flight(&app, run_id, msg);
         if let Ok(line) = normalize_input(msg) {
             let st = app.state::<AppState>();
-            let _ = write_to_pane(&st, parent_id, line.as_bytes());
+            let _ = write_to_pane(&st, parent_id, line.as_bytes(), parent_ws.as_deref());
         }
     };
 
@@ -12846,8 +13206,15 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                         let caller_role = peer_pid.and_then(|pid| caller_pane_role(app, pid));
                         #[cfg(not(target_os = "macos"))]
                         let caller_role: Option<roles::AgentRole> = None;
+                        // WORKSPACE-ISOLATION (Phase 1): mirror the role walk to recover the
+                        // caller's PANE ID (and thus its workspace) from the same peer pid.
+                        // None → external / reparented caller → the gate denies cross-ws writes.
+                        #[cfg(target_os = "macos")]
+                        let caller_pane_id = peer_pid.and_then(|pid| caller_pane_id_of_peer_pid(app, pid));
+                        #[cfg(not(target_os = "macos"))]
+                        let caller_pane_id: Option<String> = None;
                         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_socket_request(app, req, caller_role, peer_pid)
+                            handle_socket_request(app, req, caller_role, peer_pid, caller_pane_id)
                         })) {
                             Ok(resp) => resp,
                             Err(payload) => {
@@ -13223,10 +13590,11 @@ fn serve_http_request(
             // the coordinator-only gate refuses mutating ops over HTTP (fail closed). The
             // loopback-HTTP path is for read/observability; pane-driven mutations come over
             // the UDS socket where the peer pid binds the caller to its pane.
-            // HTTP transport: no Unix peer pid → caller_role None AND peer_pid None, so both
-            // the coordinator gate and the external-orchestrator path refuse mutating ops
-            // (external admission is UDS-only by construction). Fail closed.
-            let resp = handle_socket_request(app, parsed, None, None);
+            // HTTP transport: no Unix peer pid → caller_role None AND peer_pid None AND
+            // caller_pane_id None, so both the coordinator gate, the external-orchestrator
+            // path, AND the workspace-isolation gate refuse cross-ws writes (external
+            // admission is UDS-only by construction; D1 hard-deny). Fail closed.
+            let resp = handle_socket_request(app, parsed, None, None, None);
             let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
                 r#"{"ok":false,"code":"INTERNAL","message":"serialize failed"}"#.to_string()
             });
@@ -14040,6 +14408,9 @@ pub fn run() {
             bridge_verify,
             apply_update,
             set_max_concurrent,
+            // WORKSPACE-ISOLATION (Phase 1): per-workspace sharing opt-in toggle + read.
+            set_workspace_sharing,
+            get_workspace_sharing_states,
             get_capacity,
             run_now,
             speak,
