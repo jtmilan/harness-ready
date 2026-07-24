@@ -19543,6 +19543,7 @@ mod socket_seam_tests {
                     model: None,
                     target_workspace: None,
                 },
+                SocketRequest::WritePtyRaw { id: "w".into(), data: "x".into() },
             ]
         }
         // Exhaustiveness guard: a NEW SocketRequest variant that isn't added to `every_op()` (and
@@ -19564,10 +19565,11 @@ mod socket_seam_tests {
                 | SocketRequest::Close { .. }
                 | SocketRequest::ReadOutput { .. }
                 | SocketRequest::CreateWorkspace { .. }
-                | SocketRequest::AddPane { .. } => {}
+                | SocketRequest::AddPane { .. }
+                | SocketRequest::WritePtyRaw { .. } => {}
             }
         }
-        assert_eq!(every_op().len(), 15, "every_op() must enumerate every SocketRequest variant");
+        assert_eq!(every_op().len(), 16, "every_op() must enumerate every SocketRequest variant");
         let roles_matrix: [Option<roles::AgentRole>; 3] = [
             None,                                 // unresolved caller (external client)
             Some(roles::AgentRole::Builder),      // a tracked but non-coordinator pane
