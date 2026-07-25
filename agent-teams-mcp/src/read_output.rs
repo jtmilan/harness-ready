@@ -756,6 +756,11 @@ fn audit_read(state_dir: &Path, id: &str, bytes: usize, source: &str) {
             "id": id,
             "source": source,
             "bytes": bytes,
+            // Phase 2 (data-plane partition): tenant-stamp the read with the pane
+            // id's workspace (server-derived). A non-pane id (no `-pN` tail) yields
+            // null → the row stays in the legacy global scope. Lets `team_audit_log`
+            // scope reads to the caller's visible workspaces.
+            "ws": agent_teams_core::ws_of_pane(id),
         })
         .to_string();
         use std::io::Write;

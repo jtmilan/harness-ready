@@ -457,13 +457,22 @@ impl TeamServer {
         &self,
         Parameters(args): Parameters<audit_log::AuditLogArgs>,
     ) -> Result<Json<audit_log::AuditLogResult>, ErrorData> {
-        // Phase 2: filter audit entries by ws tag (entries currently carry no ws
-        // tag; the whole log is returned regardless of caller_ws). Trivially
-        // retrofittable once the app stamps ws on each mutation/read row.
-        Ok(Json(audit_log::resolve(
+        // WORKSPACE ISOLATION (Phase 2): scope audit rows to the caller's visible
+        // workspaces. Each row now carries a `ws` stamp (mutations best-effort from
+        // the target; reads from the pane id). An absent/null stamp (legacy
+        // pre-Phase-2 rows, or a genuinely ws-less external op) is the GLOBAL scope
+        // — visible to every caller, which is also the free migration for the
+        // existing on-disk ledgers. Reads ALWAYS scope (no kill-switch check),
+        // matching the Phase-1 read tools. No-caller (operator/dev/test) keeps the
+        // global view (`can_see_ws` is true for all when `caller_ws` is None).
+        Ok(Json(audit_log::resolve_scoped(
             &self.state_dir,
             args.limit,
             args.kind.as_deref(),
+            |ws| match ws {
+                None => true,
+                Some(target) => self.can_see_ws(target),
+            },
         )))
     }
 }

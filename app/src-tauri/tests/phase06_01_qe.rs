@@ -190,6 +190,7 @@ fn ac3_live_registry_format_roundtrip() {
             tag: None,
             session_id: None,
             spawned_at: Some(1735689600456),
+            allow_sharing: false,
         }],
     };
     assert_eq!(back, expected);

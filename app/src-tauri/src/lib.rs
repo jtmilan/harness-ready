@@ -6943,6 +6943,25 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let text_snip = text.map(|t| t.chars().take(200).collect::<String>());
+    // Phase 2 (data-plane partition): BEST-EFFORT tenant stamp so `team_audit_log`
+    // can scope rows to the caller's visible workspaces (decision: derive from the
+    // target, never from client text). Pane-id targets (send_input/focus) → their
+    // workspace via the strict `ws_of_pane`; a bare workspace target (orchestrate /
+    // add_pane `target_workspace`) passes through; broadcast / create_workspace /
+    // "N pane(s)" / free text → null (the legacy global scope). A non-ws-shaped
+    // target falls to null rather than mis-stamping a wrong tenant.
+    let ws: Option<String> = target.as_deref().and_then(|t| {
+        if let Some(w) = ws_of_pane(t) {
+            return Some(w.to_string());
+        }
+        let trimmed = t.trim();
+        let bare_ws = trimmed.starts_with("ws")
+            && trimmed.contains('x')
+            && !trimmed
+                .chars()
+                .any(|c| c.is_whitespace() || c == '(' || c == ')');
+        bare_ws.then(|| trimmed.to_string())
+    });
     let rec = serde_json::json!({
         "ts": ts,
         "source": "external_orchestrator",
@@ -6951,6 +6970,7 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
         "target": target,
         "text": text_snip,
         "details": details,
+        "ws": ws,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
@@ -7650,6 +7670,9 @@ fn audit_external_read(app: &tauri::AppHandle, id: &str, bytes: usize) {
         "id": id,
         "source": "live_scrollback",
         "bytes": bytes,
+        // Phase 2 (data-plane partition): tenant-stamp the read with the pane id's
+        // workspace so `team_audit_log` can scope it (null = non-pane id → global).
+        "ws": ws_of_pane(id),
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
@@ -15087,7 +15110,14 @@ fn memory_harvest_reports(
     if candidates.is_empty() {
         return 0;
     }
-    agent_teams_memory::write_harvested_notes(&dir, &candidates, run_id, goal)
+    // Phase 2 (side-path decision): tenant-stamp harvested notes with the run's
+    // workspace, derived server-side from the report pane ids (the harvest has no
+    // caller identity, so the run's own panes are the authoritative ws source). A
+    // run whose panes carry no derivable ws leaves the notes global.
+    let ws = reports
+        .iter()
+        .find_map(|(pane_id, _)| ws_of_pane(pane_id).map(str::to_owned));
+    agent_teams_memory::write_harvested_notes(&dir, &candidates, run_id, goal, ws)
 }
 
 /// Capture ONE completed run as a structured note in the GLOBAL memory store. Gate
