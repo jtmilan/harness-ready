@@ -154,6 +154,31 @@ fn genesis_owner(log: &[Transition], task_id: &str) -> Option<String> {
         })
 }
 
+/// Normalize a task provenance identity to its bare TENANT workspace id for the
+/// Phase-2 partition. The identity may be a full pane id (`wsNNNNNxK-pN`, what the
+/// genesis `Actor::Pane` stamps) or a bare workspace id (what an operator-store
+/// `Task.workspace_id` may carry); both fold to the bare `wsNNNNNxK`. The
+/// `unknown` sentinel / empty / whitespace → `None` = the legacy GLOBAL scope
+/// (operator-authored, no-identity, and every pre-Phase-2 task — visible to every
+/// workspace; that is the free migration). PURE.
+fn tenant_of(identity: Option<&str>) -> Option<String> {
+    let s = identity?.trim();
+    if s.is_empty() || s == "unknown" {
+        return None;
+    }
+    Some(
+        agent_teams_core::ws_of_pane(s)
+            .map(str::to_owned)
+            .unwrap_or_else(|| s.to_string()),
+    )
+}
+
+/// The tenant workspace of a log-only (agent-created) task: derived server-side
+/// from its genesis author's pane id. Operator/unknown genesis → `None` (global).
+fn task_tenant_ws(log: &[Transition], task_id: &str) -> Option<String> {
+    tenant_of(genesis_owner(log, task_id).as_deref())
+}
+
 /// 4c authorization (PURE, testable): may a pane with `scope` transition `task_id`?
 /// `scope == None` ⇒ unrestricted. Else the genesis owner must EQUAL the scope —
 /// so a pane advances only a task it authored (cross-pane / operator-task / phantom
@@ -220,7 +245,9 @@ impl TaskView {
             created_at: t.created_at,
             updated_at: t.updated_at,
             lifecycle: lifecycle.to_string(),
-            workspace_id: t.workspace_id.clone(),
+            // Phase 2: normalize the operator-store provenance to a bare tenant ws
+            // (pane id → ws; `unknown`/empty → None = global scope).
+            workspace_id: tenant_of(t.workspace_id.as_deref()),
             pane_id: t.pane_id.clone(),
             run_id: t.run_id.clone(),
         }
@@ -229,7 +256,14 @@ impl TaskView {
     /// Build a view for a LOG-ONLY (agent-created) task from its ALREADY-folded parts
     /// (title + genesis `at` + lifecycle). Column defaults to `backlog`; these never
     /// touch the mutable store (C4), so they have no operator column/order/links.
-    fn from_log_parts(id: &str, title: Option<&str>, at: u64, lifecycle: Lifecycle) -> Self {
+    /// `workspace_id` is the tenant derived from the genesis author (Phase 2).
+    fn from_log_parts(
+        id: &str,
+        title: Option<&str>,
+        at: u64,
+        lifecycle: Lifecycle,
+        workspace_id: Option<String>,
+    ) -> Self {
         TaskView {
             id: id.to_string(),
             title: title.unwrap_or_default().to_string(),
@@ -238,7 +272,7 @@ impl TaskView {
             created_at: at,
             updated_at: at,
             lifecycle: lifecycle.to_string(),
-            workspace_id: None,
+            workspace_id,
             pane_id: None,
             run_id: None,
         }
@@ -279,7 +313,13 @@ fn list_views(store_tasks: &[Task], log: &[Transition]) -> Vec<TaskView> {
     for id in log_task_ids(log) {
         if !store_ids.contains(id.as_str()) {
             let (title, at) = genesis.get(id.as_str()).copied().unwrap_or((None, 0));
-            out.push(TaskView::from_log_parts(&id, title, at, lc(&id)));
+            out.push(TaskView::from_log_parts(
+                &id,
+                title,
+                at,
+                lc(&id),
+                task_tenant_ws(log, &id),
+            ));
         }
     }
     out
@@ -298,6 +338,7 @@ fn get_view(id: &str, store_tasks: &[Task], log: &[Transition]) -> Option<TaskVi
             g.title.as_deref(),
             g.at,
             current_lifecycle(log, id),
+            task_tenant_ws(log, id),
         ));
     }
     None
@@ -411,6 +452,22 @@ impl TeamServer {
             )),
         }
     }
+
+    // ── Phase 2 (data-plane partition): tenant visibility over tasks ──────────
+    //
+    // Same predicate as the Phase-1 read tools (`can_see_ws`). A task's tenant is
+    // its normalized `workspace_id` (view) — `None` (operator / no-identity /
+    // pre-Phase-2) is the legacy GLOBAL scope, visible to every workspace (the
+    // free migration). Reads ALWAYS scope (no kill-switch check) — matching the
+    // shipped Phase-1 read tools.
+    /// Is a task with this (already-normalized) tenant workspace visible to the
+    /// caller? `None` tenant = global = visible to all.
+    fn task_ws_visible(&self, tenant_ws: Option<&str>) -> bool {
+        match tenant_ws {
+            None => true,
+            Some(ws) => self.can_see_ws(ws),
+        }
+    }
 }
 
 #[tool_router(router = task_tool_router, vis = "pub(crate)")]
@@ -430,7 +487,10 @@ impl TeamServer {
     ) -> Result<Json<TasksResult>, ErrorData> {
         let (store, log_path) = self.task_paths()?;
         let log = read_transitions(&log_path);
-        let tasks = list_views(&read_tasks(&store), &log);
+        let mut tasks = list_views(&read_tasks(&store), &log);
+        // Phase 2: drop tasks in workspaces the caller cannot see (own ws ∪
+        // mutually-sharing ∪ the global `None`-tenant scope). No-caller keeps all.
+        tasks.retain(|v| self.task_ws_visible(v.workspace_id.as_deref()));
         Ok(Json(TasksResult { tasks }))
     }
 
@@ -447,6 +507,17 @@ impl TeamServer {
         let (store, log_path) = self.task_paths()?;
         let log = read_transitions(&log_path);
         let task = get_view(&a.id, &read_tasks(&store), &log);
+        // Phase 2: a caller-NAMED by-id read of a foreign-tenant task is a HARD
+        // CROSS_WORKSPACE error (never a silent null — don't hide intent on a
+        // security boundary). Global-tenant tasks (None) pass.
+        if let Some(v) = &task {
+            if !self.task_ws_visible(v.workspace_id.as_deref()) {
+                return Err(self.cross_workspace_err(
+                    v.workspace_id.as_deref().unwrap_or("<global>"),
+                    "task_get",
+                ));
+            }
+        }
         Ok(Json(TaskResult { task }))
     }
 
@@ -507,7 +578,7 @@ impl TeamServer {
         let to: Lifecycle =
             a.to.parse()
                 .map_err(|e: String| ErrorData::invalid_params(e, None))?;
-        let (_store, log_path) = self.task_paths()?;
+        let (store, log_path) = self.task_paths()?;
 
         // CROSS-PROCESS critical section: flock the log for the whole
         // read-fold-validate-append below, so two sidecars can't both fold the same
@@ -525,6 +596,20 @@ impl TeamServer {
             return Err(ErrorData::invalid_params(
                 format!("task_transition: unknown task id {:?} (no genesis)", a.id),
                 None,
+            ));
+        }
+
+        // Phase 2: refuse to advance a foreign-tenant task. Tenant is derived the
+        // SAME way the read path sees it (get_view → normalized workspace_id), so
+        // the write gate and the read filter never disagree. A global-tenant task
+        // (None) is writable by any caller; a foreign one is a hard CROSS_WORKSPACE
+        // (this is a WRITE op, but the MCP read-side predicate `can_see_ws` is the
+        // scoping authority here, consistent with the Phase-2 read decision).
+        let tenant = get_view(&a.id, &read_tasks(&store), &log).and_then(|v| v.workspace_id);
+        if !self.task_ws_visible(tenant.as_deref()) {
+            return Err(self.cross_workspace_err(
+                tenant.as_deref().unwrap_or("<global>"),
+                "task_transition",
             ));
         }
 
@@ -1120,5 +1205,162 @@ mod tests {
             listed[0].lifecycle, "review",
             "list_views folds the same lifecycle"
         );
+    }
+
+    // ════════════════ Phase 2 — data-plane partition (task) ═════════════════════
+    //
+    // `tenant_of` / `task_tenant_ws` are PURE (no env, no server) → tested directly.
+    // The read-filter + by-id gate are exercised behaviorally through the tools with
+    // `caller_ws` set on the server (private field, in scope from this child module;
+    // no `set_var` — the module's no-env-race discipline).
+
+    const CROSS_WS: &str = "CROSS_WORKSPACE";
+
+    fn err_message<T>(r: Result<T, ErrorData>) -> Option<String> {
+        r.err().map(|e| e.message.to_string())
+    }
+
+    /// A TeamServer over a fresh, test-private state_dir (nested so its parent —
+    /// where the task store/log siblings land — is also test-private).
+    fn server_with_unique_state() -> (TeamServer, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "at-mcp-task-ws-test-{}-{}",
+            std::process::id(),
+            mint_id()
+        ));
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        (TeamServer::new(state_dir.clone()), root)
+    }
+
+    #[test]
+    fn tenant_of_normalizes_provenance_identities() {
+        // pane id → bare workspace
+        assert_eq!(
+            tenant_of(Some("ws76101x0-p3")).as_deref(),
+            Some("ws76101x0"),
+            "a pane id folds to its workspace"
+        );
+        // bare workspace id passes through
+        assert_eq!(
+            tenant_of(Some("ws76101x0")).as_deref(),
+            Some("ws76101x0"),
+            "a bare workspace id is already a tenant"
+        );
+        // the `unknown` sentinel / empty / whitespace / None → global scope (None)
+        assert_eq!(tenant_of(Some("unknown")), None, "`unknown` → global");
+        assert_eq!(tenant_of(Some("")), None, "empty → global");
+        assert_eq!(tenant_of(Some("   ")), None, "whitespace → global");
+        assert_eq!(tenant_of(None), None, "None → global");
+    }
+
+    #[test]
+    fn task_tenant_ws_derives_from_the_genesis_author() {
+        let dir = std::env::temp_dir().join(format!(
+            "at-mcp-task-tenant-{}-{}",
+            std::process::id(),
+            mint_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("tasks-log.jsonl");
+
+        // pane-authored (wsA), another-pane-authored (wsB), and operator-authored.
+        create_task(&log_path, "A", "a", actor_from(Some("wsA-p1".into())), 1).unwrap();
+        create_task(&log_path, "B", "b", actor_from(Some("wsB-p1".into())), 2).unwrap();
+        create_task(&log_path, "G", "g", Actor::Operator, 3).unwrap();
+        let log = read_transitions(&log_path);
+
+        assert_eq!(task_tenant_ws(&log, "A").as_deref(), Some("wsA"));
+        assert_eq!(task_tenant_ws(&log, "B").as_deref(), Some("wsB"));
+        assert_eq!(
+            task_tenant_ws(&log, "G"),
+            None,
+            "operator-authored task → global scope"
+        );
+        assert_eq!(task_tenant_ws(&log, "nope"), None, "absent task → global");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn phase2_task_read_partition_matrix() {
+        let (mut srv, root) = server_with_unique_state();
+        let log_path = tasks_log_path(&srv.state_dir).expect("log path");
+
+        // Fixtures: a wsA task, a wsB (foreign) task, and a global (operator) task.
+        create_task(&log_path, "taskA", "a", actor_from(Some("wsA-p1".into())), 1).unwrap();
+        create_task(&log_path, "taskB", "b", actor_from(Some("wsB-p1".into())), 2).unwrap();
+        create_task(&log_path, "taskG", "g", Actor::Operator, 3).unwrap();
+
+        async fn listed_ids(srv: &TeamServer) -> Vec<String> {
+            srv.task_list(Parameters(ListTasksArgs::default()))
+                .await
+                .expect("task_list ok")
+                .0
+                .tasks
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        }
+
+        // ── caller = wsA, sharing OFF (no registry → default-deny) ──
+        srv.caller_ws = Some("wsA".into());
+        let ids = listed_ids(&srv).await;
+        assert!(ids.contains(&"taskA".into()), "own-ws task visible");
+        assert!(ids.contains(&"taskG".into()), "global task visible to all");
+        assert!(!ids.contains(&"taskB".into()), "foreign task hidden");
+
+        // by-id read of the foreign task → hard CROSS_WORKSPACE.
+        let msg = err_message(
+            srv.task_get(Parameters(GetTaskArgs { id: "taskB".into() }))
+                .await,
+        )
+        .expect("foreign task_get must Err");
+        assert!(msg.contains(CROSS_WS), "foreign by-id read = {CROSS_WS}: {msg}");
+
+        // transitioning the foreign task is refused too (write-side ws check).
+        let msg = err_message(
+            srv.task_transition(Parameters(TransitionTaskArgs {
+                id: "taskB".into(),
+                to: "doing".into(),
+            }))
+            .await,
+        )
+        .expect("foreign task_transition must Err");
+        assert!(msg.contains(CROSS_WS), "foreign transition = {CROSS_WS}: {msg}");
+
+        // own task is gettable + transitionable.
+        assert!(
+            srv.task_get(Parameters(GetTaskArgs { id: "taskA".into() }))
+                .await
+                .unwrap()
+                .0
+                .task
+                .is_some(),
+            "own by-id read passes"
+        );
+
+        // ── wsB opts into sharing → caller wsA sees wsB's task ──
+        let reg = serde_json::json!({
+            "schema": 1,
+            "workspaces": [{ "id": "wsB", "allow_sharing": true }],
+        });
+        std::fs::write(
+            root.join("agent-teams-live.json"),
+            serde_json::to_string(&reg).unwrap(),
+        )
+        .unwrap();
+        let ids = listed_ids(&srv).await;
+        assert!(
+            ids.contains(&"taskB".into()),
+            "a sharing target ws becomes visible (read-side)"
+        );
+
+        // ── operator / no caller → global view (all tasks) ──
+        srv.caller_ws = None;
+        let ids = listed_ids(&srv).await;
+        assert_eq!(ids.len(), 3, "no-caller keeps the pre-isolation global view");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

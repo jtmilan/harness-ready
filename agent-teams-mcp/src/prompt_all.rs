@@ -545,6 +545,7 @@ mod tests {
             tag: tag.map(str::to_string),
             session_id: None,
             spawned_at: None,
+            allow_sharing: false,
         }
     }
 

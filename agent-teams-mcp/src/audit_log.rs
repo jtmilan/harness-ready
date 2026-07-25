@@ -85,7 +85,28 @@ pub struct AuditLogResult {
 /// Resolve the audit trail: read the requested ledger(s) beside the state root,
 /// merge, and return the newest `limit` rows. Read-only and best-effort: missing
 /// files and malformed lines degrade to `note`/`skipped`, never an error.
+///
+/// Unscoped convenience wrapper over [`resolve_scoped`] with an always-visible
+/// predicate (the operator / no-caller global view). The MCP tool calls
+/// [`resolve_scoped`] with a tenant predicate for the Phase-2 partition.
+#[allow(dead_code)] // production calls `resolve_scoped`; kept as the tested unscoped entry point
 pub fn resolve(state_dir: &Path, limit: Option<u32>, kind: Option<&str>) -> AuditLogResult {
+    resolve_scoped(state_dir, limit, kind, |_| true)
+}
+
+/// Like [`resolve`], but filters rows by a caller-supplied tenant predicate BEFORE
+/// the newest-`limit` truncation (so foreign rows never consume the caller's
+/// visible cap). `visible` receives the row's `ws` field (`None` when the row carries
+/// no stamp — legacy pre-Phase-2 rows and genuinely ws-less external ops; the
+/// predicate decides those, conventionally `None` = the global scope). Filtering
+/// happens pre-truncate so a caller surrounded by foreign rows still gets a full
+/// page of its own visible history.
+pub fn resolve_scoped(
+    state_dir: &Path,
+    limit: Option<u32>,
+    kind: Option<&str>,
+    visible: impl Fn(Option<&str>) -> bool,
+) -> AuditLogResult {
     let cap = (limit.map(|l| l as usize).unwrap_or(DEFAULT_LIMIT)).min(HARD_LIMIT);
 
     // Which ledgers to read. An unknown kind reads NOTHING (with a note) rather
@@ -164,6 +185,12 @@ pub fn resolve(state_dir: &Path, limit: Option<u32>, kind: Option<&str>) -> Audi
     if want_reads {
         read_ledger(READS_LEDGER, "reads");
     }
+
+    // Phase 2 (data-plane partition): drop rows the caller cannot see, BEFORE the
+    // newest-`cap` truncation (foreign rows must not consume the visible page).
+    // A row's tenant is its `ws` stamp; an absent/null stamp (legacy / ws-less
+    // external op) is handed to the predicate as `None`.
+    rows.retain(|(_, _, e)| visible(e.row.get("ws").and_then(|v| v.as_str())));
 
     // Newest first: ts descending, append order descending as the tie-break.
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
@@ -384,6 +411,76 @@ mod tests {
             .filter_map(|e| e.row.get("text").and_then(|v| v.as_str()))
             .collect();
         assert_eq!(texts, vec!["second", "first"], "later append wins the tie");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Phase 2 — `resolve_scoped` filters rows by the caller's tenant predicate
+    /// BEFORE the newest-`limit` truncation: foreign rows neither appear nor
+    /// consume the visible page; a null/absent `ws` stamp (legacy / ws-less
+    /// external op) is handed to the predicate as `None` (conventionally the
+    /// global scope). The unscoped `resolve` wrapper ignores `ws` entirely.
+    #[test]
+    fn resolve_scoped_filters_by_ws_before_truncate() {
+        let root = unique_root("scoped");
+        // 5 foreign (wsB) rows with the HIGHEST ts, then 3 own (wsA) + 1 global
+        // (no ws) row with lower ts. A naive filter-AFTER-truncate (limit 3) would
+        // return the 3 wsB rows and starve the caller; pre-truncate filtering must
+        // return the 3 visible (wsA) rows instead.
+        let state = scaffold(
+            &root,
+            &[
+                r#"{"ts":100,"op":"broadcast","ws":"wsB"}"#,
+                r#"{"ts":101,"op":"broadcast","ws":"wsB"}"#,
+                r#"{"ts":102,"op":"broadcast","ws":"wsB"}"#,
+                r#"{"ts":103,"op":"broadcast","ws":"wsB"}"#,
+                r#"{"ts":104,"op":"broadcast","ws":"wsB"}"#,
+                r#"{"ts":50,"op":"send_input","ws":"wsA"}"#,
+                r#"{"ts":51,"op":"send_input","ws":"wsA"}"#,
+                r#"{"ts":52,"op":"send_input","ws":"wsA"}"#,
+                r#"{"ts":1,"op":"focus"}"#, // no ws stamp → global (low ts: under the top-3)
+            ],
+            &[],
+        );
+
+        // Caller sees wsA + global (None); wsB is foreign.
+        let r = resolve_scoped(&state, Some(3), Some("mutations"), |ws| match ws {
+            None => true,
+            Some("wsA") => true,
+            Some(_) => false,
+        });
+        let ws_tags: Vec<Option<&str>> = r
+            .entries
+            .iter()
+            .map(|e| e.row.get("ws").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            r.entries.len(),
+            3,
+            "foreign rows must not consume the caller's visible page"
+        );
+        assert!(
+            ws_tags.iter().all(|w| *w == Some("wsA")),
+            "the 3 newest VISIBLE rows are wsA (foreign wsB filtered pre-truncate): {ws_tags:?}"
+        );
+
+        // A wider limit surfaces the global (no-ws) row too, still no wsB.
+        let r = resolve_scoped(&state, Some(20), Some("mutations"), |ws| match ws {
+            None => true,
+            Some("wsA") => true,
+            Some(_) => false,
+        });
+        assert_eq!(r.entries.len(), 4, "3 wsA + 1 global, no wsB");
+        assert!(
+            r.entries
+                .iter()
+                .all(|e| e.row.get("ws").and_then(|v| v.as_str()) != Some("wsB")),
+            "no foreign wsB row leaks"
+        );
+
+        // The unscoped `resolve` wrapper ignores ws and returns all 9 (newest first).
+        let all = resolve(&state, Some(20), Some("mutations"));
+        assert_eq!(all.entries.len(), 9, "unscoped sees every row");
 
         let _ = fs::remove_dir_all(&root);
     }

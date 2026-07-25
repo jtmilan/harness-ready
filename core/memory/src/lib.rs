@@ -373,6 +373,27 @@ pub fn create_note(
     category: Option<String>,
     writer: Option<String>,
 ) -> io::Result<Note> {
+    // Unscoped convenience: no workspace tenant stamp (legacy `global` scope,
+    // visible to every workspace on read). The scoped tool/harvest paths call
+    // [`create_note_scoped`] directly with a server-derived workspace id.
+    create_note_scoped(dir, title, body, tags, links, category, writer, None)
+}
+
+/// Like [`create_note`], but stamps the tenant [`Note::workspace_id`] — the
+/// workspace that OWNS this note for the Phase-2 data-plane partition. The store
+/// stays HERMETIC: `workspace_id` is passed by the caller (the tool layer derives
+/// it server-side from `$AGENT_TEAMS_PANE_ID`; this crate never reads env or
+/// parses pane ids). `None` = legacy unscoped note (the `global` shared scope).
+pub fn create_note_scoped(
+    dir: &Path,
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    links: Vec<String>,
+    category: Option<String>,
+    writer: Option<String>,
+    workspace_id: Option<String>,
+) -> io::Result<Note> {
     validate_write(&title, &body, &tags, &links)?;
     if count_notes(dir) >= MAX_NOTES_PER_DIR {
         return Err(io::Error::new(
@@ -398,7 +419,8 @@ pub fn create_note(
         // Structured run-provenance is set ONLY by the capture path
         // ([`build_run_capture`]); an ordinary create/graph-editor note carries none.
         run_id: None,
-        workspace_id: None,
+        // Tenant stamp for the Phase-2 partition (None = legacy global scope).
+        workspace_id,
     };
     write_note_atomic(dir, &note)?;
     Ok(note)
@@ -895,6 +917,7 @@ pub fn write_harvested_notes(
     candidates: &[LessonCandidate],
     run_id: &str,
     goal: &str,
+    workspace: Option<String>,
 ) -> usize {
     if candidates.is_empty() {
         return 0;
@@ -918,7 +941,9 @@ pub fn write_harvested_notes(
         );
         // Created WITH the lineage links (those ids exist NOW): a crash before the
         // mesh patch below leaves a valid store — orphans at worst, never dangling.
-        if let Ok(note) = create_note(
+        // Tenant-stamped with the run's workspace (Phase-2 side-path decision): no
+        // global bypass via harvest.
+        if let Ok(note) = create_note_scoped(
             dir,
             c.title.clone(),
             body,
@@ -926,6 +951,7 @@ pub fn write_harvested_notes(
             relevant.clone(),
             Some(HARVEST_CATEGORY.to_string()),
             Some(c.pane_id.clone()),
+            workspace.clone(),
         ) {
             seen.insert(c.title.clone());
             written_ids.push(note.id);
@@ -2958,7 +2984,7 @@ mod tests {
         let text = "LESSON: the store dir must be a sibling of state_root to survive wipes\n";
         let cands = harvest_lessons(&[rep("ws9-p2", text)]);
         assert_eq!(cands.len(), 1);
-        let n = write_harvested_notes(&dir, &cands, "run-2026-07-06", "");
+        let n = write_harvested_notes(&dir, &cands, "run-2026-07-06", "", None);
         assert_eq!(n, 1);
         let notes = list_notes(&dir);
         assert_eq!(notes.len(), 1);
@@ -2983,7 +3009,7 @@ mod tests {
         // A single-note batch has no siblings and (goal "") no lineage → links empty.
         assert!(note.links.is_empty());
         // Re-harvesting the SAME run is idempotent: exact-title dedup writes 0.
-        assert_eq!(write_harvested_notes(&dir, &cands, "run-2026-07-06", ""), 0);
+        assert_eq!(write_harvested_notes(&dir, &cands, "run-2026-07-06", "", None), 0);
         assert_eq!(list_notes(&dir).len(), 1);
     }
 
@@ -3006,7 +3032,7 @@ mod tests {
                     LESSON: a second, genuinely new lesson lands despite the dup ahead of it\n";
         let cands = harvest_lessons(&[rep("p0", text)]);
         assert_eq!(cands.len(), 2);
-        let n = write_harvested_notes(&dir, &cands, "r1", "");
+        let n = write_harvested_notes(&dir, &cands, "r1", "", None);
         assert_eq!(n, 1, "dup skipped, new one written");
         let notes = list_notes(&dir);
         assert_eq!(notes.len(), 2);
@@ -3022,7 +3048,7 @@ mod tests {
     fn write_harvested_notes_empty_is_zero_and_touches_nothing() {
         let s = Scratch::new("harvest-empty");
         let (_sr, dir) = dir_for(&s);
-        assert_eq!(write_harvested_notes(&dir, &[], "r0", "any goal"), 0);
+        assert_eq!(write_harvested_notes(&dir, &[], "r0", "any goal", None), 0);
         // No dir is even created for an empty batch.
         assert!(!dir.exists());
     }
@@ -3097,7 +3123,7 @@ mod tests {
                     LESSON: mesh lesson two is long enough to pass the guard\n\
                     LESSON: mesh lesson three is long enough to pass the guard\n";
         let cands = harvest_lessons(&[rep("p0", text)]);
-        assert_eq!(write_harvested_notes(&dir, &cands, "mesh-run", ""), 3);
+        assert_eq!(write_harvested_notes(&dir, &cands, "mesh-run", "", None), 3);
         let notes = list_notes(&dir);
         assert_eq!(notes.len(), 3);
         for n in &notes {
@@ -3142,7 +3168,7 @@ mod tests {
                     LESSON: lineage lesson beta is long enough to pass the guard\n";
         let cands = harvest_lessons(&[rep("ws2-p1", text)]);
         let goal = "run the flywheel verify loop again";
-        assert_eq!(write_harvested_notes(&dir, &cands, "lineage-run", goal), 2);
+        assert_eq!(write_harvested_notes(&dir, &cands, "lineage-run", goal, None), 2);
         let notes = list_notes(&dir);
         let new_notes: Vec<&Note> = notes
             .iter()
@@ -3204,7 +3230,7 @@ mod tests {
                     LESSON: fresh lesson two is long enough to pass the guard\n";
         let cands = harvest_lessons(&[rep("p0", text)]);
         assert_eq!(cands.len(), 3);
-        assert_eq!(write_harvested_notes(&dir, &cands, "skip-run", ""), 2);
+        assert_eq!(write_harvested_notes(&dir, &cands, "skip-run", "", None), 2);
         let notes = list_notes(&dir);
         let fresh: Vec<&Note> = notes.iter().filter(|n| n.id != pre.id).collect();
         assert_eq!(fresh.len(), 2);

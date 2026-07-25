@@ -27,7 +27,7 @@ use rmcp::{tool, tool_router, ErrorData};
 use serde::{Deserialize, Serialize};
 
 use agent_teams_memory::{
-    backlinks, build_graph, create_note, delete_note, get_note, harvest_lessons, list_notes,
+    backlinks, build_graph, create_note_scoped, delete_note, get_note, harvest_lessons, list_notes,
     memory_root, repo_dir, search_notes, suggest, update_note, valid_note_id,
     write_harvested_notes, MemoryGraph, Note, NotePatch, Suggestion, GLOBAL_SCOPE,
 };
@@ -167,7 +167,15 @@ pub(crate) fn harvest_reports(
     if candidates.is_empty() {
         return 0;
     }
-    write_harvested_notes(&dir, &candidates, run_id, goal)
+    // Phase 2 (side-path decision): harvested notes are tenant-stamped with the
+    // run's workspace, derived server-side from the report pane ids (the harvest
+    // has no caller identity — it's a post-run fan-in — so the run's own panes are
+    // the authoritative ws source). A run whose panes carry no derivable ws leaves
+    // the notes unscoped (global). No global bypass for a ws-bearing run.
+    let ws = reports
+        .iter()
+        .find_map(|(pane_id, _)| agent_teams_core::ws_of_pane(pane_id).map(str::to_owned));
+    write_harvested_notes(&dir, &candidates, run_id, goal, ws)
 }
 
 impl TeamServer {
@@ -180,6 +188,31 @@ impl TeamServer {
                 None,
             )
         })
+    }
+
+    // ── Phase 2 (data-plane partition): tenant visibility over notes ──────────
+    //
+    // Same predicate as the Phase-1 read tools (`can_see_ws`): a note is visible
+    // when its tenant workspace is the caller's own OR the target workspace has
+    // opted into symmetric sharing. A note with NO `workspace_id` (legacy / the
+    // `global` shared scope, incl. every note written before Phase 2) is visible
+    // to EVERY workspace — that is the free migration: existing rows ARE the
+    // shared scope. `caller_ws == None` (operator/dev/test) keeps the global view
+    // (`can_see_ws` returns true for all). Reads ALWAYS scope (no kill-switch
+    // check) — matching the shipped Phase-1 read tools.
+
+    /// Is one note visible to the caller?
+    fn note_visible(&self, note: &Note) -> bool {
+        match note.workspace_id.as_deref() {
+            // Legacy / global-scope note → shared, visible to all.
+            None => true,
+            Some(ws) => self.can_see_ws(ws),
+        }
+    }
+
+    /// Filter a note set down to the caller's visible tenant scope.
+    fn visible_notes(&self, notes: Vec<Note>) -> Vec<Note> {
+        notes.into_iter().filter(|n| self.note_visible(n)).collect()
     }
 }
 
@@ -196,7 +229,11 @@ impl TeamServer {
         Parameters(a): Parameters<CreateMemoryArgs>,
     ) -> Result<Json<NoteResult>, ErrorData> {
         let dir = self.memory_dir()?;
-        let note = create_note(
+        // Phase 2: tenant-stamp the note with the caller's workspace (derived
+        // server-side from `$AGENT_TEAMS_PANE_ID` at construction, NOT from any
+        // client-supplied data). `caller_ws == None` (operator/no-identity) leaves
+        // it unscoped → the shared `global` scope, visible to every workspace.
+        let note = create_note_scoped(
             &dir,
             a.title,
             a.body,
@@ -204,6 +241,7 @@ impl TeamServer {
             a.links,
             a.category,
             writer_id(),
+            self.caller_ws.clone(),
         )
         .map_err(|e| ErrorData::invalid_params(format!("create_memory: {e}"), None))?;
         Ok(Json(NoteResult { note: Some(note) }))
@@ -219,7 +257,7 @@ impl TeamServer {
         Parameters(a): Parameters<SearchMemoriesArgs>,
     ) -> Result<Json<MemoriesResult>, ErrorData> {
         let dir = self.memory_dir()?;
-        let all = list_notes(&dir);
+        let all = self.visible_notes(list_notes(&dir));
         Ok(Json(MemoriesResult {
             memories: search_notes(&all, &a.query, default_limit(a.limit)),
         }))
@@ -235,7 +273,7 @@ impl TeamServer {
         Parameters(a): Parameters<FindBacklinksArgs>,
     ) -> Result<Json<BacklinksResult>, ErrorData> {
         let dir = self.memory_dir()?;
-        let all = list_notes(&dir);
+        let all = self.visible_notes(list_notes(&dir));
         Ok(Json(BacklinksResult {
             backlinks: backlinks(&all, &a.target),
         }))
@@ -251,7 +289,7 @@ impl TeamServer {
         Parameters(a): Parameters<SuggestConnectionsArgs>,
     ) -> Result<Json<SuggestionsResult>, ErrorData> {
         let dir = self.memory_dir()?;
-        let all = list_notes(&dir);
+        let all = self.visible_notes(list_notes(&dir));
         Ok(Json(SuggestionsResult {
             suggestions: suggest(&all, &a.target, default_limit(a.limit)),
         }))
@@ -269,9 +307,20 @@ impl TeamServer {
             return Err(reject_bad_id());
         }
         let dir = self.memory_dir()?;
-        Ok(Json(NoteResult {
-            note: get_note(&dir, &a.id),
-        }))
+        let note = get_note(&dir, &a.id);
+        // Phase 2: gate a caller-NAMED by-id read on the note's tenant. A foreign
+        // note (workspace_id set, not visible) is a HARD CROSS_WORKSPACE error —
+        // never a silent null (the Phase-1 convention: don't hide intent on a
+        // security boundary). Legacy/global notes (workspace_id None) pass.
+        if let Some(n) = &note {
+            if !self.note_visible(n) {
+                return Err(self.cross_workspace_err(
+                    n.workspace_id.as_deref().unwrap_or("<global>"),
+                    "get_memory",
+                ));
+            }
+        }
+        Ok(Json(NoteResult { note }))
     }
 
     #[tool(
@@ -284,7 +333,7 @@ impl TeamServer {
     ) -> Result<Json<MemoriesResult>, ErrorData> {
         let dir = self.memory_dir()?;
         Ok(Json(MemoriesResult {
-            memories: list_notes(&dir),
+            memories: self.visible_notes(list_notes(&dir)),
         }))
     }
 
@@ -301,6 +350,17 @@ impl TeamServer {
             return Err(reject_bad_id());
         }
         let dir = self.memory_dir()?;
+        // Phase 2: refuse to mutate a foreign-tenant note. The tenant stamp is
+        // immutable across update (update_note never touches workspace_id), so
+        // gating on the pre-update note is correct. Foreign → hard CROSS_WORKSPACE.
+        if let Some(existing) = get_note(&dir, &a.id) {
+            if !self.note_visible(&existing) {
+                return Err(self.cross_workspace_err(
+                    existing.workspace_id.as_deref().unwrap_or("<global>"),
+                    "update_memory",
+                ));
+            }
+        }
         let patch = NotePatch {
             title: a.title,
             body: a.body,
@@ -326,6 +386,15 @@ impl TeamServer {
             return Err(reject_bad_id());
         }
         let dir = self.memory_dir()?;
+        // Phase 2: refuse to delete a foreign-tenant note (hard CROSS_WORKSPACE).
+        if let Some(existing) = get_note(&dir, &a.id) {
+            if !self.note_visible(&existing) {
+                return Err(self.cross_workspace_err(
+                    existing.workspace_id.as_deref().unwrap_or("<global>"),
+                    "delete_memory",
+                ));
+            }
+        }
         let deleted = delete_note(&dir, &a.id)
             .map_err(|e| ErrorData::internal_error(format!("delete_memory: {e}"), None))?;
         Ok(Json(DeleteResult { deleted }))
@@ -343,7 +412,7 @@ impl TeamServer {
         Parameters(_a): Parameters<ListMemoriesArgs>,
     ) -> Result<Json<MemoryGraph>, ErrorData> {
         let dir = self.memory_dir()?;
-        Ok(Json(build_graph(&list_notes(&dir))))
+        Ok(Json(build_graph(&self.visible_notes(list_notes(&dir)))))
     }
 }
 
@@ -621,6 +690,191 @@ mod tests {
                 "no-env fallback must resolve to /global: {dir:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ════════════════ Phase 2 — data-plane partition (memory) ════════════════════
+    //
+    // Behavioral matrix for the tenant stamp + filter-on-read. `caller_ws` is a
+    // private field set directly here (this module is a child of the crate root
+    // that defines `TeamServer`, so the field is in scope) — we do NOT touch
+    // `$AGENT_TEAMS_PANE_ID` (the module's no-`set_var` discipline: concurrent
+    // setenv across libtest threads is UB). Sharing is driven by a hand-written
+    // live registry beside the test-private state dir.
+
+    /// The CROSS_WORKSPACE message marker (asserted on the message, not the code,
+    /// so the test pins the wire-visible contract a client parser keys off).
+    const CROSS_WS: &str = "CROSS_WORKSPACE";
+
+    fn err_message<T>(r: Result<T, ErrorData>) -> Option<String> {
+        r.err().map(|e| e.message.to_string())
+    }
+
+    /// Write a live registry (sibling of the state dir) marking the given
+    /// workspaces as `allow_sharing=true`.
+    fn write_sharing_registry(root: &std::path::Path, sharing_ws: &[&str]) {
+        let workspaces: Vec<serde_json::Value> = sharing_ws
+            .iter()
+            .map(|ws| serde_json::json!({ "id": ws, "allow_sharing": true }))
+            .collect();
+        let reg = serde_json::json!({ "schema": 1, "workspaces": workspaces });
+        std::fs::write(
+            root.join("agent-teams-live.json"),
+            serde_json::to_string(&reg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn list_titles(srv: &TeamServer) -> Vec<String> {
+        srv.list_memories(Parameters(ListMemoriesArgs::default()))
+            .await
+            .expect("list_memories ok")
+            .0
+            .memories
+            .into_iter()
+            .map(|n| n.title)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn phase2_create_stamps_the_caller_workspace() {
+        // create_memory tenant-stamps the note with the server-derived caller_ws
+        // (NOT client data). operator/no-identity (None) → unscoped (global).
+        let (mut srv, root) = server_with_unique_state();
+
+        srv.caller_ws = Some("ws76101x0".into());
+        let scoped = srv
+            .create_memory(Parameters(CreateMemoryArgs {
+                title: "scoped".into(),
+                body: "b".into(),
+                tags: vec![],
+                links: vec![],
+                category: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .note
+            .unwrap();
+        assert_eq!(
+            scoped.workspace_id.as_deref(),
+            Some("ws76101x0"),
+            "create_memory stamps the caller's workspace"
+        );
+
+        srv.caller_ws = None;
+        let global = srv
+            .create_memory(Parameters(CreateMemoryArgs {
+                title: "global".into(),
+                body: "b".into(),
+                tags: vec![],
+                links: vec![],
+                category: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .note
+            .unwrap();
+        assert_eq!(
+            global.workspace_id, None,
+            "no caller identity → unscoped (legacy global scope)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn phase2_memory_read_partition_matrix() {
+        let (mut srv, root) = server_with_unique_state();
+        let dir = notes_dir(&root.join("state")).expect("notes dir");
+
+        // Fixtures via the hermetic core: own-ws, foreign-ws, and a global note.
+        let own = create_note_scoped(
+            &dir, "own".into(), "b".into(), vec![], vec![], None, None,
+            Some("wsA".into()),
+        )
+        .unwrap();
+        let foreign = create_note_scoped(
+            &dir, "foreign".into(), "b".into(), vec![], vec![], None, None,
+            Some("wsB".into()),
+        )
+        .unwrap();
+        let _global = create_note_scoped(
+            &dir, "global".into(), "b".into(), vec![], vec![], None, None, None,
+        )
+        .unwrap();
+
+        // ── caller = wsA, sharing OFF (no registry → default-deny) ──
+        srv.caller_ws = Some("wsA".into());
+        let titles = list_titles(&srv).await;
+        assert!(titles.contains(&"own".into()), "own-ws note visible");
+        assert!(titles.contains(&"global".into()), "global note visible to all");
+        assert!(!titles.contains(&"foreign".into()), "foreign note hidden");
+
+        // by-id read of the foreign note → hard CROSS_WORKSPACE (not a silent null).
+        let msg = err_message(
+            srv.get_memory(Parameters(GetMemoryArgs {
+                id: foreign.id.clone(),
+            }))
+            .await,
+        )
+        .expect("foreign get_memory must Err");
+        assert!(msg.contains(CROSS_WS), "foreign by-id read = {CROSS_WS}: {msg}");
+
+        // by-id update/delete of the foreign note are also refused.
+        assert!(err_message(
+            srv.update_memory(Parameters(UpdateMemoryArgs {
+                id: foreign.id.clone(),
+                title: Some("x".into()),
+                body: None,
+                tags: None,
+                links: None,
+                category: None,
+            }))
+            .await,
+        )
+        .unwrap()
+        .contains(CROSS_WS));
+        assert!(err_message(
+            srv.delete_memory(Parameters(DeleteMemoryArgs {
+                id: foreign.id.clone(),
+            }))
+            .await,
+        )
+        .unwrap()
+        .contains(CROSS_WS));
+
+        // the foreign note survived the refused delete (gate fired before I/O).
+        assert!(
+            get_note(&dir, &foreign.id).is_some(),
+            "refused delete must not remove the foreign note"
+        );
+
+        // own by-id read passes.
+        assert!(
+            srv.get_memory(Parameters(GetMemoryArgs { id: own.id.clone() }))
+                .await
+                .unwrap()
+                .0
+                .note
+                .is_some(),
+            "own by-id read passes"
+        );
+
+        // ── wsB opts into sharing → caller wsA now sees wsB's note ──
+        write_sharing_registry(&root, &["wsB"]);
+        let titles = list_titles(&srv).await;
+        assert!(
+            titles.contains(&"foreign".into()),
+            "a target ws with allow_sharing=true becomes visible (read-side)"
+        );
+
+        // ── operator / no caller → the global view (everything) ──
+        srv.caller_ws = None;
+        let titles = list_titles(&srv).await;
+        assert_eq!(titles.len(), 3, "no-caller keeps the pre-isolation global view");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
