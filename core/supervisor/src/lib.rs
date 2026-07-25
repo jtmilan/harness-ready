@@ -1740,6 +1740,25 @@ impl Supervisor {
                 );
             }
         }
+        // CommandCode GLOBAL MCP injection (sibling to the project-local inject above).
+        // CommandCode reads MCP from BOTH the per-cwd `.mcp.json` AND `~/.commandcode/
+        // mcp.json`; injecting the global file gives the pane MCP even when its cwd is
+        // not the worktree root, and gives the startup-purge path a place to clean
+        // after a daemon crash. Serialized under COMMANDCODE_CONFIG_LOCK + idempotent
+        // strip-before-append, mirroring the codex path. The block is stripped on
+        // Supervisor::kill (see `remove_commandcode_mcp`).
+        if !spec.is_worker && matches!(spec.harness, Harness::CommandCode) {
+            if let Err(e) = inject_commandcode_global_mcp(
+                sidecar_bin,
+                state_root,
+                &spec.id,
+                &mem_key,
+            ) {
+                eprintln!(
+                    "[agent-teams] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
+                );
+            }
+        }
 
         // grok is state-blind but a first-class MCP CLIENT: it reads a project-scoped
         // `.grok/config.toml` at the pane cwd (auto-discovered). Same sidecar, TOML format.
