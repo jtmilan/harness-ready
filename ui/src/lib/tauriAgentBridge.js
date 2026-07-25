@@ -704,8 +704,16 @@ export class TauriAgentBridge {
           raw: "",
           gen: this.gen[id],
         };
-        this._emit();
-      }
+    // GC stale pane labels. `ids` is the authoritative, COMPLETE live set for this tick: it is
+    // the union of the queue rows (from a successful `list_queue`) and adapter-spawned ids, and
+    // it is only reached when `_pollOnce` did NOT throw (the outer `_poll` swallows tick errors
+    // before we get here). So the list is known-good, not a boot/empty/hiccup superset.
+    // reconcilePaneLabels itself ALSO no-ops on an empty `ids` (and we only call on a successful
+    // tick), so a transiently-empty queue can never wipe labels. Closed panes' ids drop out of
+    // `ids` on the tick after they die → their permanent `hr:pane-labels` entry gets pruned.
+    reconcilePaneLabels(ids);
+    this._emit();
+  }
 
       try {
         await invoke("spawn_workspace", { id, harness, repo, role });
