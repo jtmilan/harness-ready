@@ -1979,9 +1979,21 @@ impl Supervisor {
         let sink = output.clone();
         let subs_sink = subs.clone();
         let writer_for_reader = writer.clone();
+        // Grok 0.2.112 opens an interactive WELCOME/SESSION screen on launch (it lists
+        // recent sessions for the cwd; a fresh worktree has none, so it shows the empty
+        // dashboard: "New worktree / Resume session / Changelog / Quit") INSTEAD of a chat
+        // prompt. That screen swallows the coordinator's delegated task (typed bytes never
+        // reach a prompt), so an interactive grok pane looks "stuck working". The TUI has no
+        // CLI flag to skip it and process cwd is already the worktree, so the fix is to
+        // dismiss it: Enter on the welcome screen starts a new chat in the cwd (live-verified
+        // by the operator). We send that Enter ONCE, the instant we see the screen painted,
+        // from the reader thread below (event-driven, no timing guess). Interactive grok only.
+        let grok_welcome_dismiss = matches!(spec.harness, Harness::Grok) && !spec.is_worker;
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut probe_carry: Vec<u8> = Vec::new();
+            let mut grok_dismiss = grok_welcome_dismiss;
+            let mut grok_tail = String::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -1995,6 +2007,26 @@ impl Supervisor {
                         // OpenTUI blocks on capability probes until the host answers.
                         // Answer here so paint does not depend on FE sized-gate timing.
                         auto_answer_term_queries(&writer_for_reader, chunk, &mut probe_carry);
+                        // Dismiss grok's welcome screen (see grok_welcome_dismiss above) the
+                        // moment its menu is painted: detect a menu label in a rolling tail of
+                        // the output (rolling so a label split across two reads still matches),
+                        // then send Enter once. The tail is only tracked while pending, so
+                        // non-grok panes and post-dismiss reads pay nothing.
+                        if grok_dismiss {
+                            grok_tail.push_str(&String::from_utf8_lossy(chunk));
+                            if grok_tail.contains("New worktree")
+                                || grok_tail.contains("Resume session")
+                            {
+                                if let Ok(mut g) = writer_for_reader.lock() {
+                                    let _ = g.write_all(b"\r");
+                                    let _ = g.flush();
+                                }
+                                grok_dismiss = false;
+                            } else if grok_tail.len() > 512 {
+                                let drop = grok_tail.len() - 512;
+                                grok_tail.drain(..drop);
+                            }
+                        }
                     }
                 }
             }
