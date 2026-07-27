@@ -87,3 +87,37 @@ describe("TauriAgentBridge.spawnAgents — K1 return value (pinned; p4)", () => 
     "failed spawn_workspace invoke is excluded from the returned id list",
   );
 });
+
+describe("TauriAgentBridge.spawnAgents — workspace unity (one tenant per workspace)", () => {
+  // Regression guard for the bug where every manual NEW AGENT minted its OWN backend
+  // ws prefix at `-p0`, so a workspace's panes each looked like a separate workspace
+  // to the coordinator's MCP scope (team_get_queue / prompt_all / list_workspaces
+  // could not address the fleet as one unit). Reusing a wsId across calls must hand
+  // out the next free `-pN` slot — never collide at `-p0`.
+  it("reusing a wsId across single-add calls increments the pane index", async () => {
+    const { invoke } = installGlobals();
+    vi.resetModules();
+    ({ TauriAgentBridge } = await import("@/lib/tauriAgentBridge"));
+    const bridge = new TauriAgentBridge();
+    bridge._poll = vi.fn(async () => {});
+    const wsId = "ws55555x0";
+    await bridge.spawnAgents([{ kind: "claude-code" }], "T", { assignTo: wsId, wsId });
+    await bridge.spawnAgents([{ kind: "cursor" }], "T", { assignTo: wsId, wsId });
+    await bridge.spawnAgents([{ kind: "grok" }], "T", { assignTo: wsId, wsId });
+    const ids = spawnCalls(invoke).map((c) => c[1].id);
+    expect(ids).toEqual(["ws55555x0-p0", "ws55555x0-p1", "ws55555x0-p2"]);
+  });
+
+  it("a fresh wsId still starts at -p0 with a shared prefix", async () => {
+    const { invoke } = installGlobals();
+    vi.resetModules();
+    ({ TauriAgentBridge } = await import("@/lib/tauriAgentBridge"));
+    const bridge = new TauriAgentBridge();
+    bridge._poll = vi.fn(async () => {});
+    await bridge.spawnAgents([{ kind: "claude-code" }, { kind: "cursor" }], "T");
+    const ids = spawnCalls(invoke).map((c) => c[1].id);
+    expect(ids[0]).toMatch(/-p0$/);
+    expect(ids[1]).toMatch(/-p1$/);
+    expect(ids[0].slice(0, -3)).toBe(ids[1].slice(0, -3)); // same ws prefix
+  });
+});

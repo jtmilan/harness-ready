@@ -17,7 +17,7 @@
 
 import { randomAgentName } from "@/lib/agentNames";
 import { reconcilePaneLabels } from "@/lib/paneLabels";
-import { assignMany, unassign } from "@/lib/workspaceAssign";
+import { assignMany, unassign, getAssignment } from "@/lib/workspaceAssign";
 import { toast } from "@/components/ui/use-toast";
 
 // Prod parity: POLL_TICK_MS = 120 in agent-teams app/src/poll-core.js:7 — 500ms reads a beat
@@ -410,15 +410,40 @@ export class TauriAgentBridge {
   // minting a new one (template path creates the UI tab first with this id).
   async spawnAgents(configs, _name, { assignTo, wsId: wsIdOpt } = {}) {
     // Backend groups panes into a workspace by right-splitting the id on "-p"
-    // (wsNNNNNxK-pN shape) — one workspace id per spawnAgents call.
+    // (wsNNNNNxK-pN shape). A workspace is ONE tenant: when the caller REUSES a ws
+    // prefix (wsIdOpt — a manual spawn into an existing workspace, or a template
+    // relaunch), every pane in that workspace MUST share the prefix and take the next
+    // free `-pN` slot. The OLD per-batch 0-based index made every single-add call
+    // collide at `-p0` and — worse — gave each pane its own prefix, so the
+    // coordinator's MCP scope (team_get_queue / prompt_all / list_workspaces) saw each
+    // pane as a separate workspace and could not address the fleet as one. A fresh ws
+    // has no live panes, so its indices still start at 0 (unchanged behavior).
     const ws =
       typeof wsIdOpt === "string" && wsIdOpt
         ? wsIdOpt
         : "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
-    // Mint ALL ids up front (same wsNNNNNx0-pN scheme as before) so assignMany can pin
-    // the whole batch before any per-config invoke.
-    const plan = configs.map((cfg, index) => {
-      const id = `${ws}-p${index}`;
+    // Collect pane indices already occupying this ws (live/optimistic registrations
+    // AND the localStorage assignment map — the latter catches panes whose registration
+    // lagged, so we never hand out a slot that collides with a pane the backend still
+    // holds). Over-counting only leaves gaps (safe); under-counting would collide.
+    const usedIdx = new Set();
+    const take = (pid) => {
+      if (pid.startsWith(ws + "-p")) {
+        const k = Number(pid.slice(ws.length + 2));
+        if (Number.isInteger(k) && k >= 0) usedIdx.add(k);
+      }
+    };
+    for (const pid of Object.keys(this.spawned)) take(pid);
+    for (const [pid, wid] of Object.entries(getAssignment())) {
+      if (wid === ws) take(pid);
+    }
+    // Mint ALL ids up front so assignMany can pin the whole batch before any invoke.
+    let cursor = 0;
+    const plan = configs.map((cfg) => {
+      while (usedIdx.has(cursor)) cursor += 1;
+      const id = `${ws}-p${cursor}`;
+      usedIdx.add(cursor);
+      cursor += 1;
       return {
         id,
         cfg,

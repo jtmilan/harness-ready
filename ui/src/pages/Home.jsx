@@ -204,10 +204,6 @@ export default function Home() {
   // (spawn-window squeeze → 1–2 col PTYs). Manual spawn uses assignTo when the operator
   // is on a non-default workspace for the same reason.
   const defaultWsId = workspaces[0]?.id;
-  const spawnAssignOpts =
-    activeWorkspace && activeWorkspace !== defaultWsId
-      ? { assignTo: activeWorkspace }
-      : {};
   const handleLaunchTemplate = async (template) => {
     // Same id scheme as TauriAgentBridge.spawnAgents — bridge accepts optional wsId.
     const wsId = "ws" + String(Math.floor(10000 + Math.random() * 90000)) + "x0";
@@ -217,12 +213,15 @@ export default function Home() {
     forceRerender();
   };
   const handleSpawnAgent = async (cfg) => {
-    const { paneIds } = await bridge.spawnAgents([cfg], "MANUAL LAUNCH", spawnAssignOpts);
-    // When assignTo was not used (default bucket), still pin to the active workspace.
-    if (!spawnAssignOpts.assignTo) {
-      const wsId = activeWorkspace;
-      for (const paneId of paneIds) assign(paneId, wsId);
-    }
+    // UNIFY the workspace: pass the active workspace's id as the backend ws prefix so
+    // the new pane shares the workspace's tenant (wsNNNNNxK / seed id) instead of
+    // minting its own. Without this, every manual NEW AGENT became its own workspace
+    // at `-p0`, so the coordinator's MCP scope saw each pane in isolation and
+    // `team_prompt_all` / `list_workspaces` could not address the fleet as one unit.
+    // spawnAgents assigns the next free `-pN` slot for that ws. assignTo pins the
+    // optimistic pane into the active tab before the first poll tick.
+    const wsId = activeWorkspace || defaultWsId;
+    await bridge.spawnAgents([cfg], "MANUAL LAUNCH", { assignTo: wsId, wsId });
     forceRerender(); // assignment is localStorage-only; re-bucket without a tab switch
   };
   // CLOSE WORKSPACE confirm path: terminate the whole fleet AND return to a
