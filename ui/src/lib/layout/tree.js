@@ -220,8 +220,12 @@ function pruneDead(node, live, seen) {
 // workspace-store id (`ws-1`); the old index scheme rebuilt leaves as `${wsId}-p${i}` and
 // every restore pruned-to-empty. The storage *envelope* (`{v:2, tree}`) lives at the
 // useTiling layer; these pure helpers only transform the tree node.
-// `paneIdxOf` / `wsId` args kept for call-site compat; index-era leaves heal via
-// legacy `{i:N}` → `${wsId}-p${N}` when wsId is provided, else null.
+// `paneIdxOf` / `wsId` args are retained positionally for call-site compat but
+// IGNORED under v2: leaves carry the full pane id, and legacy index-era `{i:N}`
+// leaves are REJECTED (not healed to `${wsId}-p${N}`) — that heal WAS the id-space
+// mismatch (a UI ws id + index never matches a spawn-group-scoped live pane, so it
+// only ever pruned to empty; prod already discards it because `unpackTree` never
+// passes wsId and rejects non-v2 envelopes).
 export function serializeTree(node, _paneIdxOf) {
   if (!node) return null;
   if (node.t === "leaf") {
@@ -232,16 +236,17 @@ export function serializeTree(node, _paneIdxOf) {
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };
   return a || b || null;
 }
-export function deserializeTree(node, wsId) {
+export function deserializeTree(node, _wsId) {
   if (!node || typeof node !== "object") return null;
   if (node.t === "leaf") {
+    // v2: the wire id is authoritative. A legacy index-only leaf (`{i:N}`) is
+    // rejected, never rebuilt as `${wsId}-p${N}` (see header note).
     if (typeof node.id === "string" && node.id) return leaf(node.id);
-    if (typeof node.i === "number" && wsId) return leaf(`${wsId}-p${node.i}`);
     return null;
   }
   if (node.t !== "split") return null;
-  const a = deserializeTree(node.a, wsId);
-  const b = deserializeTree(node.b, wsId);
+  const a = deserializeTree(node.a, _wsId);
+  const b = deserializeTree(node.b, _wsId);
   if (a && b) return { t: "split", dir: node.dir, ratio: node.ratio, a, b };
   return a || b || null;
 }
