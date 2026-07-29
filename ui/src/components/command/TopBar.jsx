@@ -23,7 +23,7 @@ export default function TopBar({ activeCount, localWorking = 0, capMax = null, a
       </button>
       <button
         onClick={onBroadcast}
-        title="Broadcast (⌘⇧I)"
+        title="Broadcast a one-shot command to all panes (opens a prompt). ⌘⇧I is the live-typing toggle, not this button."
         className="flex items-center gap-2 px-5 py-2.5 border border-cyan-800 text-cyan-500 font-heading tracking-[0.2em] text-sm font-bold hover:border-cyan-400 hover:text-cyan-300 transition-colors"
       >
         <Megaphone className="w-4 h-4" /> BROADCAST

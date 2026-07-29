@@ -56,17 +56,21 @@ export default function NewAgentOverlay({ onLaunch, onClose }) {
             </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <div className={labelCls}>PRIORITY</div>
-              <select value={priority} onChange={(e) => setPriority(e.target.value)} className={inputCls}>
+            {/* F-OBS-4 (M1 / R3): PRIORITY + AUTONOMY have NO backend effect — Tauri
+                spawn_workspace accepts id/harness/repo/role only. Shown disabled with a
+                PENDING BACKEND tag rather than removed, so the fields exist the day the
+                contract grows them (NEEDS-BACKEND; SYNTHESIS §2 V-B1). */}
+            <div className="space-y-1.5" title="No backend effect yet — spawn_workspace takes id / harness / repo / role only (NEEDS-BACKEND)">
+              <div className={labelCls}>PRIORITY · <span className="text-cyan-800">PENDING BACKEND</span></div>
+              <select value={priority} onChange={(e) => setPriority(e.target.value)} disabled className={inputCls + " opacity-50 cursor-not-allowed"}>
                 <option value="low">LOW</option>
                 <option value="normal">NORMAL</option>
                 <option value="high">HIGH</option>
               </select>
             </div>
-            <div className="space-y-1.5">
-              <div className={labelCls}>AUTONOMY</div>
-              <select value={autonomy} onChange={(e) => setAutonomy(e.target.value)} className={inputCls}>
+            <div className="space-y-1.5" title="No backend effect yet — spawn_workspace takes id / harness / repo / role only (NEEDS-BACKEND)">
+              <div className={labelCls}>AUTONOMY · <span className="text-cyan-800">PENDING BACKEND</span></div>
+              <select value={autonomy} onChange={(e) => setAutonomy(e.target.value)} disabled className={inputCls + " opacity-50 cursor-not-allowed"}>
                 <option value="supervised">SUPERVISED</option>
                 <option value="semi">SEMI-AUTONOMOUS</option>
                 <option value="full">FULL AUTONOMY</option>

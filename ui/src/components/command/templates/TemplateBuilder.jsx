@@ -28,12 +28,14 @@ export default function TemplateBuilder({ onSave, saving }) {
               <option key={k} value={k}>{AGENT_KINDS[k].label}</option>
             ))}
           </select>
-          <select value={row.priority} onChange={(e) => setRow(i, { priority: e.target.value })} className={inputCls}>
+          {/* F-OBS-4 (M1 / R3): priority/autonomy have no backend effect — disabled until
+              spawn honors them (NEEDS-BACKEND). Defaults still ride the schema. */}
+          <select value={row.priority} onChange={(e) => setRow(i, { priority: e.target.value })} disabled title="Pending backend — not honored by spawn yet" className={inputCls + " opacity-50 cursor-not-allowed"}>
             <option value="low">LOW</option>
             <option value="normal">NORMAL</option>
             <option value="high">HIGH</option>
           </select>
-          <select value={row.autonomy} onChange={(e) => setRow(i, { autonomy: e.target.value })} className={inputCls}>
+          <select value={row.autonomy} onChange={(e) => setRow(i, { autonomy: e.target.value })} disabled title="Pending backend — not honored by spawn yet" className={inputCls + " opacity-50 cursor-not-allowed"}>
             <option value="supervised">SUPERVISED</option>
             <option value="semi">SEMI-AUTO</option>
             <option value="full">FULL AUTO</option>
