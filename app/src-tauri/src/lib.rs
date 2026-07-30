@@ -1565,6 +1565,17 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
     } else {
         &state.sidecar_bin
     };
+    // Coordinator-gate-fix regression lock: the pane's sidecar config must be baked with
+    // THIS app's OWN state root — `inject_mcp_config` renders `{{STATE_DIR}}` verbatim from
+    // the spawn parameter, so baking another install's root (the bug: a dev binary baking
+    // the prod path) makes the dev-spawned sidecar dial prod's socket, which never knew the
+    // workspace. `state.state_root` is `default_state_root()` captured at setup; re-resolve
+    // to prove they agree (debug builds only — zero release cost).
+    debug_assert_eq!(
+        state.state_root,
+        default_state_root(),
+        "spawn must inject the app's OWN state root (flavor isolation)"
+    );
     let sup = match Supervisor::spawn(&spec, &state.hooks_dir, &state.state_root, chosen_sidecar) {
         Ok(s) => s,
         Err(e) => {
@@ -3078,9 +3089,38 @@ fn set_active_workspace(state: tauri::State<AppState>, id: Option<String>) {
 }
 
 fn default_state_root() -> PathBuf {
+    // The flavor primitive (coordinator-gate-fix): ONE deterministic decision, in priority
+    // order — (1) the explicit `AGENT_TEAMS_STATE_DIR` escape hatch (Dev.app's baked
+    // LSEnvironment, or an operator override); (2) a DEBUG build (`tauri dev` / `cargo
+    // run`, `cfg!(debug_assertions)`) is a DEV install → the canonical dev sandbox, so a
+    // bare dev run can NEVER bake the prod root into its spawned sidecars (the bug:
+    // dev-spawned sidecars dialed prod's socket, which never knew the workspace); (3) the
+    // prod root. Deterministic code — NO per-machine config. (The plan's `env!("PROFILE")`
+    // is unavailable outside build scripts; `debug_assertions` is the same build-time
+    // signal, set by cargo for exactly the debug profile.) The socket + live registry are
+    // fixed-name SIBLINGS of this root, so a distinct root isolates them by construction
+    // (prod + dev coexist; the instance.lock flock can't false-collide).
     if let Ok(d) = std::env::var("AGENT_TEAMS_STATE_DIR") {
         return PathBuf::from(d);
     }
+    if cfg!(debug_assertions) {
+        return dev_state_root();
+    }
+    prod_state_root()
+}
+
+/// The canonical DEV state root — the ONE dev dir the scripts (scripts/dev.sh) + the
+/// Harness Ready Dev LSEnvironment bake agree on (coordinator-gate-fix port). NESTED
+/// under `harness-ready-dev/` so the fixed-name sibling files (MCP socket, live
+/// registry, HTTP port/token) land in `harness-ready-dev/`, NOT in `Application
+/// Support/` where they would collide with production's.
+fn dev_state_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/harness-ready-dev/state")
+}
+
+/// The prod state root (release builds without an env override).
+fn prod_state_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     // NESTED under harness-ready/ (one level below Application Support) so the fixed-name
     // SIBLINGS of state_root — agent-teams-mcp.sock, the live registry, persist/audit files —
@@ -20048,6 +20088,67 @@ mod socket_seam_tests {
         // (If catch_unwind propagated the panic the test binary would abort before here.)
         let proof_of_survival: u32 = 42;
         assert_eq!(proof_of_survival, 42, "thread survives: listener loop would keep accepting");
+    }
+}
+
+// ─────────────── coordinator-gate-fix: dual-install flavor isolation ────────────────
+//
+// Prod + dev installs coexist BY CONSTRUCTION: one deterministic `default_state_root`
+// decision (env escape hatch → debug PROFILE → dev sandbox → prod), and the socket +
+// live registry are fixed-name SIBLINGS of that root — so distinct roots yield distinct
+// sockets with zero renaming and the single-instance flock can't false-collide.
+#[cfg(test)]
+mod flavor_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn dev_prod_state_roots_differ_and_dev_is_nested() {
+        let dev = dev_state_root();
+        let prod = prod_state_root();
+        assert_ne!(dev, prod, "dev and prod must NEVER share a state root");
+        // the dev root is NESTED under harness-ready-dev/ so the fixed-name sibling
+        // files (socket, live registry) land INSIDE harness-ready-dev/, not Application
+        // Support/
+        assert_eq!(
+            dev.parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned()),
+            Some("harness-ready-dev".to_string()),
+            "dev root nested → siblings isolated from prod"
+        );
+        assert!(
+            prod.ends_with("Library/Application Support/harness-ready/agent-teams"),
+            "prod root unchanged (this fork's nested prod path)"
+        );
+    }
+
+    #[test]
+    fn socket_path_isolated_by_flavor() {
+        // the socket is a fixed-name SIBLING of state_root → distinct roots give
+        // distinct sockets by construction (the dual-install coexistence guarantee).
+        let dev_sock = agent_teams_core::socket_path(&dev_state_root()).unwrap();
+        let prod_sock = agent_teams_core::socket_path(&prod_state_root()).unwrap();
+        assert_ne!(dev_sock, prod_sock);
+        assert_ne!(
+            dev_sock.parent(),
+            prod_sock.parent(),
+            "the dev socket must NOT sit in prod's parent dir"
+        );
+    }
+
+    #[test]
+    fn default_state_root_is_the_dev_root_on_a_debug_build() {
+        // cargo test compiles a debug build (debug_assertions on) → the flavor primitive
+        // selects the dev sandbox (unless the env escape hatch is set — untestable
+        // without racing other tests' env reads, so skip that branch when present).
+        if std::env::var("AGENT_TEAMS_STATE_DIR").is_ok() {
+            return;
+        }
+        assert_eq!(
+            default_state_root(),
+            dev_state_root(),
+            "a debug build must default to the dev sandbox — never prod"
+        );
     }
 }
 

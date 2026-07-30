@@ -655,6 +655,49 @@ mod mcp_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Coordinator-gate-fix smoking-gun lock: `inject_mcp_config` bakes the CALLER's
+    // `cfg.state_root` into the rendered sidecar config VERBATIM — no internal default.
+    // (The lockout bug's aggravator: a dev-binary caller baked the PROD state path, so
+    // the dev-spawned sidecar dialed prod's socket.) Two distinct caller roots must
+    // produce two distinct baked env values.
+    #[test]
+    fn inject_mcp_config_bakes_calling_state_root_verbatim() {
+        let root = scratch("bake-root");
+        let repo = root.join("worktree");
+        let staged = root.join("staged-hooks");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+        fs::copy(
+            templates_dir().join("claude-mcp.tmpl.json"),
+            staged.join("claude-mcp.tmpl.json"),
+        )
+        .unwrap();
+        let sidecar = PathBuf::from("/abs/path/to/agent-teams-mcp");
+
+        // a dev-flavored root and a prod-flavored root — each must ride verbatim
+        let dev = root.join("Application Support/agent-teams-dev/state");
+        let prod = root.join("Application Support/agent-teams");
+        for (i, state) in [dev, prod].into_iter().enumerate() {
+            let cfg = cfg_for(
+                &format!("bake{i}"),
+                repo.clone(),
+                staged.clone(),
+                state.clone(),
+            );
+            let out = inject_mcp_config(&cfg, InjectHarness::Claude, &sidecar)
+                .expect("inject claude")
+                .expect("claude returns Some(path)");
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&out).unwrap()).expect("parseable JSON");
+            assert_eq!(
+                v["mcpServers"]["agent-teams"]["env"]["AGENT_TEAMS_STATE_DIR"],
+                state.to_string_lossy().as_ref(),
+                "the sidecar env must carry the CALLER's state root — never an internal default"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // AC-3 (cursor): writes <worktree>/.cursor/mcp.json with the same shape and
     // appends it to .git/info/exclude exactly once (idempotent on a second call);
     // returns None (cursor discovers it by path).
