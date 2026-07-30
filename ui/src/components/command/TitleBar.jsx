@@ -1,5 +1,6 @@
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
+import SharedStateBadge from "@/components/command/SharedStateBadge";
 
 const LINKS = [
   { path: "/", label: "COMMAND" },
@@ -29,6 +30,13 @@ export default function TitleBar() {
           </Link>
         ))}
       </nav>
+      {/* R-MCP-RW shared-state mode indicator (Phase 7). Non-interactive status
+       * chip — NOT a toggle. The dynamic mode value is NEEDS-BACKEND; the chip
+       * shows the real gated-OFF default (read-only) until a backend method
+       * exists. See docs/REQUIRES-HUMAN-DESIGN-shared-state-write.md. */}
+      <div className="ml-3 pl-3 border-l border-cyan-900/50 flex items-center">
+        <SharedStateBadge />
+      </div>
     </div>
   );
 }
