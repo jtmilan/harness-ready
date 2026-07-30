@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, useReducer, useCallback } from "react";
+import React, { useState, useEffect, useRef, useReducer, useCallback, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import { loadWorkspaces, saveWorkspaces, moveAgentToWorkspace, deleteWorkspace, resetWorkspaces } from "@/lib/workspaceStore";
 import { paneIdsForWorkspace, assign } from "@/lib/workspaceAssign";
 import { toast } from "@/components/ui/use-toast";
@@ -20,6 +21,7 @@ import TemplatesOverlay from "@/components/command/templates/TemplatesOverlay";
 import NewAgentOverlay from "@/components/command/NewAgentOverlay";
 import EmptyState from "@/components/command/EmptyState";
 import ConfirmOverlay from "@/components/command/ConfirmOverlay";
+import CommandPalette from "@/components/command/CommandPalette";
 
 // F-OBS-4: fake session constants removed (SESSION_ID "00612425-38791089839" was a
 // hardcoded string, SESSION_START a module-load Date.now(), and the RUNNING indicator
@@ -39,6 +41,11 @@ export default function Home() {
   // Broadcast-toggle mode (⌘⇧I): every keystroke mirrors live into all panes, except terminal
   // reply traffic (isReplyTraffic). State lives here, not in TopBar/AgentPane.
   const [broadcast, setBroadcast] = useState(false);
+  // ⌘K command palette (Phase 5 / R-PALETTE): modal overlay listing every
+  // reachable action. State is a simple open/close boolean; the commands array
+  // is derived below via useCallback.
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const navigate = useNavigate();
   // Pane-drag controller state (Lane 3): which pane is mid-drag + the ws tab under the pointer.
   const [dragPaneId, setDragPaneId] = useState(null);
   const [dragDropTargetWs, setDragDropTargetWs] = useState(null);
@@ -371,9 +378,12 @@ export default function Home() {
     const target = selectedId ?? zoomId;
     if (target) toggleZoom(target);
   };
+
+
   useKeyboardShortcuts({
     onBroadcastToggle: () => setBroadcast((b) => !b),
     onMaximizeToggle: handleMaximizeToggle,
+    onOpenPalette: () => setPaletteOpen(true),
   });
 
   // T3: native app-menu "Toggle Pane Zoom" (Cmd+Shift+G) emits "maximize-pane" from
@@ -643,6 +653,41 @@ export default function Home() {
     setOverlay("templates");
   };
 
+  // Phase 5 / R-PALETTE: the command palette's action list. Every entry wraps
+  // an EXISTING handler (TopBar button, overlay setter, nav link, workspace
+  // tab, or pane action) — R7 forbids palette-only commands. The array is
+  // rebuilt when any closed-over value changes; since the palette is only
+  // mounted when `paletteOpen` is true, this is cheap in the common case.
+  const commands = useMemo(() => {
+    const cmds = [
+      { id: "new-agent", label: "New Agent", keywords: ["spawn", "create", "add"], hint: "TopBar", run: guardedNewAgent },
+      { id: "broadcast", label: "Broadcast to all", keywords: ["send", "message", "all"], hint: "TopBar", run: () => setOverlay("broadcast") },
+      { id: "delegate", label: "Delegate", keywords: ["assign", "task"], hint: "TopBar", run: () => setOverlay("delegate") },
+      { id: "templates", label: "Templates", keywords: ["launch", "preset", "team"], hint: "TopBar", run: guardedTemplates },
+      { id: "close-workspace", label: "Close workspace", keywords: ["terminate", "reset", "fleet"], run: () => setOverlay("close-workspace") },
+      { id: "toggle-broadcast", label: "Toggle broadcast mode", keywords: ["mode", "mirror", "keystroke"], hint: "⌘⇧I", run: () => setBroadcast((b) => !b) },
+      { id: "go-monitoring", label: "Go to Monitoring", keywords: ["metrics", "fleet", "page", "nav"], run: () => navigate("/monitoring") },
+      { id: "go-command", label: "Go to Command", keywords: ["home", "main", "page", "nav"], run: () => navigate("/") },
+      ...workspaces.map((w) => ({
+        id: `switch-ws-${w.id}`,
+        label: `Switch to ${w.name}`,
+        keywords: ["workspace", "tab", "switch"],
+        run: () => setActiveWorkspace(w.id),
+      })),
+    ];
+    // Maximize is only meaningful when a pane has focus (R3: no fake affordance).
+    if (selectedId) {
+      cmds.push({
+        id: "maximize-focused",
+        label: "Maximize focused pane",
+        keywords: ["zoom", "fullscreen", "pane"],
+        hint: "⌘G",
+        run: () => toggleZoom(selectedId),
+      });
+    }
+    return cmds;
+  }, [guardedNewAgent, guardedTemplates, navigate, workspaces, selectedId, toggleZoom]);
+
   return (
     <div className="h-screen flex flex-col bg-[#0D1117] scanlines overflow-hidden">
       <TitleBar />
@@ -848,6 +893,13 @@ export default function Home() {
           requireAgent
           onSubmit={handleDelegate}
           onClose={() => setOverlay(null)}
+        />
+      )}
+      {paletteOpen && (
+        <CommandPalette
+          open={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          commands={commands}
         />
       )}
     </div>

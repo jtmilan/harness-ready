@@ -2,7 +2,7 @@
 // listener in the app: `components/ui/sidebar.jsx` has one that looks like a peer, but
 // `SidebarProvider` is never mounted, so that code is dead. Do not extend it.
 //
-//   ⌘⇧I → onBroadcastToggle()   ⌘G → onMaximizeToggle()
+//   ⌘⇧I → onBroadcastToggle()   ⌘G → onMaximizeToggle()   ⌘K → onOpenPalette()
 //
 // Platform: macOS-only by ship target, not by accident. Bundle targets are `app`+`dmg`
 // (app/src-tauri/tauri.conf.json), sidecars are aarch64-apple-darwin only, install scripts
@@ -22,10 +22,11 @@
 // primary use case, since a focused terminal is exactly when you reach for broadcast.
 //
 // ── Matching semantics ────────────────────────────────────────────────────────────────
-// BOTH arms match on physical `e.code` ("KeyI" / "KeyG"), never on `e.key`. Both reject
-// e.repeat and call preventDefault + stopPropagation on hit. Modifier gates DIFFER:
+// ALL arms match on physical `e.code` ("KeyI" / "KeyG" / "KeyK"), never on `e.key`.
+// All reject e.repeat and call preventDefault + stopPropagation on hit. Modifier gates:
 //   - ⌘⇧I (broadcast): meta + shift, no alt/ctrl
 //   - ⌘G  (maximize):  meta + NO shift, no alt/ctrl
+//   - ⌘K  (palette):   meta + NO shift, no alt/ctrl
 //
 // Why ⌘G not ⌘⇧G (operator-confirmed, wave-8):
 //   ⌘⇧G is swallowed by WKWebView (Find-Previous family) before the page OR the app menu
@@ -54,6 +55,7 @@ import * as React from "react";
  * @typedef {object} ShortcutHandlers
  * @property {() => void} [onBroadcastToggle] ⌘⇧I — toggle broadcast-to-all-panes mode.
  * @property {() => void} [onMaximizeToggle]  ⌘G — toggle zoom on the highlighted pane.
+ * @property {() => void} [onOpenPalette]    ⌘K — open the command palette.
  */
 
 /**
@@ -92,6 +94,12 @@ export function useKeyboardShortcuts(handlers = {}) {
         e.preventDefault();
         e.stopPropagation();
         latest.current.onMaximizeToggle?.();
+      } else if (e.metaKey && !e.shiftKey && e.code === "KeyK") {
+        // ⌘K — open the command palette (accelerator only; every palette command
+        // is already reachable without it per R7). No Ctrl+K arm — see header.
+        e.preventDefault();
+        e.stopPropagation();
+        latest.current.onOpenPalette?.();
       }
     };
 
