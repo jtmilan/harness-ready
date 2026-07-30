@@ -192,6 +192,30 @@ Fixing B1 alone (unify liveness) does not automatically fix B5 (hook-less harnes
 
 ---
 
+## Stage-0 — read-path honesty (shipped on `phase/0-gates-stage0`, 2026-07-30)
+
+An additive, zero-authority-change slice that makes the divergence *observable* without
+picking the canonical liveness source (which is the human-design decision below):
+
+- `team_read_output` now returns `registry_present: bool` on every result and, on the
+  `source:"none"` path, names the state in prose: **ABSENT from the live registry**
+  (liveness-blindness / stale-registry; offline the read server cannot prove liveness) vs
+  **listed but no artifact** (empty app buffer / read gate off). Replaces the old note that
+  read as "the pane is gone."
+- **RC7 (new):** the coordinator PID-ancestry gate (`team_send_input` / `broadcast` /
+  `prompt_all`) trusts the process tree, not env. After a pane process restart the registry's
+  `peer_pid` is stale, so an external session that *is* the coordinator gets `FORBIDDEN`. A
+  re-bind / session-token path (channel-A identity) is needed — **HD**, paired with Q2/Q7.
+
+What this does NOT do (intentionally deferred to the unification PR below):
+
+- queue-side registry freshness (`app_pid` alive? `updated_at` age?) — redesigns the queue
+  filter; ship together with the authority decision.
+- the single-source-of-liveness unification (Options A/B) and orphan-PTY policy — gated on Q1–Q4.
+
+The read-path change is in `agent-teams-mcp/src/read_output.rs` only; `core/mcp` types are
+untouched, so the app's registry deserialization and the GUI queue are byte-for-byte unchanged.
+
 ## BOUNDARIES
 
 - **Read-only:** No code, config, or behavior changes in Agent Teams, harness-ready, or prod state.
