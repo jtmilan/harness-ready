@@ -21,7 +21,7 @@
 - Any write path from agents into shared state.
 - Any gate logic (arm/disarm, per-op allow/deny, audit).
 - Any change to `ui/src/lib/agentBridge.js` or `tauriAgentBridge.js`.
-- Any Rust / `core/mcp` / `app/src-tauri` / `agent-teams-mcp/` code.
+- Any Rust / `core/mcp` / `app/src-tauri` / `harness-ready-mcp/` code.
 - Any new dependency.
 
 The write path is the mutation boundary. Shipping guessed gate code would violate the boundary and would repeat the silent-lie pattern documented in the liveness-blindness note (RC1: split liveness authority).
@@ -207,7 +207,7 @@ The indicator shipped in Phase 7 is honest about what it does not know:
 
 - **No write-path code ships in Phase 7.** Would be guessing the gate.
 - **No edit to `ui/src/lib/agentBridge.js` or `tauriAgentBridge.js`.** Indicator calls the pure helper with `undefined` (no backend source yet).
-- **No Rust / `core/mcp` / `app/src-tauri` / `agent-teams-mcp/` code.** Zero files under those trees are created or modified in this phase.
+- **No Rust / `core/mcp` / `app/src-tauri` / `harness-ready-mcp/` code.** Zero files under those trees are created or modified in this phase.
 - **No new dependency.** Uses existing `lucide-react` icons.
 - **Indicator is non-interactive.** `<span role="status">`, no `onClick`, no button semantics (R3).
 - **Tone is not a health lane.** Cyan/muted (read-only) and amber (read-write) — neither uses `--need` / `--danger` (R5).

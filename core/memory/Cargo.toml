@@ -2,7 +2,7 @@
 name = "agent-teams-memory"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — BridgeMemory note store (Mem-1, Phase 10): zero-dep per-note-file store with atomic-rename + last-writer-wins, sibling-of-state_root + repo-keyed. Targets pain #3 (context loss). NO embeddings, NO single-JSONL upsert race."
+description = "Harness Ready — BridgeMemory note store (Mem-1, Phase 10): zero-dep per-note-file store with atomic-rename + last-writer-wins, sibling-of-state_root + repo-keyed. Targets pain #3 (context loss). NO embeddings, NO single-JSONL upsert race."
 
 [lib]
 name = "agent_teams_memory"

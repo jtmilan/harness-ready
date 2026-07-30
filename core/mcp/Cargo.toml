@@ -2,7 +2,7 @@
 name = "agent-teams-core"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — serde-able queue projection over the zero-dep state-adapter (MCP Phase A; the future extraction target for app/src-tauri compute_queue)"
+description = "Harness Ready — serde-able queue projection over the zero-dep state-adapter (MCP Phase A; the future extraction target for app/src-tauri compute_queue)"
 
 [lib]
 name = "agent_teams_core"

@@ -2,7 +2,7 @@
 name = "harness-ready-daemon"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — detached daemon skeleton (Phase 08 Sub-build 1): launch-agnostic lifecycle DECISION LOGIC + trait/placeholder surfaces. Owns NO PTY and NO socket yet (later sub-builds)."
+description = "Harness Ready — detached daemon skeleton (Phase 08 Sub-build 1): launch-agnostic lifecycle DECISION LOGIC + trait/placeholder surfaces. Owns NO PTY and NO socket yet (later sub-builds)."
 
 [lib]
 name = "harness_ready_daemon"

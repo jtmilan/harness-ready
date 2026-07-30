@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn plist_carries_the_label_and_program() {
         let p = generate_daemon_plist(
-            "/Applications/Agent Teams.app/Contents/MacOS/agent-teams-daemon",
+            "/Applications/Harness Ready.app/Contents/MacOS/harness-ready-daemon",
             &state_root(),
             None,
         )
@@ -106,7 +106,7 @@ mod tests {
             "label present"
         );
         assert!(
-            p.contains("agent-teams-daemon</string>"),
+            p.contains("harness-ready-daemon</string>"),
             "program path present"
         );
     }

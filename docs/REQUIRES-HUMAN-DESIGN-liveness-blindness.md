@@ -41,7 +41,7 @@ So missing queue membership is **not** explained solely by `state_blind` / missi
 | Path | Liveness source | Key code |
 |------|-------------------|----------|
 | **Mutations** (`team_send_input`, split-write) | In-memory `DaemonSups` in the running app: `contains(id)` + `sup.is_alive()` | `core/daemon/src/handlers.rs` (~146–215): resolves pane via app socket → supervisor map |
-| **Reads** (`team_read_output` live scrollback) | Disk `agent-teams-live.json` via `registry_lookup()` | `agent-teams-mcp/src/read_output.rs` (~114–119, 171–209, 219–222): `pane_is_live = reg_row.is_some()`; without registry row, live scrollback is skipped and note says pane is not in live registry |
+| **Reads** (`team_read_output` live scrollback) | Disk `agent-teams-live.json` via `registry_lookup()` | `harness-ready-mcp/src/read_output.rs` (~114–119, 171–209, 219–222): `pane_is_live = reg_row.is_some()`; without registry row, live scrollback is skipped and note says pane is not in live registry |
 
 **Exact divergence:** A pane can be alive in **Instance A’s `sups`** (send works) while **absent from `live.json`** (read/queue blind).
 
@@ -73,7 +73,7 @@ This **always** writes an empty `live_ids` vector (not conditional on instance l
 
 ### RC4 — MCP queue filtered by disk registry, not `sups`
 
-**VERIFIED:** `identified_queue` in `agent-teams-mcp/src/main.rs` (~1020–1022) calls `compute_queue_identified`, which when registry **is present** filters to `registry.live_ids` only (`core/mcp/src/lib.rs` ~192–201). Empty or stale registry ⇒ empty or wrong MCP queue even if events exist on disk.
+**VERIFIED:** `identified_queue` in `harness-ready-mcp/src/main.rs` (~1020–1022) calls `compute_queue_identified`, which when registry **is present** filters to `registry.live_ids` only (`core/mcp/src/lib.rs` ~192–201). Empty or stale registry ⇒ empty or wrong MCP queue even if events exist on disk.
 
 **VERIFIED:** In-app `list_queue` uses `state.sups.live_ids()` in-memory (`app/src-tauri/src/lib.rs` ~2535–2547), optionally enriched from registry — **not** the same filter as MCP.
 
@@ -89,7 +89,7 @@ This **always** writes an empty `live_ids` vector (not conditional on instance l
 
 ### RC6 — MCP default state dir vs prod panes (configuration footgun)
 
-**VERIFIED:** MCP sidecar default state dir is harness-ready path unless `$AGENT_TEAMS_STATE_DIR` is set (`agent-teams-mcp/src/main.rs` ~1027–1032). Pane spawn sets `AGENT_TEAMS_STATE_DIR` to app’s `state_root` (`core/supervisor/src/lib.rs` ~1291).
+**VERIFIED:** MCP sidecar default state dir is harness-ready path unless `$AGENT_TEAMS_STATE_DIR` is set (`harness-ready-mcp/src/main.rs` ~1027–1032). Pane spawn sets `AGENT_TEAMS_STATE_DIR` to app’s `state_root` (`core/supervisor/src/lib.rs` ~1291).
 
 **INFERRED:** External MCP clients without env alignment read wrong `live.json` / events tree — amplifies blindness but is not required to explain ws29184x2 probe (prod paths were used).
 
@@ -179,13 +179,13 @@ Fixing B1 alone (unify liveness) does not automatically fix B5 (hook-less harnes
 
 | Surface | Behavior when registry stale | Code anchor |
 |---------|------------------------------|-------------|
-| `team_get_queue` / `team://queue` | Empty or subset; filters to `live_ids` when registry file exists | `core/mcp/src/lib.rs` ~192–201; `agent-teams-mcp/src/main.rs` ~1020–1022 |
-| `team_read_output` (live scrollback) | Skips scrollback; `source: none` + misleading “not in live registry” | `agent-teams-mcp/src/read_output.rs` ~171–209, ~219–222 |
+| `team_get_queue` / `team://queue` | Empty or subset; filters to `live_ids` when registry file exists | `core/mcp/src/lib.rs` ~192–201; `harness-ready-mcp/src/main.rs` ~1020–1022 |
+| `team_read_output` (live scrollback) | Skips scrollback; `source: none` + misleading “not in live registry” | `harness-ready-mcp/src/read_output.rs` ~171–209, ~219–222 |
 | `agent-teams-live.json` consumers | Any tool reading sibling file without socket | `core/mcp/src/lib.rs` ~301–317 |
 | In-app queue vs MCP queue | GUI may list `sups.live_ids()` while MCP lists registry only | `app/src-tauri/src/lib.rs` ~2535–2547 vs MCP path above |
 | `dead_pane_ids` (GUI) | Uses `sups` + registry keys; comments note registry keys can linger | `app/src-tauri/src/lib.rs` ~2550–2579 |
 | `team_orchestrate` / `team_broadcast` (MCP) | Uses app `live_pane_ctxs` from **sups** — may target panes absent from queue | `app/src-tauri/src/lib.rs` ~6597–6614 (pattern; exact MCP bridge not re-run) |
-| `team_synthesize` (pane ids) | `read_output::resolve` — registry-gated like read | `agent-teams-mcp/src/read_output.rs` |
+| `team_synthesize` (pane ids) | `read_output::resolve` — registry-gated like read | `harness-ready-mcp/src/read_output.rs` |
 | Event-discovered queue (registry absent) | May show **stale** panes from old `events.jsonl` | `compute_queue` when registry missing — inverse failure mode |
 
 **Silent lie pattern:** Mutations succeed → operator assumes pane is observable → read/queue/report paths return empty or “none” without a hard error that mutations would succeed.
@@ -213,7 +213,7 @@ What this does NOT do (intentionally deferred to the unification PR below):
   filter; ship together with the authority decision.
 - the single-source-of-liveness unification (Options A/B) and orphan-PTY policy — gated on Q1–Q4.
 
-The read-path change is in `agent-teams-mcp/src/read_output.rs` only; `core/mcp` types are
+The read-path change is in `harness-ready-mcp/src/read_output.rs` only; `core/mcp` types are
 untouched, so the app's registry deserialization and the GUI queue are byte-for-byte unchanged.
 
 ## BOUNDARIES

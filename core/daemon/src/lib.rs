@@ -1,4 +1,4 @@
-//! Agent Teams — detached daemon **skeleton** (Phase 08 Sub-build 1).
+//! Harness Ready — detached daemon **skeleton** (Phase 08 Sub-build 1).
 //!
 //! This crate is the LAUNCH-AGNOSTIC skeleton of the detached daemon that will
 //! eventually own the PTY-backed agent sessions and survive the GUI app's

@@ -808,7 +808,7 @@ impl RealSpawnExec {
     /// Resolve paths daemon-side. `AGENT_TEAMS_HOOKS_DIR` / `AGENT_TEAMS_SIDECAR_BIN` /
     /// `AGENT_TEAMS_MCP_COORDINATOR_BIN` override; otherwise fall back to siblings of the
     /// daemon binary. Best-effort. The coordinator sidecar FAILS SAFE (mirror of the app's
-    /// `resolve_coordinator_sidecar_bin`): if the separate `agent-teams-mcp-coordinator`
+    /// `resolve_coordinator_sidecar_bin`): if the separate `harness-ready-mcp-coordinator`
     /// binary is absent, coordinator panes get the read-only sidecar — a coordinator on a
     /// build that never bundled the mutation binary simply cannot broadcast (never a silent
     /// grant, never a spawn failure).
@@ -822,12 +822,12 @@ impl RealSpawnExec {
             .unwrap_or_else(|_| exe_dir.join("hooks"));
         let sidecar_bin = std::env::var("AGENT_TEAMS_SIDECAR_BIN")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| exe_dir.join("agent-teams-mcp"));
+            .unwrap_or_else(|_| exe_dir.join("harness-ready-mcp"));
         let coordinator_sidecar_bin = std::env::var("AGENT_TEAMS_MCP_COORDINATOR_BIN")
             .map(PathBuf::from)
             .ok()
             .or_else(|| {
-                let cand = exe_dir.join("agent-teams-mcp-coordinator");
+                let cand = exe_dir.join("harness-ready-mcp-coordinator");
                 cand.exists().then_some(cand)
             })
             .unwrap_or_else(|| sidecar_bin.clone());

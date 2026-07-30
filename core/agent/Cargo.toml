@@ -2,7 +2,7 @@
 name = "agent-teams-agent"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — persisted Agent/persona record store (Phase 14-T4). A sibling-of-state_root per-record file store, independent of the state machine. Survives the D7 startup wipe."
+description = "Harness Ready — persisted Agent/persona record store (Phase 14-T4). A sibling-of-state_root per-record file store, independent of the state machine. Survives the D7 startup wipe."
 
 [lib]
 name = "agent_teams_agent"

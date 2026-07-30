@@ -1,4 +1,4 @@
-//! `agent-teams-daemon` binary — Phase 08 Sub-build 3 (slice 2).
+//! `harness-ready-daemon` binary — Phase 08 Sub-build 3 (slice 2).
 //!
 //! GATED OFF (bundled-but-inert): as of 08-T9 this binary IS bundled (it is in
 //! `tauri.conf` `externalBin`), but it is NEVER launched by a default install — its
@@ -60,7 +60,7 @@ fn main() {
         Err(e) => {
             // MF-F: fail LOUD on A1 error — do NOT fall through to a self-bind.
             eprintln!(
-                "agent-teams-daemon: acquire listener failed: {e}; exiting \
+                "harness-ready-daemon: acquire listener failed: {e}; exiting \
                  (A1 launchd socket-activation = fail-loud, no A2 fallback). \
                  Run with --dev to self-bind outside launchd."
             );
@@ -86,7 +86,7 @@ fn main() {
         let purged = supervisor::purge_all_managed_codex_mcp();
         if purged > 0 {
             eprintln!(
-                "agent-teams-daemon: startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
+                "harness-ready-daemon: startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
             );
         }
     }
@@ -95,7 +95,7 @@ fn main() {
     // as before). The production stored value is the real `Supervisor` (the PTY-owning pane).
     let sups: Arc<DaemonSups<supervisor::Supervisor>> = Arc::new(DaemonSups::new());
     eprintln!(
-        "agent-teams-daemon: listening via {mech}; state_root={}",
+        "harness-ready-daemon: listening via {mech}; state_root={}",
         state_root.display()
     );
     serve(listener, sups, state_root);

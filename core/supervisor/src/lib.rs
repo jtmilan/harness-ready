@@ -1,4 +1,4 @@
-//! Agent Teams — PTY session supervisor + git-worktree isolation (Plan 02-01).
+//! Harness Ready — PTY session supervisor + git-worktree isolation (Plan 02-01).
 //!
 //! Spawns a harness CLI in a PTY inside a per-workspace git worktree, with the
 //! Phase-01 hooks injected and `AGENT_TEAMS_STATE_DIR` set so the agent's events
@@ -227,12 +227,12 @@ fn session_args(harness: Harness, session_id: Option<&str>, resume: bool) -> Vec
     }
 }
 
-/// Build the per-harness MCP-config CLI flags for the read-only `agent-teams-mcp`
+/// Build the per-harness MCP-config CLI flags for the read-only `harness-ready-mcp`
 /// sidecar (Plan 16-01, item 1 — D56). Pure + total so it is unit-tested without
 /// spawning, exactly like [`session_args`].
 ///
 /// - **Claude** with a resolved config path → `--mcp-config <abs file> --strict-mcp-config`.
-///   STRICT (06-06, reversing D56's additive choice): claude loads ONLY the agent-teams
+///   STRICT (06-06, reversing D56's additive choice): claude loads ONLY the harness-ready
 ///   sidecar and ignores the operator's user-scoped servers. Those fail setup in the
 ///   fresh-worktree pane → claude's "N setup issues: MCP" startup banner that EATS the
 ///   first dispatched input (the claude-pane hang). An agent pane needs the agent-teams
@@ -251,12 +251,12 @@ fn mcp_args(harness: Harness, claude_cfg: Option<&Path>, is_worker: bool) -> Vec
             Some(p) => vec![
                 "--mcp-config".into(),
                 p.to_string_lossy().into_owned(),
-                // 06-06: STRICT so claude loads ONLY the agent-teams sidecar and IGNORES the
+                // 06-06: STRICT so claude loads ONLY the harness-ready sidecar and IGNORES the
                 // operator's user-scoped servers (bridgemind/google-docs/railway). Those fail
                 // setup in the fresh-worktree pane env → claude's "N setup issues: MCP" startup
                 // banner, which INTERCEPTS Enter and eats the first dispatched task (the claude
                 // pane hang, observed claude Code v2.1.181). A spawned agent pane needs the
-                // agent-teams coordination surface, not the operator's ancillary servers — so we
+                // harness-ready coordination surface, not the operator's ancillary servers — so we
                 // trade them for a hands-free dispatch submit.
                 "--strict-mcp-config".into(),
             ],
@@ -1647,13 +1647,13 @@ impl Supervisor {
             // failure here is best-effort: degrade to "no MCP in the pane" rather
             // than failing the spawn.
             // Phase-16: a delegate WORKER does NOT get the sidecar — worker_args'
-            // --allowedTools excludes mcp__agent-teams__* (the worker can't call it),
+            // --allowedTools excludes mcp__harness-ready__* (the worker can't call it),
             // so injecting it would only spawn an unused sidecar process at startup.
             if !spec.is_worker {
                 match inject_mcp_config(&cfg, ih, sidecar_bin) {
                     Ok(path) => claude_mcp_cfg = path,
                     Err(e) => eprintln!(
-                        "[agent-teams] inject_mcp_config failed (pane will have no MCP): {e}"
+                        "[harness-ready] inject_mcp_config failed (pane will have no MCP): {e}"
                     ),
                 }
             }
@@ -1670,7 +1670,7 @@ impl Supervisor {
             if matches!(spec.harness, Harness::Claude) {
                 if let Err(e) = preseed_claude_trust(&spec.worktree) {
                     eprintln!(
-                        "[agent-teams] preseed_claude_trust failed (claude pane may show the trust dialog): {e}"
+                        "[harness-ready] preseed_claude_trust failed (claude pane may show the trust dialog): {e}"
                     );
                 }
             }
@@ -1683,7 +1683,7 @@ impl Supervisor {
                 // failed spawn.
                 if let Err(e) = preseed_cursor_trust(&spec.worktree) {
                     eprintln!(
-                        "[agent-teams] preseed_cursor_trust failed (cursor pane may block on the trust modal): {e}"
+                        "[harness-ready] preseed_cursor_trust failed (cursor pane may block on the trust modal): {e}"
                     );
                 }
                 if let Some(role) = spec.role {
@@ -1691,7 +1691,7 @@ impl Supervisor {
                         inject_cursor_role(&spec.worktree, hooks_dir, roles::persona(role))
                     {
                         eprintln!(
-                            "[agent-teams] inject_cursor_role failed (cursor pane will have no role persona): {e}"
+                            "[harness-ready] inject_cursor_role failed (cursor pane will have no role persona): {e}"
                         );
                     }
                 }
@@ -1727,7 +1727,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_mcp failed (commandcode pane will have no MCP): {e}"
+                    "[harness-ready] inject_commandcode_mcp failed (commandcode pane will have no MCP): {e}"
                 );
             }
         }
@@ -1749,7 +1749,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_opencode_mcp failed (opencode pane will have no MCP): {e}"
+                    "[harness-ready] inject_opencode_mcp failed (opencode pane will have no MCP): {e}"
                 );
             }
         }
@@ -1768,7 +1768,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
+                    "[harness-ready] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
                 );
             }
         }
@@ -1787,7 +1787,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
+                    "[harness-ready] inject_commandcode_global_mcp failed (CommandCode pane will lack global MCP): {e}"
                 );
             }
         }
@@ -1806,7 +1806,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_grok_mcp failed (grok pane will have no MCP): {e}"
+                    "[harness-ready] inject_grok_mcp failed (grok pane will have no MCP): {e}"
                 );
             }
         }
@@ -1834,7 +1834,7 @@ impl Supervisor {
                 &mem_key,
             ) {
                 eprintln!(
-                    "[agent-teams] inject_codex_mcp failed (codex pane will have no MCP): {e}"
+                    "[harness-ready] inject_codex_mcp failed (codex pane will have no MCP): {e}"
                 );
             }
         }
@@ -1858,7 +1858,7 @@ impl Supervisor {
                 write_spawn_ready_event(state_root, &spec.id, spec.harness.descriptor().wire)
             {
                 eprintln!(
-                    "[agent-teams] write_spawn_ready_event failed (pane may stay state-blind): {e}"
+                    "[harness-ready] write_spawn_ready_event failed (pane may stay state-blind): {e}"
                 );
             }
         }
@@ -1869,7 +1869,7 @@ impl Supervisor {
         if matches!(spec.harness, Harness::OpenCode) && !spec.is_worker {
             if let Err(e) = ensure_opencode_plugin(hooks_dir) {
                 eprintln!(
-                    "[agent-teams] ensure_opencode_plugin failed (opencode pane has no turn-end): {e}"
+                    "[harness-ready] ensure_opencode_plugin failed (opencode pane has no turn-end): {e}"
                 );
             }
         }
@@ -2941,7 +2941,7 @@ mod tests {
                 "--strict-mcp-config"
             ]
         );
-        // 06-06: strict IS present — claude loads only the agent-teams sidecar, so the
+        // 06-06: strict IS present — claude loads only the harness-ready sidecar, so the
         // operator's user-scoped servers can't raise the "N setup issues: MCP" banner that
         // eats the first dispatched input.
         assert!(mcp_args(Harness::Claude, Some(&p), false)
@@ -3398,7 +3398,7 @@ mod tests {
         let config = dir.join("config.toml");
         std::fs::write(&config, "# user config\nmodel = \"o3\"\n").unwrap();
 
-        let sidecar = dir.join("agent-teams-mcp-coordinator");
+        let sidecar = dir.join("harness-ready-mcp-coordinator");
         let state = dir.join("state");
         let pane_id = "ws42-p0";
         let server_name = codex_mcp_server_name(pane_id);
@@ -3711,7 +3711,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("at-cc-mcp-{tag}-{nonce}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let sidecar = dir.join("agent-teams-mcp-coordinator");
+        let sidecar = dir.join("harness-ready-mcp-coordinator");
         std::fs::write(&sidecar, "#!/bin/true\n").unwrap();
         (dir, sidecar)
     }
