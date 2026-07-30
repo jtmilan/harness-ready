@@ -23,7 +23,7 @@ use serde::Serialize;
 use super::PhaseBError;
 
 /// Keychain generic-password **service** id for the Bearer token (real Phase B).
-pub const KEYCHAIN_SERVICE: &str = "agent-teams-mcp";
+pub const KEYCHAIN_SERVICE: &str = "harness-ready-mcp";
 /// Keychain **account** under [`KEYCHAIN_SERVICE`] holding the Bearer.
 pub const KEYCHAIN_ACCOUNT: &str = "loopback-http-bearer";
 /// Bearer entropy: 256 bits (32 bytes) of CSPRNG, per AC-4.

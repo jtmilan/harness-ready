@@ -342,7 +342,7 @@ describeIf("integration — flywheel + bridge gate alignment", () => {
     const gate = JSON.parse(raw);
     expect(Array.isArray(gate.manifests)).toBe(true);
     expect(gate.manifests.length).toBeGreaterThan(0);
-    // NOT a "starts with core/" check: PR #269 added agent-teams-mcp/Cargo.toml to the
+    // NOT a "starts with core/" check: PR #269 added harness-ready-mcp/Cargo.toml to the
     // gate, which made the old core/ prefix assertion wrong. The real invariant is
     // path safety: every entry is a relative Cargo.toml path with no traversal.
     for (const m of gate.manifests) {

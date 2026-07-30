@@ -113,7 +113,7 @@ mod tests {
     fn dial_on_absent_socket_is_app_not_running_not_panic() {
         // A socket that doesn't exist ⇒ connect refused ⇒ structured Incomplete
         // (the caller maps this to APP_NOT_RUNNING). Never panics.
-        let nope = std::env::temp_dir().join("agent-teams-mcp-DEFINITELY-ABSENT.sock");
+        let nope = std::env::temp_dir().join("harness-ready-mcp-DEFINITELY-ABSENT.sock");
         let _ = std::fs::remove_file(&nope);
         let r = dial(&nope, &SocketRequest::Focus { id: "w".into() });
         assert!(matches!(r, Err(PhaseBError::Incomplete(_))));
