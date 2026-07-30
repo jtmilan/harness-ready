@@ -1,4 +1,4 @@
-// Agent Teams — test-support: install a fake `window.__TAURI__` for DOM tests.
+// Harness Ready — test-support: install a fake `window.__TAURI__` for DOM tests.
 //
 // The app reads `window.__TAURI__.core.invoke` DIRECTLY (main.js `tauriInvoke`), NOT
 // `@tauri-apps/api`. So DOM tests can't mock a module — they must plant the global.

@@ -1,4 +1,4 @@
-// Agent Teams — ranked "who needs you" rail: PURE reconcile core (10-01).
+// Harness Ready — ranked "who needs you" rail: PURE reconcile core (10-01).
 //
 // The DOM + WAAPI motion live in main.js (`renderRail`); this is the PURE set-math
 // that drives it, keyed by pane id, so it is unit-testable in node with no DOM —

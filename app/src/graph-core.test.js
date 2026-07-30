@@ -152,12 +152,12 @@ describe("assignShortLabels", () => {
 
   it("never duplicates: later nodes walk to their next free word", () => {
     const out = assignShortLabels(recs(
-      "Agent Teams",
-      "Agent Teams Pane Communication",
-      "Agent Teams Pane Interaction",
+      "Harness Ready",
+      "Harness Ready Pane Communication",
+      "Harness Ready Pane Interaction",
     ));
-    expect(out[0].label).toBe("agent");
-    expect(out[1].label).toBe("teams");
+    expect(out[0].label).toBe("harness");
+    expect(out[1].label).toBe("ready");
     expect(out[2].label).toBe("pane");
     expect(new Set(out.map((r) => r.label)).size).toBe(3);
   });

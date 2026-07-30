@@ -1,4 +1,4 @@
-// Agent Teams — layout wizard controller (Phase 1: DOM view + wiring).
+// Harness Ready — layout wizard controller (Phase 1: DOM view + wiring).
 //
 // The CREATE flow: a 3-step modal (Start → Layout → Agents) over the #wizard markup
 // (index.html) styled by styles.css. Pure state lives in wizard-core.js; presets in
