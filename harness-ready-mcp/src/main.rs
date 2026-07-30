@@ -1,4 +1,4 @@
-//! `agent-teams-mcp` — read-only MCP sidecar over the Agent Teams state adapter
+//! `harness-ready-mcp` — read-only MCP sidecar over the Harness Ready state adapter
 //! (PRD §14 Phase A; `.paul/analysis/context-router-mcp.md`).
 //!
 //! **Pitch:** expose *your* team state to *your* MCP clients (Cursor / Claude
@@ -19,9 +19,9 @@
 //! [`phase_b`] compile under `--features phase-b-mutations` and ARE wired: the
 //! separate `mutation_tool_router` is MERGED into the main router in
 //! `TeamServer::new` when the feature is on, and the tools dial the app's Unix
-//! socket for real. The DEFAULT `agent-teams-mcp` build stays read-only (feature
+//! socket for real. The DEFAULT `harness-ready-mcp` build stays read-only (feature
 //! off — this binary is what every ordinary pane gets); the SHIPPED
-//! `agent-teams-mcp-coordinator` sidecar is built WITH the feature and is handed
+//! `harness-ready-mcp-coordinator` sidecar is built WITH the feature and is handed
 //! ONLY to Coordinator-role panes (the app/daemon select it by role) — so
 //! broadcast/orchestrate capability is role-scoped by ABSENCE, not merely refused.
 //! Every mutating call is still double-gated at the app boundary
@@ -58,7 +58,7 @@ use agent_teams_core::{
 /// PHASE B — the LIVE mutation tool surface (Unix-socket dial + wire protocol).
 /// Compiled only under `--features phase-b-mutations` and WIRED: the separate
 /// `mutation_tool_router` is merged into the live router in `new()`. The shipped
-/// `agent-teams-mcp-coordinator` binary carries this feature (capability-by-role:
+/// `harness-ready-mcp-coordinator` binary carries this feature (capability-by-role:
 /// only Coordinator panes get it); the default read-only build does not.
 #[cfg(feature = "phase-b-mutations")]
 mod phase_b;
@@ -306,7 +306,7 @@ impl TeamServer {
             .and_then(|id| ws_of_pane(&id).map(str::to_owned));
         if caller_ws.is_none() {
             eprintln!(
-                "agent-teams-mcp: no AGENT_TEAMS_PANE_ID — read tools return GLOBAL view \
+                "harness-ready-mcp: no AGENT_TEAMS_PANE_ID — read tools return GLOBAL view \
                  (isolation bypassed; operator/dev/test back-compat path)"
             );
         }
@@ -390,7 +390,7 @@ impl TeamServer {
             answer to 'go read what p4 wrote'. Pass the FULL pane id (e.g. \
             \"ws50144x0-p4\" as it appears in team_get_queue) — NOT a short 'p4', and \
             NOT a filesystem path; the server resolves the source from the id and reads \
-            only Agent-Teams-controlled artifacts. Source precedence: (1) the \
+            only Harness Ready-controlled artifacts. Source precedence: (1) the \
             orchestrate/bridge <id>.md report (harness-agnostic — what a dispatched pane \
             wrote); (2) claude/cursor pane transcripts on disk; (3) grok session \
             chat_history.jsonl (source='grok_transcript' — clean assistant text, not \
@@ -582,7 +582,7 @@ impl TeamServer {
 impl TeamServer {
     #[prompt(
         name = "agent_teams_developer_guide",
-        description = "How to drive the Agent Teams MCP surface: the read tools, the \
+        description = "How to drive the Harness Ready MCP surface: the read tools, the \
             ranked-queue semantics, the app-up vs app-down read path, the resources, \
             and the allow_mutations / Model-A gate for the Phase-B mutation tools."
     )]
@@ -598,7 +598,7 @@ impl TeamServer {
 /// structural (names + semantics) so it lives next to the surface it documents — a
 /// tool change is in the same file as its doc.
 const DEVELOPER_GUIDE: &str = "\
-Agent Teams MCP — developer guide.\n\n\
+Harness Ready MCP — developer guide.\n\n\
 THE WEDGE: one ranked 'who needs me' queue across your Claude + Cursor agent panes — the same \
 order the app's global hotkey (Cmd+Shift+J) jumps to. Terminals cannot model agent state; this \
 surface exposes it.\n\n\
@@ -627,7 +627,7 @@ entry is tagged with its ledger ('mutations'|'reads'); kind narrows to one; limi
 20, caps at 200. Rows are audit metadata (ts/op/target/bytes; mutation text is a <=200-char \
 snippet), never full content. USE THIS instead of recalling your own dispatches from memory.\n\n\
 RESOURCES (mirror the tools): team://queue, team://workspaces, team://workspace/{id}.\n\n\
-APP-UP vs APP-DOWN: when the Agent Teams app is running, team_get_queue / get_workspace reflect the \
+APP-UP vs APP-DOWN: when the Harness Ready app is running, team_get_queue / get_workspace reflect the \
 LIVE set; when it is down they fall back to the discovered on-disk superset (which may include stale \
 workspaces). list_workspaces is ALWAYS pure discovery.\n\n\
 FAN-IN: team_synthesize consolidates many panes' outputs into ONE markdown doc. Two modes — \
@@ -700,7 +700,7 @@ impl TeamServer {
 
     #[tool(
         name = "team_focus_workspace",
-        description = "Raise the Agent Teams app and focus a workspace by id. \
+        description = "Raise the Harness Ready app and focus a workspace by id. \
             Requires the app running AND allow_mutations=true in mcp-config.json, \
             and the calling pane must be a Coordinator (peer-pid ancestry gate) — a \
             non-Coordinator pane is refused FORBIDDEN. \
@@ -946,7 +946,7 @@ impl TeamServer {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 ErrorData::invalid_params(
-                    "team_delegate must run inside an Agent Teams pane \
+                    "team_delegate must run inside a Harness Ready pane \
                      ($AGENT_TEAMS_PANE_ID is unset) — it has no parent to fan results into"
                         .to_string(),
                     None,
@@ -965,7 +965,7 @@ impl TeamServer {
 
     #[tool(
         name = "team_create_workspace",
-        description = "Open ONE NEW VISIBLE workspace in the running Agent Teams grid and spawn its \
+        description = "Open ONE NEW VISIBLE workspace in the running Harness Ready grid and spawn its \
             panes in a single call. For a MIXED team, pass `panes` — a per-pane spec list like \
             [{\"harness\":\"claude\",\"role\":\"builder\",\"count\":2},{\"harness\":\"codex\",\"role\":\"reviewer\"}] \
             — and ALL panes land in the SAME workspace. For a simple homogeneous team, omit `panes` and \
@@ -1203,7 +1203,7 @@ impl ServerHandler for TeamServer {
         // surface never contradicts the registered tool set.
         #[allow(unused_mut)]
         let mut instructions = String::from(
-            "Read-only Agent Teams state. Tools: team_get_queue, list_workspaces, \
+            "Read-only Harness Ready state. Tools: team_get_queue, list_workspaces, \
              get_workspace. Resources: team://queue (ranked queue), team://workspaces \
              (id list), team://workspace/{id} (one row). Prompt: \
              agent_teams_developer_guide (how to drive this surface).",
@@ -1708,7 +1708,7 @@ mod inline_defs_tests {
     #[test]
     fn every_served_tool_schema_is_ref_free() {
         let dir = std::env::temp_dir().join(format!(
-            "agent-teams-mcp-schematest-{}",
+            "harness-ready-mcp-schematest-{}",
             std::process::id()
         ));
         let server = crate::TeamServer::new(dir);

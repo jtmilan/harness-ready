@@ -142,7 +142,7 @@ pub fn team_focus_workspace(
 pub fn mutation_error_message(e: &MutationError) -> String {
     match e {
         MutationError::AppNotRunning => format!(
-            "{APP_NOT_RUNNING}: the Agent Teams app is not running (mutations require the live app; reads still work)"
+            "{APP_NOT_RUNNING}: the Harness Ready app is not running (mutations require the live app; reads still work)"
         ),
         // The app's own `detail` is authoritative — relay it VERBATIM (one code covers
         // several distinct refusals; inventing a cause here misled the calling brain,
@@ -802,7 +802,7 @@ mod tests {
         // "same-user check" — the brain relayed the invented cause to the operator.)
         let m = mutation_error_message(&rej(
             response_code::FORBIDDEN,
-            "external spawn: repo is not in the trusted-repos allowlist (trust it in Agent Teams first)",
+            "external spawn: repo is not in the trusted-repos allowlist (trust it in Harness Ready first)",
         ));
         assert!(
             m.contains("trusted-repos allowlist") && m.contains("FORBIDDEN"),

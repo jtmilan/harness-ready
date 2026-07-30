@@ -290,7 +290,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
         (
             "this pane is ABSENT from the live registry",
             " — LIVENESS-BLINDNESS: if this pane is actually running (team_send_input reaches it, \
-             or it shows in the Agent Teams app), the registry is stale or out of sync with the \
+             or it shows in the Harness Ready app), the registry is stale or out of sync with the \
              app's in-memory panes (the read/mutation divergence; see \
              docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md). Offline this read server cannot \
              prove liveness; the running app is the only reconciler.",
@@ -307,7 +307,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     };
     let note = format!(
         "No report or transcript on disk for {id}{}; {} — it may not have produced output yet, \
-         or this harness keeps no on-disk transcript. Read it live in the Agent Teams app, or ask \
+         or this harness keeps no on-disk transcript. Read it live in the Harness Ready app, or ask \
          the pane to write a report via team_orchestrate.{}{}{}",
         harness
             .as_deref()
@@ -581,7 +581,7 @@ fn newest_grok_transcript(id: &str, repo: Option<&str>) -> Option<(String, Strin
 ///
 /// Resolution order for the session-cwd directory under `sessions_root`:
 /// 1. **Registry-derived cwd candidates** (when `repo` is known):
-///    - `{repo}/.agent-teams-worktrees/{id}` — the standard agent-teams worktree cwd
+///    - `{repo}/.agent-teams-worktrees/{id}` — the standard Harness Ready worktree cwd
 ///    - `{repo}` itself — bare-folder fallback (no worktree)
 /// 2. **`active_sessions.json`** entries whose `cwd` ends with the pane id (or equals a
 ///    registry-derived candidate) — live sessions map `session_id → cwd`.
@@ -1250,7 +1250,7 @@ mod tests {
             "%2Ftmp%2Fa%20b",
             "space → %20"
         );
-        // Worktree-shaped path used by agent-teams panes.
+        // Worktree-shaped path used by Harness Ready panes.
         let wt = "/Users/jeffrymilan/repo/.agent-teams-worktrees/ws9-p3";
         assert_eq!(
             grok_encode_cwd(wt),
