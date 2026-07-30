@@ -1,4 +1,4 @@
-// Agent Teams — split-tree layout model (PURE, no DOM, no globals). The visual layout for a
+// Harness Ready — split-tree layout model (PURE, no DOM, no globals). The visual layout for a
 // workspace is a binary tree: leaves carry a paneId, split nodes hold a direction + ratio.
 // `ws.paneIds` stays the AUTHORITATIVE live-pane set — this tree is only a VIEW over it
 // (main.js relayout() reconciles the tree against paneIds every layout). Keeping the model

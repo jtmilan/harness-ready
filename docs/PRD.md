@@ -142,7 +142,7 @@ Legend: **P0** = do now (differentiator or trust-critical); **P1** = next; **P2*
 ### R-GATES — Close the two open trust gates (P0, HD)
 - **Story:** the read path and the mutation path must agree on which panes are live; branch info must wire through cleanly.
 - **AC:** liveness-blindness root causes (registry-vs-`sups` divergence, startup `live.json` clobber, multi-instance clobber, MCP queue filter) resolved or explicitly redesigned; branch-wire-through closed.
-- **Touches:** `app/src-tauri/src/lib.rs`, `core/mcp`, `core/daemon`, `agent-teams-mcp`. **Effort:** L. **HD:** **YES** — design the single source of liveness before coding (per the existing REQUIRES-HUMAN-DESIGN notes).
+- **Touches:** `app/src-tauri/src/lib.rs`, `core/mcp`, `core/daemon`, `harness-ready-mcp`. **Effort:** L. **HD:** **YES** — design the single source of liveness before coding (per the existing REQUIRES-HUMAN-DESIGN notes).
 
 ### R-TEMPLATES — Local template store (P1)
 - **Story:** team templates persist locally, independent of Base44, with the same schema.

@@ -1,4 +1,4 @@
-// Agent Teams — pane reopen: PURE counter-idx selection (close/reopen fix, D63).
+// Harness Ready — pane reopen: PURE counter-idx selection (close/reopen fix, D63).
 //
 // Pane state arrays (sessionIds/harnesses/roles) are keyed by the monotonic spawn
 // counter (`spawnPane`: idx = ws.counter++; id = `${wsId}-p${idx}`). closeWorkspace

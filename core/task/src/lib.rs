@@ -1,5 +1,5 @@
 //! Persisted **Task** model — the first durable, human-owned product entity in
-//! Agent Teams (option-b plan-item #1; `.paul/phases/09-surfaces/09-01-PLAN.md`
+//! Harness Ready (option-b plan-item #1; `.paul/phases/09-surfaces/09-01-PLAN.md`
 //! Task 1 / AC-1 / AC-4 prerequisite half).
 //!
 //! # Why this crate exists

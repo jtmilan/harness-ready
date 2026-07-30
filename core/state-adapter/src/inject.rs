@@ -552,7 +552,7 @@ mod mcp_tests {
 
         // overwritten with the rendered config…
         let now = fs::read_to_string(&user_cfg).unwrap();
-        assert!(now.contains("agent-teams"), "rendered config written");
+        assert!(now.contains("harness-ready"), "rendered config written");
         // …but the user's original was preserved first.
         let backup = repo.join(".cursor/mcp.json.agent-teams-backup");
         assert!(backup.exists(), "real user file backed up before overwrite");
@@ -590,7 +590,7 @@ mod mcp_tests {
             "no backup inside a disposable agent-teams worktree"
         );
         let now = fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap();
-        assert!(now.contains("agent-teams"), "overwritten in place");
+        assert!(now.contains("harness-ready"), "overwritten in place");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -631,7 +631,7 @@ mod mcp_tests {
         // parseable JSON with the resolved command + STATE_DIR env
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&out).unwrap()).expect("parseable JSON");
-        let srv = &v["mcpServers"]["agent-teams"];
+        let srv = &v["mcpServers"]["harness-ready"];
         assert_eq!(srv["command"], "/abs/path/to/agent-teams-mcp");
         assert_eq!(
             srv["env"]["AGENT_TEAMS_STATE_DIR"],
@@ -690,7 +690,7 @@ mod mcp_tests {
             let v: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&out).unwrap()).expect("parseable JSON");
             assert_eq!(
-                v["mcpServers"]["agent-teams"]["env"]["AGENT_TEAMS_STATE_DIR"],
+                v["mcpServers"]["harness-ready"]["env"]["AGENT_TEAMS_STATE_DIR"],
                 state.to_string_lossy().as_ref(),
                 "the sidecar env must carry the CALLER's state root — never an internal default"
             );
@@ -726,7 +726,7 @@ mod mcp_tests {
         assert!(written.exists(), "cursor config in the worktree");
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&written).unwrap()).expect("parseable JSON");
-        let srv = &v["mcpServers"]["agent-teams"];
+        let srv = &v["mcpServers"]["harness-ready"];
         // cursor-agent splits the `command` string on whitespace (claude doesn't),
         // so the bundled `/Applications/Agent Teams.app/…` path with a space makes it
         // `spawn /Applications/Agent` → ENOENT. Wrap in `/bin/sh -c "exec '<path>'"`:
@@ -780,7 +780,7 @@ mod mcp_tests {
         assert_eq!(written, repo.join(".mcp.json"));
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&written).unwrap()).expect("parseable JSON");
-        let srv = &v["mcpServers"]["agent-teams"];
+        let srv = &v["mcpServers"]["harness-ready"];
         // same /bin/sh -c exec wrapper as cursor (spaced bundle path safety)
         assert_eq!(srv["command"], "/bin/sh");
         assert_eq!(srv["args"][0], "-c");
@@ -844,7 +844,7 @@ mod mcp_tests {
             v.get("mcpServers").is_none(),
             "opencode.json must NOT use 'mcpServers' key"
         );
-        let srv = &v["mcp"]["agent-teams"];
+        let srv = &v["mcp"]["harness-ready"];
         // type: "local" for stdio servers
         assert_eq!(srv["type"], "local");
         // command as string array (not separate command + args)
@@ -1000,21 +1000,21 @@ mod mcp_tests {
             "cursor-mcp.tmpl.json",
             "commandcode-mcp.tmpl.json",
         ] {
-            // no bin → only agent-teams, still valid JSON.
+            // no bin → only harness-ready, still valid JSON.
             let off = render(name, None);
             assert!(
-                off["mcpServers"]["agent-teams"].is_object(),
-                "{name}: agent-teams present"
+                off["mcpServers"]["harness-ready"].is_object(),
+                "{name}: harness-ready present"
             );
             assert!(
                 off["mcpServers"]["bridgeagent"].is_null(),
                 "{name}: no bridgeagent when absent"
             );
-            // with bin → both servers, agent-teams untouched.
+            // with bin → both servers, harness-ready untouched.
             let on = render(name, Some(bridge));
             assert!(
-                on["mcpServers"]["agent-teams"].is_object(),
-                "{name}: agent-teams preserved"
+                on["mcpServers"]["harness-ready"].is_object(),
+                "{name}: harness-ready preserved"
             );
             let ba = &on["mcpServers"]["bridgeagent"];
             assert_eq!(

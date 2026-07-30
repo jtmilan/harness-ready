@@ -2,7 +2,7 @@
 name = "agent-teams-task"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — persisted Task model: the first durable, human-owned product entity (option-b plan-item #1). A sibling-of-state_root JSONL store, independent of the state machine."
+description = "Harness Ready — persisted Task model: the first durable, human-owned product entity (option-b plan-item #1). A sibling-of-state_root JSONL store, independent of the state machine."
 
 [lib]
 name = "agent_teams_task"

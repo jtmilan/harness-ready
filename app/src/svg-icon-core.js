@@ -1,4 +1,4 @@
-// Agent Teams — svg-icon-core: build an inline Lucide icon node.
+// Harness Ready — svg-icon-core: build an inline Lucide icon node.
 //
 // Renders <svg class="icon"><use href="#id"/></svg> via DOM — an SVG element needs its
 // namespace (createElementNS), and the <use> href references a <symbol> in the sprite.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core/state-adapter", "core/supervisor", "core/harness", "core/flywheel", "core/mcp", "agent-teams-mcp", "core/daemon", "core/task", "core/ringbuf", "core/memory", "core/roles", "core/agent"]
+members = ["core/state-adapter", "core/supervisor", "core/harness", "core/flywheel", "core/mcp", "harness-ready-mcp", "core/daemon", "core/task", "core/ringbuf", "core/memory", "core/roles", "core/agent"]
 # app/ is the Tauri project — its own build (own target, own deps tree); it
 # depends on the core crates by path. Excluded so cargo doesn't absorb it.
 exclude = ["app"]

@@ -187,18 +187,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-teams-daemon"
-version = "0.1.0"
-dependencies = [
- "agent-teams-core",
- "libc",
- "roles",
- "serde",
- "serde_json",
- "supervisor",
-]
-
-[[package]]
 name = "agent-teams-memory"
 version = "0.1.0"
 dependencies = [
@@ -263,11 +251,11 @@ version = "0.9.0"
 dependencies = [
  "agent-teams-agent",
  "agent-teams-core",
- "agent-teams-daemon",
  "agent-teams-memory",
  "agent-teams-task",
  "flywheel",
  "getrandom 0.2.17",
+ "harness-ready-daemon",
  "libc",
  "roles",
  "sentry",
@@ -1842,6 +1830,18 @@ dependencies = [
  "serde",
  "serde_json",
  "state-adapter",
+]
+
+[[package]]
+name = "harness-ready-daemon"
+version = "0.1.0"
+dependencies = [
+ "agent-teams-core",
+ "libc",
+ "roles",
+ "serde",
+ "serde_json",
+ "supervisor",
 ]
 
 [[package]]

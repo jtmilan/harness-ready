@@ -37,7 +37,7 @@ fn spawn_and_wait(
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join(format!("at-live-state-{}", std::process::id()));
     std::fs::create_dir_all(&state).unwrap();
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     assert!(sup.is_alive(), "{id}: child alive right after spawn");

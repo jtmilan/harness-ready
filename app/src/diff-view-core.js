@@ -1,4 +1,4 @@
-// Agent Teams — diff-view-core: render a unified-diff string into a DOM node.
+// Harness Ready — diff-view-core: render a unified-diff string into a DOM node.
 //
 // Pure DOM builders, no module-level state, no I/O:
 //   diffLineClass(line)      → the .diff-* CSS class for one unified-diff line

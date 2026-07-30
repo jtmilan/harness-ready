@@ -11,7 +11,7 @@ resolver = "2"
 [package]
 name = "app"
 version = "0.9.0"
-description = "Agent Teams — desktop supervisor for parallel AI coding agents in isolated git worktrees, surfaced through one ranked who-needs-you queue."
+description = "Harness Ready — desktop supervisor for parallel AI coding agents in isolated git worktrees, surfaced through one ranked who-needs-you queue."
 authors = ["Jeffry M <jtmilan@gmail.com>"]
 edition = "2021"
 
@@ -67,7 +67,7 @@ flywheel = { path = "../../core/flywheel" }
 # the relocated owner of the PTY master fds. In this slice it runs IN-PROCESS (the
 # daemon is not yet the socket server — Sub-build 3); the type move is what lets the
 # server own it later without touching every call site again.
-agent-teams-daemon = { path = "../../core/daemon" }
+harness-ready-daemon = { path = "../../core/daemon" }
 # D37: the SSOT queue projection — the app imports QueueRow + compute_queue from here
 # (deleting its own copies), becoming the second thin caller after the MCP sidecar.
 agent-teams-core = { path = "../../core/mcp" }

@@ -5,7 +5,7 @@
 //! and return the seeded workspace id. Two legs (DIFFERENT mechanisms):
 //!
 //! - **claude** — `--mcp-config <staged abs file>` (ADDITIVE, no `--strict`) +
-//!   `--allowedTools mcp__agent-teams__team_get_queue`. The `-p` mode has TWO
+//!   `--allowedTools mcp__harness-ready__team_get_queue`. The `-p` mode has TWO
 //!   independent gates: (a) MCP-SERVER trust and (b) per-TOOL permission. The
 //!   `--allowedTools` flag pre-allows the tool so the probe isolates the
 //!   SERVER-TRUST gate — that is what D56's additive-vs-strict question measures.
@@ -34,7 +34,7 @@ fn sidecar_bin() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../app/src-tauri/binaries/agent-teams-mcp-aarch64-apple-darwin")
+                .join("../../app/src-tauri/binaries/harness-ready-mcp-aarch64-apple-darwin")
         })
 }
 
@@ -116,7 +116,7 @@ fn claude_pane_lists_and_calls_team_get_queue() {
             "--mcp-config",
             mcp_cfg.to_str().unwrap(),
             "--allowedTools",
-            "mcp__agent-teams__team_get_queue",
+            "mcp__harness-ready__team_get_queue",
             "-p",
             "Call the team_get_queue tool and print its JSON result verbatim. No commentary.",
         ])
@@ -174,7 +174,7 @@ fn cursor_pane_lists_and_calls_team_get_queue() {
             "-p",
             "--output-format",
             "text",
-            "Call the team_get_queue MCP tool from the agent-teams server and print its JSON result verbatim. No commentary.",
+            "Call the team_get_queue MCP tool from the harness-ready server and print its JSON result verbatim. No commentary.",
         ])
         .output()
         .expect("run cursor-agent");

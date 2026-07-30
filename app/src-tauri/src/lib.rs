@@ -1,4 +1,4 @@
-//! Agent Teams — Tauri backend (Plan 02-02).
+//! Harness Ready — Tauri backend (Plan 02-02).
 //!
 //! Holds a registry of PTY [`Supervisor`]s and exposes commands the frontend
 //! calls: spawn a workspace, send input, read output, and read the ranked
@@ -41,7 +41,7 @@ use supervisor::{add_worktree, freshen_worktree, remove_worktree, Harness, Super
 // 08-T4: the daemon-owned live-pane map abstraction. `DaemonSups` (== `DaemonSups<Supervisor>`)
 // replaces the raw `Mutex<HashMap<String, Supervisor>>` as `AppState.sups`, running in-process in
 // this slice (the daemon is not yet the socket server — Sub-build 3).
-use agent_teams_daemon::sups::DaemonSups;
+use harness_ready_daemon::sups::DaemonSups;
 use tauri::{Emitter, Manager};
 
 // P10.1/P10.3 — InsForge dashboard emitter (additive, default-OFF, fail-soft; the ONLY new
@@ -124,7 +124,7 @@ struct AppState {
     // app — unseeded ⇒ the watcher is simply never armed.
     app_handle: std::sync::OnceLock<tauri::AppHandle>,
     hooks_dir: PathBuf,
-    // resolved absolute path to the bundled read-only `agent-teams-mcp` stdio
+    // resolved absolute path to the bundled read-only `harness-ready-mcp` stdio
     // sidecar (16-01 / D56). Resolved ONCE at setup (mirrors hooks_dir) and threaded
     // into Supervisor::spawn so every Claude/Cursor pane gets the read-only MCP
     // surface. A missing binary degrades to "no MCP in the pane" (never a spawn err).
@@ -314,7 +314,7 @@ fn kill_recorded_worker_group(pgid: u32, started_ms: Option<u64>) {
         let recorded_start = rec / 1000;
         if actual_start.abs_diff(recorded_start) > 300 {
             eprintln!(
-                "[agent-teams] refusing to kill pgid {pgid}: start-time mismatch (recorded {recorded_start}, actual {actual_start}) — pid likely reused"
+                "[harness-ready] refusing to kill pgid {pgid}: start-time mismatch (recorded {recorded_start}, actual {actual_start}) — pid likely reused"
             );
             return;
         }
@@ -385,7 +385,7 @@ fn sweep_orphan_worktrees(registry: &std::path::Path) {
         // (the pre-fix concatenation corruption produced exactly such lines); forgetting it
         // would leak that worktree forever. Conservative: keep + let a human look.
         let Ok(e) = serde_json::from_str::<WtEntry>(line) else {
-            eprintln!("[agent-teams] keeping unparseable worktree-registry line (manual review): {line}");
+            eprintln!("[harness-ready] keeping unparseable worktree-registry line (manual review): {line}");
             kept.push(line.to_string());
             continue;
         };
@@ -405,7 +405,7 @@ fn sweep_orphan_worktrees(registry: &std::path::Path) {
             .unwrap_or(false);
         if dirty {
             eprintln!(
-                "[agent-teams] keeping orphan worktree with uncommitted changes: {} ({})",
+                "[harness-ready] keeping orphan worktree with uncommitted changes: {} ({})",
                 e.id,
                 e.worktree.display()
             );
@@ -558,11 +558,11 @@ fn update_available(self_mtime: u64, target_mtime: u64) -> bool {
 }
 
 /// The install path `apply_update` knows how to replace. The updater is only
-/// eligible when the RUNNING app is exactly this install — the "Agent Teams Dev"
+/// eligible when the RUNNING app is exactly this install — the "Harness Ready Dev"
 /// sandbox (own bundle id, installed exclusively by scripts/install-app.sh
 /// --testing, which relaunches it itself) and bare target/ runs must never see
 /// the card: apply_update would ditto over PROD from inside the wrong app.
-const UPDATE_DEST: &str = "/Applications/Agent Teams.app";
+const UPDATE_DEST: &str = "/Applications/Harness Ready.app";
 
 /// This build's flavor, baked at compile time. install-app.sh stamps the same
 /// string into every bundle it builds (Contents/Resources/at-flavor), so the
@@ -3003,12 +3003,12 @@ fn startup_survivors_from(
     let Some(reg) = prev_registry else {
         return Vec::new();
     };
-    agent_teams_daemon::reattach::partition_reattach(reg, daemon_live)
+    harness_ready_daemon::reattach::partition_reattach(reg, daemon_live)
         .into_iter()
         .filter(|(_, decision)| {
             matches!(
                 decision,
-                agent_teams_daemon::reattach::ReattachDecision::Reattach { .. }
+                harness_ready_daemon::reattach::ReattachDecision::Reattach { .. }
             )
         })
         .filter_map(|(id, _)| reg.workspaces.iter().find(|w| w.id == id).cloned())
@@ -4694,7 +4694,7 @@ fn extract_conflict_manifest(doc: &str) -> (String, Vec<Pass1Conflict>) {
             // Best-effort: a garbled manifest must never fail or corrupt the synthesis — but log
             // it so a dropped escalation is observable rather than silent.
             if !json.is_empty() && json != "[]" {
-                eprintln!("agent-teams: omni-conflicts manifest failed to parse ({e}) — escalation skipped");
+                eprintln!("harness-ready: omni-conflicts manifest failed to parse ({e}) — escalation skipped");
             }
             Vec::new()
         }
@@ -6411,7 +6411,7 @@ fn apply_update(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     if !update_eligible(&exe, &bundle_flavor(&src)) {
         return Err(
-            "update refused: this install is not the /Applications 'Agent Teams' copy, \
+            "update refused: this install is not the /Applications 'Harness Ready' copy, \
              or the built bundle is a different flavor (dev sandbox updates via \
              scripts/install-app.sh --testing)"
                 .to_string(),
@@ -6718,7 +6718,7 @@ fn re_adopt_if_stale(sup: &Supervisor) {
     let Some(fg) = sup.foreground_pgid() else { return };
     if sup.refresh_live_pid(fg, peer_session_id(fg)).is_ok() {
         eprintln!(
-            "[agent-teams] coordinator-gate: re-adopted pane {} — stale live pid {} replaced by foreground pgid {}",
+            "[harness-ready] coordinator-gate: re-adopted pane {} — stale live pid {} replaced by foreground pgid {}",
             sup.id, stale, fg
         );
     }
@@ -8298,13 +8298,13 @@ fn handle_socket_request(
             if !is_trusted_repo(&trusted_repos_path(&st.state_root), std::path::Path::new(&repo)) {
                 return SocketResponse::err(
                     response_code::FORBIDDEN,
-                    "external spawn: repo is not in the trusted-repos allowlist (trust it in Agent Teams first)",
+                    "external spawn: repo is not in the trusted-repos allowlist (trust it in Harness Ready first)",
                 );
             }
             let payload =
                 external_create_payload(&repo, &groups, total, &tag, cfg.external_spawn_no_confirm, cap);
             let _ = app.emit("external-spawn", payload);
-            SocketResponse::ok("spawn requested — confirm in Agent Teams, then re-list workspaces to see it")
+            SocketResponse::ok("spawn requested — confirm in Harness Ready, then re-list workspaces to see it")
                 .with_data(SocketData::SpawnRequested { op: "create_workspace".into(), tag })
         }
         SocketRequest::AddPane { harness, role, model, target_workspace } => {
@@ -9823,7 +9823,7 @@ fn scheduler_tick(app: &tauri::AppHandle, state_root: &Path) {
                         // loop enabled + its last_run UNTOUCHED so a later tick retries once the
                         // precondition is met (a refusal must NOT reset the interval clock). NEVER crash
                         // the timer thread.
-                        eprintln!("[agent-teams] loop '{}' auto-fire skipped: {e}", cfg.id);
+                        eprintln!("[harness-ready] loop '{}' auto-fire skipped: {e}", cfg.id);
                     }
                 }
                 // ONE fire per tick — the slot is now claimed; stop scanning.
@@ -10849,7 +10849,7 @@ fn exclude_worktree_scaffold(wt_root: &Path) {
             if !existing.is_empty() && !existing.ends_with('\n') {
                 f.write_all(b"\n")?;
             }
-            writeln!(f, "# agent-teams: harness-injected worktree scaffold (NOT committable)")?;
+            writeln!(f, "# harness-ready: harness-injected worktree scaffold (NOT committable)")?;
             for p in &to_add {
                 writeln!(f, "{p}")?;
             }
@@ -13544,7 +13544,7 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                                     "<non-string panic payload>".to_string()
                                 };
                                 eprintln!(
-                                    "[agent-teams] mcp socket: handler panic caught (listener survives): {msg}"
+                                    "[harness-ready] mcp socket: handler panic caught (listener survives): {msg}"
                                 );
                                 SocketResponse::err("HANDLER_PANIC", msg)
                             }
@@ -13607,7 +13607,7 @@ fn spawn_socket_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) 
     use std::os::unix::net::UnixListener;
 
     let Some(path) = socket_path(&state_root) else {
-        eprintln!("[agent-teams] mcp socket: no parent for state_root — listener disabled");
+        eprintln!("[harness-ready] mcp socket: no parent for state_root — listener disabled");
         return;
     };
     // Connect-probe BEFORE unlinking: if another live instance is already accepting here,
@@ -13615,7 +13615,7 @@ fn spawn_socket_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) 
     // collision bug). Leave mutations disabled for THIS instance; reads don't use the socket.
     if socket_has_live_peer(&path) {
         eprintln!(
-            "[agent-teams] mcp socket: another instance is live at {} — mutations disabled for this instance (reads unaffected)",
+            "[harness-ready] mcp socket: another instance is live at {} — mutations disabled for this instance (reads unaffected)",
             path.display()
         );
         return;
@@ -13626,7 +13626,7 @@ fn spawn_socket_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) 
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "[agent-teams] mcp socket: bind {} failed: {e} — mutations disabled (reads unaffected)",
+                "[harness-ready] mcp socket: bind {} failed: {e} — mutations disabled (reads unaffected)",
                 path.display()
             );
             return;
@@ -13634,9 +13634,9 @@ fn spawn_socket_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) 
     };
     // 0600 — defense-in-depth (NOT the access gate on macOS; euid is). Best-effort.
     if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-        eprintln!("[agent-teams] mcp socket: chmod 0600 failed: {e} (euid check still enforced)");
+        eprintln!("[harness-ready] mcp socket: chmod 0600 failed: {e} (euid check still enforced)");
     }
-    eprintln!("[agent-teams] mcp socket listening at {}", path.display());
+    eprintln!("[harness-ready] mcp socket listening at {}", path.display());
 
     std::thread::spawn(move || {
         // CONCURRENT accept: each connection is served on its OWN thread, bounded to
@@ -13673,7 +13673,7 @@ fn spawn_socket_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) 
                     });
                 }
                 Err(e) => {
-                    eprintln!("[agent-teams] mcp socket: accept error: {e} (continuing)");
+                    eprintln!("[harness-ready] mcp socket: accept error: {e} (continuing)");
                 }
             }
         }
@@ -14058,7 +14058,7 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
     // listener with no token would 401 everything, but we want the token ready.
     if let Err(e) = ensure_http_token(&state_root) {
         // NEVER log the token; the error here is an I/O error, not the secret.
-        eprintln!("[agent-teams] mcp http: token ensure failed: {e} — HTTP transport disabled");
+        eprintln!("[harness-ready] mcp http: token ensure failed: {e} — HTTP transport disabled");
         return;
     }
 
@@ -14067,7 +14067,7 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "[agent-teams] mcp http: bind 127.0.0.1:0 failed: {e} — HTTP transport disabled (reads/UDS unaffected)"
+                "[harness-ready] mcp http: bind 127.0.0.1:0 failed: {e} — HTTP transport disabled (reads/UDS unaffected)"
             );
             return;
         }
@@ -14077,7 +14077,7 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
     let bound_port = match server.server_addr().to_ip().map(|a| a.port()) {
         Some(p) => p,
         None => {
-            eprintln!("[agent-teams] mcp http: could not read bound port — HTTP transport disabled");
+            eprintln!("[harness-ready] mcp http: could not read bound port — HTTP transport disabled");
             return;
         }
     };
@@ -14090,24 +14090,24 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
     }
     if let Some(port_path) = http_port_path(&state_root) {
         if let Err(e) = std::fs::write(&port_path, bound_port.to_string()) {
-            eprintln!("[agent-teams] mcp http: write port file failed: {e} (status/AppState still has it)");
+            eprintln!("[harness-ready] mcp http: write port file failed: {e} (status/AppState still has it)");
         }
     }
-    eprintln!("[agent-teams] mcp http listening at 127.0.0.1:{bound_port} (Bearer + Host/Origin gated)");
+    eprintln!("[harness-ready] mcp http listening at 127.0.0.1:{bound_port} (Bearer + Host/Origin gated)");
 
     std::thread::spawn(move || {
         for mut req in server.incoming_requests() {
             let resp = serve_http_request(&app, &mut req, &state_root, bound_port);
             // Contain a respond() error to THIS request — never kill the listener.
             if let Err(e) = req.respond(resp) {
-                eprintln!("[agent-teams] mcp http: respond error: {e} (continuing)");
+                eprintln!("[harness-ready] mcp http: respond error: {e} (continuing)");
             }
         }
     });
 }
 // ════════════════ 06-02 phase-b HTTP transport [END] ════════════════
 
-/// Resolve the bundled read-only `agent-teams-mcp` stdio sidecar (16-01 / D56),
+/// Resolve the bundled read-only `harness-ready-mcp` stdio sidecar (16-01 / D56),
 /// returning a `PathBuf` (not a `Result`): the sidecar is OPTIONAL, so a missing
 /// binary must degrade to "no MCP in the pane" (the supervisor's
 /// `inject_mcp_config`/`mcp_args` handle a bogus path / failed inject without
@@ -14116,10 +14116,10 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
 /// Precedence:
 /// 1. `AGENT_TEAMS_MCP_BIN` override (dev / tests).
 /// 2. The externalBin beside the running app binary (Tauri strips the host-triple
-///    suffix at bundle time → just `agent-teams-mcp` in `Contents/MacOS/`).
-/// 3. Dev fallback — PREFER the committed `binaries/agent-teams-mcp-<triple>`
+///    suffix at bundle time → just `harness-ready-mcp` in `Contents/MacOS/`).
+/// 3. Dev fallback — PREFER the committed `binaries/harness-ready-mcp-<triple>`
 ///    prebuilt (ALWAYS present in the tree), then a fresher local
-///    `target/{release,debug}/agent-teams-mcp` if one exists (a `cargo build`).
+///    `target/{release,debug}/harness-ready-mcp` if one exists (a `cargo build`).
 ///
 /// If nothing resolves, return the (possibly-absent) `current_exe`-adjacent path
 /// as a best-effort last resort — the supervisor degrades gracefully on a miss.
@@ -14129,19 +14129,19 @@ fn resolve_sidecar_bin() -> PathBuf {
     }
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp")));
+        .and_then(|exe| exe.parent().map(|d| d.join("harness-ready-mcp")));
     if let Some(cand) = &beside {
         if cand.exists() {
             return cand.clone();
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let prebuilt = manifest.join("binaries/agent-teams-mcp-aarch64-apple-darwin");
+    let prebuilt = manifest.join("binaries/harness-ready-mcp-aarch64-apple-darwin");
     if prebuilt.exists() {
         return prebuilt;
     }
     for profile in ["release", "debug"] {
-        let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
+        let cand = manifest.join(format!("../../target/{profile}/harness-ready-mcp"));
         if cand.exists() {
             return cand;
         }
@@ -14151,10 +14151,10 @@ fn resolve_sidecar_bin() -> PathBuf {
 
 /// Resolve the phase-b (mutation) sidecar handed ONLY to Coordinator-role panes — the
 /// capability half of the coordinator-only broadcast gate. Precedence mirrors
-/// [`resolve_sidecar_bin`] but targets a SEPARATE `agent-teams-mcp-coordinator` binary:
+/// [`resolve_sidecar_bin`] but targets a SEPARATE `harness-ready-mcp-coordinator` binary:
 /// 1. `AGENT_TEAMS_MCP_COORDINATOR_BIN` override (dev/tests).
-/// 2. The bundled `agent-teams-mcp-coordinator` beside the running app.
-/// 3. Dev fallback — a local `target/{release,debug}/agent-teams-mcp` (a
+/// 2. The bundled `harness-ready-mcp-coordinator` beside the running app.
+/// 3. Dev fallback — a local `target/{release,debug}/harness-ready-mcp` (a
 ///    `--features phase-b-mutations` build).
 ///
 /// If NONE resolve, fall back to [`resolve_sidecar_bin`] (read-only) so a coordinator
@@ -14166,7 +14166,7 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
     }
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp-coordinator")));
+        .and_then(|exe| exe.parent().map(|d| d.join("harness-ready-mcp-coordinator")));
     if let Some(cand) = &beside {
         if cand.exists() {
             return cand.clone();
@@ -14174,7 +14174,7 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for profile in ["release", "debug"] {
-        let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
+        let cand = manifest.join(format!("../../target/{profile}/harness-ready-mcp"));
         if cand.exists() {
             return cand;
         }
@@ -14310,7 +14310,7 @@ pub fn run() {
                 let _ = std::fs::remove_dir_all(&state_root);
             } else {
                 eprintln!(
-                    "[agent-teams] another instance holds {} — preserving state_root (skipping startup wipe)",
+                    "[harness-ready] another instance holds {} — preserving state_root (skipping startup wipe)",
                     state_sibling(&state_root, "instance.lock").display()
                 );
             }
@@ -14321,14 +14321,14 @@ pub fn run() {
             // hooks_dir needs the app handle (to find bundled resources), so build
             // and register state here rather than before the builder.
             let hooks_dir = resolve_hooks_dir(app);
-            eprintln!("[agent-teams] hooks_dir = {}", hooks_dir.display());
+            eprintln!("[harness-ready] hooks_dir = {}", hooks_dir.display());
             // 16-01 / D56: resolve the read-only MCP sidecar once (mirrors hooks_dir),
             // threaded into AppState.sidecar_bin → every Claude/Cursor pane spawn.
             let sidecar_bin = resolve_sidecar_bin();
-            eprintln!("[agent-teams] sidecar_bin = {}", sidecar_bin.display());
+            eprintln!("[harness-ready] sidecar_bin = {}", sidecar_bin.display());
             // Capability-by-role: the phase-b mutation sidecar handed ONLY to Coordinator panes.
             let coordinator_sidecar_bin = resolve_coordinator_sidecar_bin();
-            eprintln!("[agent-teams] coordinator_sidecar_bin = {}", coordinator_sidecar_bin.display());
+            eprintln!("[harness-ready] coordinator_sidecar_bin = {}", coordinator_sidecar_bin.display());
             // clone for the HUD timer thread before state_root is moved into AppState
             let state_root_timer = state_root.clone();
             // clone for the 06-02 MCP socket listener thread (same reason).
@@ -14436,7 +14436,7 @@ pub fn run() {
                     ensure_daemon_stream(st, id);
                 }
                 eprintln!(
-                    "[agent-teams] re-adopted {} daemon pane(s) after restart: {ids:?}",
+                    "[harness-ready] re-adopted {} daemon pane(s) after restart: {ids:?}",
                     ids.len()
                 );
             }
@@ -14481,7 +14481,7 @@ pub fn run() {
             // Unwinnable without NSEvent monitors (out of scope).
             //
             // ⌘G (no Shift) IS delivered to page JS in this webview class — proven daily
-            // by prod Agent Teams (main.js:8314, ⌘G = toggleGrid, works with terminals
+            // by prod Harness Ready (main.js:8314, ⌘G = toggleGrid, works with terminals
             // focused). Accelerator is therefore CmdOrCtrl+G. Do NOT "restore" ⌘⇧G.
             //
             // Deliberately NOT `global_shortcut`: a system-wide claim would fight browser
@@ -14533,7 +14533,7 @@ pub fn run() {
 
                 let jump_i = MenuItem::with_id(app, "jump", "Jump to top of queue", true, None::<&str>)?;
                 let show_i = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
-                let quit_i = MenuItem::with_id(app, "quit", "Quit Agent Teams", true, None::<&str>)?;
+                let quit_i = MenuItem::with_id(app, "quit", "Quit Harness Ready", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&jump_i, &show_i, &quit_i])?;
 
                 let _tray = TrayIconBuilder::with_id("at-tray")
@@ -14661,7 +14661,7 @@ pub fn run() {
                                         );
                                     }
                                     Err(e) => eprintln!(
-                                        "[agent-teams] admit failed for {}: {e} — dropped",
+                                        "[harness-ready] admit failed for {}: {e} — dropped",
                                         ps.id
                                     ),
                                 }
@@ -14695,7 +14695,7 @@ pub fn run() {
                                     let _ = timer_handle
                                         .notification()
                                         .builder()
-                                        .title("Agent Teams — update available")
+                                        .title("Harness Ready — update available")
                                         .body(format!("v{ver} is ready. Click Update in the app."))
                                         .show();
                                 }
@@ -14899,7 +14899,7 @@ struct McpTasksCache {
 /// Read-only projection of the Phase-14 task model (MCP task log/store) for the
 /// board. Folds the append-only transition log ONCE — operator-store tasks (with
 /// their folded lifecycle) ∪ log-only agent-created tasks, the store winning on id
-/// overlap — mirroring `agent-teams-mcp::list_views`. Never mutates.
+/// overlap — mirroring `harness-ready-mcp::list_views`. Never mutates.
 ///
 /// PERF: served through a process-global (mtime,len)-keyed cache (`McpTasksCache`) so the
 /// 1s board poll costs two stats when nothing changed — the whole-log re-parse and the
@@ -16634,8 +16634,8 @@ mod updater_tests {
     #[test]
     fn update_eligible_requires_prod_install_and_matching_flavor() {
         use std::path::Path;
-        let prod_exe = Path::new("/Applications/Agent Teams.app/Contents/MacOS/app");
-        let dev_exe = Path::new("/Applications/Agent Teams Dev.app/Contents/MacOS/app");
+        let prod_exe = Path::new("/Applications/Harness Ready.app/Contents/MacOS/app");
+        let dev_exe = Path::new("/Applications/Harness Ready Dev.app/Contents/MacOS/app");
         let bare_exe = Path::new("/Users/x/repo/app/src-tauri/target/release/app");
         // Only the replaceable install, only a same-flavor target.
         assert!(update_eligible(prod_exe, SELF_FLAVOR));
@@ -20526,7 +20526,7 @@ mod session_readopt_tests {
         };
         let hooks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/hooks");
         let state = std::env::temp_dir().join("at-app-readopt-state");
-        let sidecar = std::path::PathBuf::from("/unused/agent-teams-mcp");
+        let sidecar = std::path::PathBuf::from("/unused/harness-ready-mcp");
 
         let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
         let bash_pid = sup.process_id().expect("the PTY child has a pid");

@@ -215,7 +215,7 @@ fn ac5_agent_teams_mcp_phase_b_mutations_builds_inert() {
         .args([
             "build",
             "-p",
-            "agent-teams-mcp",
+            "harness-ready-mcp",
             "--features",
             "phase-b-mutations",
             "--quiet",
@@ -225,6 +225,6 @@ fn ac5_agent_teams_mcp_phase_b_mutations_builds_inert() {
         .expect("spawn cargo build");
     assert!(
         status.success(),
-        "agent-teams-mcp with phase-b-mutations must compile (inert stubs)"
+        "harness-ready-mcp with phase-b-mutations must compile (inert stubs)"
     );
 }

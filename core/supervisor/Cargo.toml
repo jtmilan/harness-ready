@@ -2,7 +2,7 @@
 name = "supervisor"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — PTY session supervisor + git-worktree isolation (Phase 02)"
+description = "Harness Ready — PTY session supervisor + git-worktree isolation (Phase 02)"
 
 [dependencies]
 portable-pty = "0.8"

@@ -313,7 +313,7 @@ pub fn run(state_dir: &Path, args: PromptAllArgs) -> PromptAllResult {
                 id: "*".into(),
                 error: "APP_NOT_RUNNING".into(),
                 detail: Some(
-                    "live registry absent — Agent Teams app is not running (or has no panes)"
+                    "live registry absent — Harness Ready app is not running (or has no panes)"
                         .into(),
                 ),
             }],

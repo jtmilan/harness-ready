@@ -1,4 +1,4 @@
-//! `agent-teams-daemon` binary — Phase 08 Sub-build 3 (slice 2).
+//! `harness-ready-daemon` binary — Phase 08 Sub-build 3 (slice 2).
 //!
 //! GATED OFF (bundled-but-inert): as of 08-T9 this binary IS bundled (it is in
 //! `tauri.conf` `externalBin`), but it is NEVER launched by a default install — its
@@ -22,21 +22,21 @@
 //! ## Launch posture (MF-F)
 //!
 //! * Production (no flag) → **A1** launchd socket-activation
-//!   ([`agent_teams_daemon::launch::LaunchdSocketActivation`]). On ANY A1 error this
+//!   ([`harness_ready_daemon::launch::LaunchdSocketActivation`]). On ANY A1 error this
 //!   logs and EXITS (fail loud) — it MUST NOT silently self-bind. Under the ratified
 //!   D45, A1 is the only posture that lets idle-shutdown (AC-4) coexist with
 //!   auto-restart; a self-bind fallback would re-introduce the break D45 ruled out.
-//! * `--dev` → **A2** [`agent_teams_daemon::launch::DoubleFork`] self-bind, the explicit
+//! * `--dev` → **A2** [`harness_ready_daemon::launch::DoubleFork`] self-bind, the explicit
 //!   developer escape hatch (run the daemon without an installed launchd plist).
 //!
 //! The A1-vs-A2 selection + the no-fallback guarantee live in
-//! [`agent_teams_daemon::launch::acquire_listener_with_posture`].
+//! [`harness_ready_daemon::launch::acquire_listener_with_posture`].
 
 use std::sync::Arc;
 
-use agent_teams_daemon::launch::acquire_listener_with_posture;
-use agent_teams_daemon::server::serve;
-use agent_teams_daemon::sups::DaemonSups;
+use harness_ready_daemon::launch::acquire_listener_with_posture;
+use harness_ready_daemon::server::serve;
+use harness_ready_daemon::sups::DaemonSups;
 
 /// Resolve the app's `state_root` so the daemon reads the SAME `mcp-config.json`
 /// (sibling of `state_root`) the app writes — the source of truth for the
@@ -60,7 +60,7 @@ fn main() {
         Err(e) => {
             // MF-F: fail LOUD on A1 error — do NOT fall through to a self-bind.
             eprintln!(
-                "agent-teams-daemon: acquire listener failed: {e}; exiting \
+                "harness-ready-daemon: acquire listener failed: {e}; exiting \
                  (A1 launchd socket-activation = fail-loud, no A2 fallback). \
                  Run with --dev to self-bind outside launchd."
             );
@@ -75,7 +75,7 @@ fn main() {
     // trail, then clear BOTH files before the daemon begins spawning. No-op in the default
     // build (the daemon owns no panes and the app still owns the registry).
     #[cfg(feature = "daemon-spawn")]
-    agent_teams_daemon::spawn::cold_start_sweep(&state_root);
+    harness_ready_daemon::spawn::cold_start_sweep(&state_root);
 
     // Codex MCP startup hygiene: a fresh daemon process owns no live codex panes yet, so
     // any `[mcp_servers.agent-teams-<pane>]` block in ~/.codex/config.toml is a leak from a
@@ -86,7 +86,7 @@ fn main() {
         let purged = supervisor::purge_all_managed_codex_mcp();
         if purged > 0 {
             eprintln!(
-                "agent-teams-daemon: startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
+                "harness-ready-daemon: startup: purged {purged} stale codex MCP block(s) from ~/.codex/config.toml"
             );
         }
     }
@@ -95,7 +95,7 @@ fn main() {
     // as before). The production stored value is the real `Supervisor` (the PTY-owning pane).
     let sups: Arc<DaemonSups<supervisor::Supervisor>> = Arc::new(DaemonSups::new());
     eprintln!(
-        "agent-teams-daemon: listening via {mech}; state_root={}",
+        "harness-ready-daemon: listening via {mech}; state_root={}",
         state_root.display()
     );
     serve(listener, sups, state_root);

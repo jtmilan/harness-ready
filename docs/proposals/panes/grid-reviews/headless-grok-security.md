@@ -4,11 +4,11 @@ ui/src/components/command/templates/templateIO.js:302: SHOULD: `validateOneTempl
 
 ui/src/components/command/templates/templateAgents.js:35: SHOULD: Schema pin drops unknown keys (good) but `priority`/`autonomy` are copied with no type/allowlist — import can store objects/huge strings into localStorage and into launch payload (CWE-20). Fix: keep only allowlisted string enums (or drop non-string / unknown).
 
-agent-teams-mcp/src/main.rs:1431: SHOULD: `recent_event_ids` treats any `read_dir` child as a pane id: `is_dir()`/`metadata` follow symlinks and ids are not filtered by `validate_spawn_id` — no canonical prefix-check that `events.jsonl` stays under `state_dir` (CWE-22, CWE-59). Fix: require `validate_spawn_id(id)`; use non-follow metadata (or canonicalize + `starts_with(state_dir)`); skip symlink dirs.
+harness-ready-mcp/src/main.rs:1431: SHOULD: `recent_event_ids` treats any `read_dir` child as a pane id: `is_dir()`/`metadata` follow symlinks and ids are not filtered by `validate_spawn_id` — no canonical prefix-check that `events.jsonl` stays under `state_dir` (CWE-22, CWE-59). Fix: require `validate_spawn_id(id)`; use non-follow metadata (or canonicalize + `starts_with(state_dir)`); skip symlink dirs.
 
-agent-teams-mcp/src/read_output.rs:177: SHOULD: `registry_present` is set from post-reconcile `pane_is_live`, so with `reconcile_liveness` ON a disk-only pane reports `registry_present: true` while the field claims registry membership — false authz/liveness signal (CWE-451, fail-closed). Fix: `registry_present = reg_row.is_some()`; expose reconcile source separately.
+harness-ready-mcp/src/read_output.rs:177: SHOULD: `registry_present` is set from post-reconcile `pane_is_live`, so with `reconcile_liveness` ON a disk-only pane reports `registry_present: true` while the field claims registry membership — false authz/liveness signal (CWE-451, fail-closed). Fix: `registry_present = reg_row.is_some()`; expose reconcile source separately.
 
-agent-teams-mcp/src/read_output.rs:145: SHOULD: Flag-ON path calls `recent_event_ids(state_dir, …)` (full tree scan) to decide liveness of one already-validated `id` — work scales with state_dir width (CWE-400). Fix: `metadata(state_dir.join(id).join("events.jsonl"))` only.
+harness-ready-mcp/src/read_output.rs:145: SHOULD: Flag-ON path calls `recent_event_ids(state_dir, …)` (full tree scan) to decide liveness of one already-validated `id` — work scales with state_dir width (CWE-400). Fix: `metadata(state_dir.join(id).join("events.jsonl"))` only.
 
 ui/src/lib/contextGraph.js:32: SHOULD: `countByKind` uses plain `{}` and indexes with untrusted `kind`/`file_type`/`category` — `__proto__`/`constructor` keys corrupt the bag / prototype (CWE-1321). Fix: `Object.create(null)` or `Map`.
 

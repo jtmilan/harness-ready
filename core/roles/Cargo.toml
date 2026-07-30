@@ -2,7 +2,7 @@
 name = "roles"
 version = "0.1.0"
 edition = "2021"
-description = "Agent Teams — typed agent-role persona SSOT (Coordinator/Builder/Scout/Reviewer) — Plan 17-01"
+description = "Harness Ready — typed agent-role persona SSOT (Coordinator/Builder/Scout/Reviewer) — Plan 17-01"
 
 # std-only, no deps: the persona text + AgentRole enum is shared by the supervisor
 # (system-prompt injection) and the app (orchestration prompt) so there is ONE copy

@@ -1,4 +1,4 @@
-// Agent Teams — EXTERNAL-spawn clamp: PURE cap resolution + pane expansion for the
+// Harness Ready — EXTERNAL-spawn clamp: PURE cap resolution + pane expansion for the
 // "external-spawn" Tauri event (LLM brain → UDS socket → app).
 //
 // The DOM listener lives in main.js (the `external-spawn` tauriEvent.listen block); this

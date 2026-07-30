@@ -36,7 +36,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../app/src-tauri/binaries/agent-teams-mcp-aarch64-apple-darwin")
+                .join("../../app/src-tauri/binaries/harness-ready-mcp-aarch64-apple-darwin")
         });
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).expect("spawn");
     sup.resize(40, 120).expect("resize");

@@ -104,7 +104,7 @@ Concrete mechanics:
 
 | Consumer | How it sees rows | Breaks if optional `branch`/`worktree` added? |
 | --- | --- | --- |
-| MCP `team_get_queue` | `identified_queue` → `Vec<QueueRow>` — `agent-teams-mcp/src/main.rs:222-226, 1020-1022` | **INFERRED no** for ignore-unknown JSON clients; **schema/docs** would need update (tool description currently lists optional `role`/`tag`/`workspace` only — `:209-220`) |
+| MCP `team_get_queue` | `identified_queue` → `Vec<QueueRow>` — `harness-ready-mcp/src/main.rs:222-226, 1020-1022` | **INFERRED no** for ignore-unknown JSON clients; **schema/docs** would need update (tool description currently lists optional `role`/`tag`/`workspace` only — `:209-220`) |
 | MCP `get_workspace` | same row shape — `:239-254` | same |
 | MCP resources `team://queue`, `team://workspace/{id}` | pretty-printed same rows — ~`:968-972` | same |
 | App `list_queue` | `compute_queue` + `enrich_queue` — `lib.rs:2535-2547` | **INFERRED no** for Tauri serde to JS (extra keys appear on objects) |

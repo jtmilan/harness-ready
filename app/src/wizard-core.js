@@ -1,4 +1,4 @@
-// Agent Teams — layout wizard core (Phase 1: pure model + reducers, no UI).
+// Harness Ready — layout wizard core (Phase 1: pure model + reducers, no UI).
 //
 // The 3-step create wizard (Start → Layout → Agents) is split into a PURE state
 // model (here) and a DOM controller (wizard.js). This module owns the wizard's

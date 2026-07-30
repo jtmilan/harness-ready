@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-daemon-sidecar.sh — build the agent-teams-daemon binary for the Tauri
+# build-daemon-sidecar.sh — build the harness-ready-daemon binary for the Tauri
 # externalBin. Mirrors build-mcp-sidecar.sh: build → cp to binaries/<host-triple>
 # (the committed prebuilt the app bundles). Tauri strips the triple suffix at
-# bundle time → Contents/MacOS/agent-teams-daemon.
+# bundle time → Contents/MacOS/harness-ready-daemon.
 #
 # 08-T9 — BUNDLE-BUT-INERT. This stages the daemon Mach-O into the app bundle so the
 # packaged AC-1..6 GUI-verify (detached-PTY survives Cmd+Q, no double-spawn,
@@ -16,7 +16,7 @@
 #     present, install-app.sh no longer gates registration on mere binary-PRESENCE
 #     (`-x`); it requires an explicit, security-reviewed opt-in
 #     (AGENT_TEAMS_DAEMON_LAUNCHAGENT=1). Default installs skip registration.
-#   * Run `agent-teams-daemon` with no flag and it selects A1 launchd socket-activation,
+#   * Run `harness-ready-daemon` with no flag and it selects A1 launchd socket-activation,
 #     finds no LISTEN_FDS outside launchd, and EXITS 1 (fail-loud). Only `--dev`
 #     self-binds (A2) — the intentional GUI-verify escape hatch.
 #
@@ -31,13 +31,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # agent-teams-mcp-<triple> prebuilt name (macOS aarch64 host only; cross-arch is
 # out of scope, same constraint the other sidecars carry).
 TRIPLE="aarch64-apple-darwin"
-DEST="$REPO/app/src-tauri/binaries/agent-teams-daemon-$TRIPLE"
+DEST="$REPO/app/src-tauri/binaries/harness-ready-daemon-$TRIPLE"
 
-echo "==> building agent-teams-daemon (release, no features — bundled-but-inert)"
+echo "==> building harness-ready-daemon (release, no features — bundled-but-inert)"
 
-cargo build --release -p agent-teams-daemon --manifest-path "$REPO/Cargo.toml"
+cargo build --release -p harness-ready-daemon --manifest-path "$REPO/Cargo.toml"
 
-SRC="$REPO/target/release/agent-teams-daemon"
+SRC="$REPO/target/release/harness-ready-daemon"
 if [[ ! -x "$SRC" ]]; then
   echo "ERROR: expected built binary not found at $SRC" >&2
   exit 1
@@ -54,4 +54,4 @@ if ! file "$DEST" | grep -q "Mach-O"; then
   echo "ERROR: $DEST is not a Mach-O executable" >&2
   exit 1
 fi
-echo "==> OK: daemon sidecar bundled (inert). Commit binaries/agent-teams-daemon-$TRIPLE alongside the source."
+echo "==> OK: daemon sidecar bundled (inert). Commit binaries/harness-ready-daemon-$TRIPLE alongside the source."
