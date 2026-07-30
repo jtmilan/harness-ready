@@ -2976,6 +2976,45 @@ fn reconcile_daemon_panes(state: tauri::State<AppState>) -> Result<Vec<String>, 
     reconcile_daemon_panes_inner(state.inner())
 }
 
+/// Coordinator-gate-fix (criterion 2): the panes the daemon STILL owns across this
+/// app's restart — the intersection of the prior run's live registry (a sibling file
+/// that survives the app) with the daemon's authoritative `ListLive`, via
+/// `partition_reattach` — the EXACT pure re-attach decision the reopen loop uses (ONE
+/// adoption rule, never two). Empty when: the daemon is down (transport failure ⇒
+/// fail-closed, never a false adopt), the daemon has no live panes, no prior registry
+/// exists, or it recorded no owner. App-local panes are absent from `ListLive` → never
+/// survive → never re-added (their PTY master died with the app).
+fn startup_daemon_survivors(state_root: &std::path::Path) -> Vec<LiveWorkspace> {
+    let live = match daemon_client::daemon_list_live(state_root) {
+        Ok(live) if !live.is_empty() => live,
+        _ => return Vec::new(),
+    };
+    startup_survivors_from(read_registry(state_root).as_ref(), &live)
+}
+
+/// The PURE adoption decision (unit-tested without a daemon socket): the rows of the
+/// prior registry that survive into the new run, given the daemon's live id set —
+/// every id `partition_reattach` decides `Reattach` (listed in the prior registry AND
+/// daemon-live AND an owner recorded), returned with its prior registry row verbatim.
+fn startup_survivors_from(
+    prev_registry: Option<&LiveRegistry>,
+    daemon_live: &[String],
+) -> Vec<LiveWorkspace> {
+    let Some(reg) = prev_registry else {
+        return Vec::new();
+    };
+    agent_teams_daemon::reattach::partition_reattach(reg, daemon_live)
+        .into_iter()
+        .filter(|(_, decision)| {
+            matches!(
+                decision,
+                agent_teams_daemon::reattach::ReattachDecision::Reattach { .. }
+            )
+        })
+        .filter_map(|(id, _)| reg.workspaces.iter().find(|w| w.id == id).cloned())
+        .collect()
+}
+
 /// Testable body of [`reconcile_daemon_panes`] (the command is a thin `state.inner()` wrapper).
 fn reconcile_daemon_panes_inner(state: &AppState) -> Result<Vec<String>, String> {
     // Gate on the DURABLE write-ahead store, NOT the live `daemon_spawn` routing flag. The daemon
@@ -14254,6 +14293,19 @@ pub fn run() {
             // within-session only (D7): clear stale per-workspace event files from
             // prior runs so the queue reflects only sessions live in THIS process. SKIP on a
             // detected second instance so we don't clobber the first instance's state.
+            // Coordinator-gate-fix (criterion 2): BEFORE the wipe, capture which prior-run
+            // panes are still live in the daemon — the registry is a sibling (survives the
+            // wipe) and the daemon outlives the app. App-local panes never appear in
+            // `daemon_list_live` (their PTY master died with the prior app), so they are
+            // never re-added: post-restart the registry honestly reflects daemon-live /
+            // app-local-absent. Daemon down / transport failure ⇒ empty ⇒ nothing adopted
+            // (fail-closed, never a false adopt); skipped on a detected second instance
+            // (the first instance owns the registry).
+            let daemon_survivors: Vec<LiveWorkspace> = if single_instance {
+                startup_daemon_survivors(&state_root)
+            } else {
+                Vec::new()
+            };
             if single_instance {
                 let _ = std::fs::remove_dir_all(&state_root);
             } else {
@@ -14339,6 +14391,55 @@ pub fn run() {
                 // P3 LOOP: no loop tag at launch (loop_iteration stamps it per-fire).
                 delegate_loop_id: Mutex::new(String::new()),
             });
+
+            // Coordinator-gate-fix (criterion 2): re-adopt the daemon panes that
+            // survived the restart — registry rows, the ownership set, the write-ahead
+            // anchor, and an attach stream each — the SAME adoption reconcile_daemon_
+            // panes_inner performs on reopen, but IMMEDIATE, so the registry never
+            // reports empty while daemon panes live (the old gap: empty until the
+            // frontend's reopen loop happened to reconcile). App-local panes are
+            // deliberately NOT re-added (PTY master died with the app; get_workspace
+            // correctly returns null for them — honest, not contradictory).
+            if !daemon_survivors.is_empty() {
+                let st = app.state::<AppState>().inner();
+                let ids: Vec<String> = daemon_survivors.iter().map(|w| w.id.clone()).collect();
+                live_registry_update(st, |ws| {
+                    for row in &daemon_survivors {
+                        if !ws.iter().any(|w| w.id == row.id) {
+                            ws.push(row.clone());
+                        }
+                    }
+                });
+                {
+                    let mut owned = st
+                        .daemon_panes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for id in &ids {
+                        owned.insert(id.clone());
+                    }
+                }
+                {
+                    let _g = st
+                        .daemon_spawn_ahead_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut stored = daemon_ahead_read(&st.daemon_spawn_ahead);
+                    for id in &ids {
+                        if !stored.contains(id) {
+                            stored.push(id.clone());
+                        }
+                    }
+                    daemon_ahead_write(&st.daemon_spawn_ahead, &stored);
+                }
+                for id in &ids {
+                    ensure_daemon_stream(st, id);
+                }
+                eprintln!(
+                    "[agent-teams] re-adopted {} daemon pane(s) after restart: {ids:?}",
+                    ids.len()
+                );
+            }
 
             // ── 06-02 phase-b socket listener ──
             // Bind the Unix-domain mutation socket (sibling of state_root) on a
@@ -20312,6 +20413,51 @@ mod flavor_isolation_tests {
             dev_state_root(),
             "a debug build must default to the dev sandbox — never prod"
         );
+    }
+}
+
+// ─────────────── coordinator-gate-fix: app-restart daemon re-adoption ────────────────
+//
+// An app restart wipes the in-memory pane set + rewrites an EMPTY live registry; daemon
+// panes OUTLIVE that (approach B). The startup adoption re-adds exactly the prior
+// registry rows the daemon still lists live — never app-local panes (their PTY master
+// died with the app).
+#[cfg(test)]
+mod daemon_restart_readopt_tests {
+    use super::*;
+
+    fn registry(json: &str) -> LiveRegistry {
+        serde_json::from_str(json).expect("valid LiveRegistry json")
+    }
+
+    #[test]
+    fn app_restart_readopts_daemon_pane() {
+        // prior registry: one app-local + one daemon-owned pane; the daemon still keeps
+        // the daemon-owned one live → exactly that row survives, verbatim.
+        let reg = registry(
+            r#"{"schema":1,"app_pid":111,"workspaces":[
+                {"id":"ws1-p0","harness":"claude"},
+                {"id":"ws2-p0","harness":"codex","repo":"/r"}]}"#,
+        );
+        let survivors = startup_survivors_from(Some(&reg), &["ws2-p0".to_string()]);
+        assert_eq!(survivors.len(), 1, "only the daemon-live pane survives");
+        assert_eq!(survivors[0].id, "ws2-p0");
+        assert_eq!(survivors[0].repo.as_deref(), Some("/r"), "the prior row rides verbatim");
+    }
+
+    #[test]
+    fn app_local_pane_not_reattached() {
+        let reg = registry(r#"{"schema":1,"app_pid":111,"workspaces":[{"id":"ws1-p0"}]}"#);
+        // the daemon lists NO live panes → the app-local pane is never re-added
+        assert!(startup_survivors_from(Some(&reg), &[]).is_empty());
+        // a daemon-live id that was NEVER in the prior registry is not adopted either
+        // (the GUI only acts on what it remembers)
+        assert!(startup_survivors_from(Some(&reg), &["ws9-p0".to_string()]).is_empty());
+        // no prior registry → nothing to adopt (fail closed)
+        assert!(startup_survivors_from(None, &["ws1-p0".to_string()]).is_empty());
+        // a registry with NO recorded owner → partition decides everything cold → empty
+        let no_owner = registry(r#"{"schema":1,"workspaces":[{"id":"ws1-p0"}]}"#);
+        assert!(startup_survivors_from(Some(&no_owner), &["ws1-p0".to_string()]).is_empty());
     }
 }
 
