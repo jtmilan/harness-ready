@@ -137,15 +137,37 @@ export default function Monitoring() {
           </div>
         </div>
 
-        {/* SECONDARY, SIMULATED — explicitly not the hero (R4 / V-B5). */}
+        {/*
+         * PER-AGENT OUTCOMES — placeholder pending R-OBS outcome events (NEEDS-BACKEND);
+         * nothing below is live.
+         *
+         * F-OBS-2 — NEEDS-BACKEND (proposed, NOT wired): when core emits per-agent task
+         * outcomes, either (a) extend the subscribe() agent shape with
+         *   outcomes: { success, blocked, error, total, lastOutcomeAt }
+         * or (b) add bridge.getOutcomeStats(): Promise<Array<{ id, success, blocked,
+         *   error, lastOutcomeAt }>>.
+         * Until then this section stays an empty placeholder (R4). Do NOT add either to
+         * agentBridge.js here (R10: contract changes are NOTE-only, backend-gated).
+         */}
         <div className="space-y-2">
           <div className="font-heading text-[11px] tracking-[0.3em] text-amber-400/80 font-bold">
-            SIMULATED SERIES — PLACEHOLDER ONLY (pending R-OBS)
+            PER-AGENT OUTCOMES — PLACEHOLDER (pending R-OBS outcome events)
           </div>
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-            <ResourceChart data={[]} />
-            <SuccessRateChart data={[]} />
+          <div className="px-4 py-2 border border-amber-500/30 bg-amber-500/5 font-mono text-[10px] text-amber-400/80">
+            ⚠ No outcome data yet — success / blocked / error / total counts require
+            per-agent task-outcome events from the backend (NEEDS-BACKEND, F-OBS-2). The
+            empty chart below is honest; do not read numbers into it.
           </div>
+          <SuccessRateChart data={[]} />
+        </div>
+
+        {/* SECONDARY, SIMULATED — CPU/MEM sampling placeholder (R4 / V-B5). Separate from
+         * outcomes: R-OBS sampling is a different concern from task-outcome attribution. */}
+        <div className="space-y-2">
+          <div className="font-heading text-[11px] tracking-[0.3em] text-amber-400/80 font-bold">
+            SIMULATED SERIES — PLACEHOLDER ONLY (pending R-OBS sampling)
+          </div>
+          <ResourceChart data={[]} />
         </div>
       </div>
     </div>
