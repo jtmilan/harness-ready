@@ -1,0 +1,1 @@
+403 {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}},"request_id":"req_011CdYXoRJKBBLU3TtDdJbUN"}
