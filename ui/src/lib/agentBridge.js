@@ -129,6 +129,15 @@ class MockAgentBridge {
     }
   }
 
+  // Workspace-sharing parity stubs (F-OBS-4 / M2): Home awaits bridge.setWorkspaceSharing
+  // unconditionally and polls fetchSharingStates — the Tauri bridge implements the real
+  // commands, the mock must not TypeError in the web preview (same interface-parity
+  // rationale as resumeAgents / broadcastRaw above). Sharing stays backend-authoritative:
+  // a no-op mock keeps every workspace ISOLATED, which is the safe default.
+  async setWorkspaceSharing(_wsId, _enabled) { return undefined; }
+  getSharing() { return {}; }
+  async fetchSharingStates() { return {}; }
+
   // --- process control (signals in the real backend) ---
   pauseAgents(ids) {
     this._patch((a) => ids.includes(a.id), (a) => this._append(a, ">> PAUSED BY OPERATOR", { status: "idle", attention: null }));

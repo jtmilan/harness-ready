@@ -3,12 +3,11 @@ import { Plus, LayoutTemplate, Zap } from "lucide-react";
 import { AGENT_KINDS, KIND_IDS } from "@/lib/agentTypes";
 import WorkspaceTile from "@/components/command/WorkspaceTile";
 
-export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, workspaces = [], activeId, onSelectWorkspace, onAddWorkspace, onRenameWorkspace, onDeleteWorkspace }) {
-  // Never offer delete on the last remaining workspace.
-  const deletable = workspaces.length > 1 ? onDeleteWorkspace : undefined;
+export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, activeCount = 0, workspaces = [], activeId, onSelectWorkspace, onAddWorkspace }) {
   return (
     <div className="flex-1 flex flex-col items-center justify-center overflow-y-auto terminal-scroll p-8">
-      <div className="font-mono text-xs text-cyan-700 mb-5">$ agent fleet status — 0 active</div>
+      {/* F-OBS-4: count is computed from the live fleet, never a literal (R4). */}
+      <div className="font-mono text-xs text-cyan-700 mb-5">$ agent fleet status — {activeCount} active</div>
       <h1 className="font-heading font-bold tracking-[0.3em] text-4xl md:text-5xl text-cyan-200 text-center drop-shadow-[0_0_18px_rgba(0,229,255,0.35)]">
         AGENT COMMAND CENTER<span className="inline-block w-3 h-9 bg-cyan-300 animate-pulse align-baseline ml-2" />
       </h1>
@@ -29,18 +28,28 @@ export default function EmptyState({ onNewAgent, onTemplates, onLoadDemo, worksp
         >
           <LayoutTemplate className="w-4 h-4" /> LAUNCH A TEMPLATE
         </button>
-        <button
-          onClick={onLoadDemo}
-          className="flex items-center gap-2 px-6 py-3 border border-cyan-900 text-cyan-700 font-heading tracking-[0.2em] text-sm font-bold hover:border-cyan-500 hover:text-cyan-300 transition-colors"
-        >
-          <Zap className="w-4 h-4" /> LOAD DEMO FLEET
-        </button>
+        {/* F-OBS-4 (R3): LOAD DEMO FLEET renders ONLY when the bridge actually exposes
+            loadDemoFleet (MockAgentBridge in the web preview). The Tauri bridge has no
+            such method — a button there would be a fake affordance, so it is absent.
+            The DEMO badge marks the fleet as simulated (never --success styling). */}
+        {typeof onLoadDemo === "function" && (
+          <button
+            onClick={onLoadDemo}
+            title="Mock-bridge only — simulated fleet (not live agents)"
+            className="flex items-center gap-2 px-6 py-3 border border-cyan-900 text-cyan-700 font-heading tracking-[0.2em] text-sm font-bold hover:border-cyan-500 hover:text-cyan-300 transition-colors"
+          >
+            <Zap className="w-4 h-4" /> LOAD DEMO FLEET
+            <span className="px-1.5 py-0.5 border border-cyan-800/70 text-[9px] tracking-[0.15em] text-cyan-500 font-mono">DEMO</span>
+          </button>
+        )}
       </div>
       <div className="mt-11 w-full max-w-3xl">
         <div className="font-heading text-xs tracking-[0.35em] text-cyan-600 font-bold text-center mb-3">SELECT WORKSPACE</div>
         <div className="flex flex-wrap justify-center gap-2">
           {workspaces.map((w) => (
-            <WorkspaceTile key={w.id} ws={w} chip active={activeId === w.id} onSelect={onSelectWorkspace} onRename={onRenameWorkspace} onDelete={deletable} />
+            // F-OBS-4 (M7): chip is selection-only — rename/delete live on the panel
+            // tiles, so no dead onRename/onDelete props here (WorkspaceTile chip branch).
+            <WorkspaceTile key={w.id} ws={w} chip active={activeId === w.id} onSelect={onSelectWorkspace} />
           ))}
           <button
             onClick={onAddWorkspace}

@@ -1,3 +1,7 @@
+// F-OBS-4: UNMOUNTED from the Home rail — the values fed to this widget were hardcoded
+// fakes (SESSION_ID constant, module-load Date.now() start, running always true → dead
+// PAUSED branch). Kept for a future real session-metadata source; do not remount until
+// the bridge contract exposes one (NEEDS-BACKEND; docs/proposals/SYNTHESIS.md §3).
 import React, { useState, useEffect } from "react";
 
 function formatDuration(start) {

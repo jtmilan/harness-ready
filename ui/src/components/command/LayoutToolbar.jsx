@@ -3,7 +3,7 @@ import { Square, LayoutGrid, Columns3, Maximize2 } from "lucide-react";
 
 // Layout modes. Keys match what Lane 1 / the coordinator switch on in Home.
 const MODES = [
-  { key: "single", icon: Square, title: "Single pane (⌘G)" },
+  { key: "single", icon: Square, title: "Single pane" }, // F-OBS-4 (M5): ⌘G is zoom, not a layout mode — claim removed
   { key: "tile", icon: LayoutGrid, title: "Tile grid" },
   { key: "columns", icon: Columns3, title: "Columns" },
   { key: "focus", icon: Maximize2, title: "Focus" },

@@ -20,6 +20,9 @@ function App() {
             <Route path="/" element={<Home />} />
             <Route path="/monitoring" element={<Monitoring />} />
             {/* Add your page Route elements here */}
+            {/* F-OBS-4 (M6): pages/Login.jsx, Register.jsx, ForgotPassword.jsx, ResetPassword.jsx
+                are ORPHANED — unrouted here, and their base44.auth.* calls hit an offline stub
+                that accepts anything. Do not remount them without real auth + honesty tags (R9). */}
             <Route path="*" element={<PageNotFound />} />
           </Routes>
         </Suspense>

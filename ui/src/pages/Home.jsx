@@ -11,7 +11,6 @@ import LayoutToolbar from "@/components/command/LayoutToolbar";
 import AgentPane from "@/components/command/AgentPane";
 import AgentDirectory from "@/components/command/AgentDirectory";
 import WorkspacesPanel from "@/components/command/WorkspacesPanel";
-import SessionInfo from "@/components/command/SessionInfo";
 import CommandOverlay from "@/components/command/CommandOverlay";
 import BulkActionBar from "@/components/command/BulkActionBar";
 import TitleBar from "@/components/command/TitleBar";
@@ -21,8 +20,10 @@ import NewAgentOverlay from "@/components/command/NewAgentOverlay";
 import EmptyState from "@/components/command/EmptyState";
 import ConfirmOverlay from "@/components/command/ConfirmOverlay";
 
-const SESSION_ID = "00612425-38791089839";
-const SESSION_START = Date.now();
+// F-OBS-4: fake session constants removed (SESSION_ID "00612425-38791089839" was a
+// hardcoded string, SESSION_START a module-load Date.now(), and the RUNNING indicator
+// was always true). SessionInfo left unmounted until a real session-metadata source
+// exists on the bridge contract — NEEDS-BACKEND, see docs/proposals/SYNTHESIS.md §3.
 
 export default function Home() {
   const [agents, setAgents] = useState([]);
@@ -658,12 +659,15 @@ export default function Home() {
         <EmptyState
           onNewAgent={() => setOverlay("new-agent")}
           onTemplates={() => setOverlay("templates")}
+          activeCount={agents.length}
+          // F-OBS-4 (R3): demo fleet is a mock-bridge capability — the button renders
+          // only where loadDemoFleet actually exists (web preview), never in the Tauri
+          // shell, where it would be a fake affordance.
+          onLoadDemo={typeof bridge.loadDemoFleet === "function" ? () => bridge.loadDemoFleet() : undefined}
           workspaces={workspaces}
           activeId={activeWorkspace}
           onSelectWorkspace={setActiveWorkspace}
           onAddWorkspace={handleAddWorkspace}
-          onRenameWorkspace={handleRenameWorkspace}
-          onDeleteWorkspace={requestDeleteWorkspace}
         />
       ) : (
       <>
@@ -736,22 +740,24 @@ export default function Home() {
                   NO AGENTS IN THIS WORKSPACE
                 </div>
                 <div className="font-mono text-[11px] text-cyan-700/90 leading-relaxed">
-                  The fleet is at its concurrent-pane cap, so this workspace's spawns are queued
-                  or failed — watch for the toast. Close idle panes or raise the cap (Scheduler),
-                  or launch a template here.
+                  {/* F-OBS-4 (M3): copy gated on the REAL cap state — a bare empty
+                      workspace is not evidence of a cap, so don't claim one (R4). */}
+                  {atCap
+                    ? "The fleet is at its concurrent-pane cap, so this workspace's spawns are queued or failed — watch for the toast. Close idle panes or raise the cap (Scheduler), or launch a template here."
+                    : "No agents are assigned to this workspace yet. Spawn or move a pane here, or launch a template."}
                 </div>
               </div>
             </div>
           )}
         </div>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-[1fr_1.3fr_1.3fr_1fr] gap-4 p-4 pt-0 h-64 shrink-0">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-[1fr_1.3fr_1.3fr] gap-4 p-4 pt-0 h-64 shrink-0">
         <AgentDirectory agents={agents} selectedId={selectedId} onSelect={handleSelect} />
         <PerformanceWidget trend={trend} agents={agents} />
         <WorkspacesPanel workspaces={workspaces} activeId={activeWorkspace} onSelect={setActiveWorkspace} onAdd={handleAddWorkspace} onRename={handleRenameWorkspace} onDelete={requestDeleteWorkspace} memberCounts={memberCounts} onToggleSharing={requestToggleSharing} />
-        {/* running is always true: fleet Pause was local-only and is gone; SessionInfo still
-            expects the prop (that file is out of this lane). */}
-        <SessionInfo sessionId={SESSION_ID} startTime={SESSION_START} running />
+        {/* F-OBS-4: SessionInfo removed from the rail — its id/uptime/running values were
+            hardcoded fakes (R4/R9). Re-mount only when a real session source lands
+            (NEEDS-BACKEND; SYNTHESIS §3). Rail re-gridded to 3 columns. */}
       </div>
       </>
       )}

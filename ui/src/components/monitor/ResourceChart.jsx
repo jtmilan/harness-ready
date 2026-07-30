@@ -13,7 +13,7 @@ export default function ResourceChart({ data }) {
   return (
     <div className="border border-cyan-800/70 bg-[#0A1219]">
       <div className="px-4 py-2.5 border-b border-cyan-800/70 bg-[#0C1720] font-heading font-bold tracking-[0.2em] text-sm text-cyan-300">
-        FLEET RESOURCE USAGE — LIVE
+        FLEET RESOURCE USAGE — SIMULATED (pending R-OBS)
       </div>
       <div className="p-4 h-72">
         <ResponsiveContainer width="100%" height="100%">
