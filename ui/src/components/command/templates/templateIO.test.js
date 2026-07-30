@@ -109,3 +109,35 @@ describe("parseImportPayload edges", () => {
     expect(r.errors[0]).toMatch(/too many/);
   });
 });
+
+describe("recipe fields (F-ONB-1: playbook + advisory recommended)", () => {
+  it("validateOneTemplate carries playbook + recommended, caps playbook, drops empties", () => {
+    const r = validateOneTemplate({
+      name: "r", agents: [{ role: "builder" }],
+      playbook: "  1. read AGENTS.md\n2. run tests  ",
+      recommended: { autonomy: "semi", priority: "" },
+    });
+    expect(r.template.playbook).toBe("1. read AGENTS.md\n2. run tests");
+    expect(r.template.recommended).toEqual({ autonomy: "semi" });
+    const capped = validateOneTemplate({ name: "r", playbook: "x".repeat(5000) });
+    expect(capped.template.playbook.length).toBe(4000);
+    const none = validateOneTemplate({ name: "r", playbook: "   ", recommended: { autonomy: "" } });
+    expect(none.template).not.toHaveProperty("playbook");
+    expect(none.template).not.toHaveProperty("recommended");
+  });
+  it("buildExportBundle preserves playbook + recommended and strips empties", () => {
+    const b = buildExportBundle([
+      { name: "r", agents: [{ role: "builder" }], playbook: "do the thing", recommended: { priority: "high" } },
+      { name: "plain", agents: [{ role: "builder" }] },
+    ]);
+    expect(b.templates[0].playbook).toBe("do the thing");
+    expect(b.templates[0].recommended).toEqual({ priority: "high" });
+    expect(b.templates[1]).not.toHaveProperty("playbook");
+    expect(b.templates[1]).not.toHaveProperty("recommended");
+  });
+  it("import round-trips a recipe bundle", () => {
+    const r = parseImportPayload(JSON.stringify({ schema: 1, templates: [{ name: "r", playbook: "steps", recommended: { autonomy: "full" } }] }));
+    expect(r.templates[0].playbook).toBe("steps");
+    expect(r.templates[0].recommended).toEqual({ autonomy: "full" });
+  });
+});

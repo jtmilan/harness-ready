@@ -11,14 +11,60 @@ export default function TemplateBuilder({ onSave, saving }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [rows, setRows] = useState([emptyRow()]);
+  // F-ONB-1 recipe fields: playbook = displayed guidance; recommended = advisory metadata.
+  const [playbook, setPlaybook] = useState("");
+  const [recPriority, setRecPriority] = useState("");
+  const [recAutonomy, setRecAutonomy] = useState("");
 
   const setRow = (i, patch) => setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   const valid = name.trim() && rows.length > 0 && rows.every((r) => r.role.trim());
+  const buildPayload = () => {
+    const recommended = {};
+    if (recPriority) recommended.priority = recPriority;
+    if (recAutonomy) recommended.autonomy = recAutonomy;
+    const data = { name: name.trim(), description: description.trim(), agents: coerceTemplateAgents(rows) };
+    if (playbook.trim()) data.playbook = playbook.trim();
+    if (recommended.priority || recommended.autonomy) data.recommended = recommended;
+    return data;
+  };
 
   return (
     <div className="p-4 space-y-3 overflow-y-auto terminal-scroll max-h-[55vh]">
       <input value={name} onChange={(e) => setName(e.target.value)} placeholder="TEMPLATE NAME" className={inputCls} />
       <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="DESCRIPTION (optional)" className={inputCls} />
+      {/* F-ONB-1: optional recipe layer. Playbook is shown to the operator on launch (never
+          auto-applied); recommended autonomy/priority are ADVISORY metadata, labelled as such —
+          the backend does not enforce them (NEEDS-BACKEND), so we never claim it does. */}
+      <div className="space-y-1.5">
+        <div className="font-mono text-[11px] text-cyan-600">// recipe (optional) — a playbook turns this template into onboarding</div>
+        <textarea
+          value={playbook}
+          onChange={(e) => setPlaybook(e.target.value)}
+          rows={3}
+          placeholder={"FIRST-RUN STEPS / AUTONOMY GUIDANCE\nshown to the operator on launch · NOT auto-applied"}
+          className={inputCls + " resize-y"}
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <div className="space-y-1">
+            <div className="font-mono text-[9px] text-cyan-700">RECOMMENDED PRIORITY · <span className="text-amber-400/80">advisory only</span></div>
+            <select value={recPriority} onChange={(e) => setRecPriority(e.target.value)} title="Stored as operator guidance; the backend does not enforce it (NEEDS-BACKEND)" className={inputCls}>
+              <option value="">— none —</option>
+              <option value="low">LOW</option>
+              <option value="normal">NORMAL</option>
+              <option value="high">HIGH</option>
+            </select>
+          </div>
+          <div className="space-y-1">
+            <div className="font-mono text-[9px] text-cyan-700">RECOMMENDED AUTONOMY · <span className="text-amber-400/80">advisory only</span></div>
+            <select value={recAutonomy} onChange={(e) => setRecAutonomy(e.target.value)} title="Stored as operator guidance; the backend does not enforce it (NEEDS-BACKEND)" className={inputCls}>
+              <option value="">— none —</option>
+              <option value="supervised">SUPERVISED</option>
+              <option value="semi">SEMI-AUTO</option>
+              <option value="full">FULL AUTO</option>
+            </select>
+          </div>
+        </div>
+      </div>
       <div className="font-mono text-[11px] text-cyan-600">// agents in this team</div>
       {rows.map((row, i) => (
         <div key={i} className="flex gap-2 items-center">
@@ -57,7 +103,7 @@ export default function TemplateBuilder({ onSave, saving }) {
           <Plus className="w-3.5 h-3.5" /> ADD AGENT
         </button>
         <button
-          onClick={() => onSave({ name: name.trim(), description: description.trim(), agents: coerceTemplateAgents(rows) })}
+          onClick={() => onSave(buildPayload())}
           disabled={!valid || saving}
           className="ml-auto flex items-center gap-1.5 px-5 py-2 bg-cyan-400/15 border border-cyan-400 text-cyan-300 font-heading font-bold tracking-[0.15em] text-xs hover:bg-cyan-400/25 disabled:opacity-40 disabled:cursor-not-allowed"
         >
