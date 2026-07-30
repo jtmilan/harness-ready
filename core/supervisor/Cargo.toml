@@ -26,3 +26,9 @@ agent-teams-memory = { path = "../memory" }
 # a fresh worktree's claude pane doesn't block on the first-launch trust dialog). Needs a
 # real JSON parse to preserve the operator's existing config losslessly.
 serde_json = "1"
+
+# coordinator-gate-fix: `getsid(2)` at spawn — the PTY session id is the re-association
+# key that stays stable across an in-pane agent-CLI restart (the pid-ancestry gate key
+# does not). libc (not nix) keeps the dep surface minimal, matching the app crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -499,3 +499,63 @@ fn add_worktree_rejects_a_plain_dir_squatting_the_path() {
 
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+#[cfg(unix)]
+fn refresh_live_pid_rejects_session_mismatch() {
+    // Coordinator-gate-fix: the pane's PTY session id is captured at spawn; `refresh_live_pid`
+    // admits a new pid ONLY when the claimed session is known-equal to it, and REFUSES
+    // (leaving live_pid untouched → the gate falls through to refusal) on a cross-session
+    // claim, an unknown session, or a zero pid.
+    let dir = std::env::temp_dir().join(format!("at-sup-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = WorkspaceSpec {
+        id: "wssess".into(),
+        harness: Harness::Bash,
+        worktree: dir.clone(),
+        session_id: None,
+        resume: false,
+        role: None,
+        is_worker: false,
+        extra_dirs: vec![],
+        model: None,
+    };
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
+    let state = std::env::temp_dir().join("at-sup-state-sess");
+    // Bash skips injection entirely, so the sidecar path is never read (16-01).
+    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+
+    let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
+    let spawn_pid = sup.process_id().expect("the PTY child has a pid");
+    // portable-pty's child calls setsid → it LEADS its own session → getsid(child) == child pid
+    let sid = sup.session_id().expect("the session id is captured at spawn");
+    assert_eq!(sid, spawn_pid, "the PTY child leads its own session");
+    assert_eq!(sup.live_pid(), Some(spawn_pid), "live pid is init to the spawn pid");
+
+    // a same-session claim ADMITS → the live pid is replaced (the CLI-restart re-adopt path)
+    let restarted = std::process::id(); // any non-zero pid; refresh verifies the SESSION claim
+    sup.refresh_live_pid(restarted, Some(sid))
+        .expect("a same-session refresh is admitted");
+    assert_eq!(sup.live_pid(), Some(restarted));
+
+    // a cross-session claim REFUSES → live_pid untouched (fail closed)
+    assert_eq!(
+        sup.refresh_live_pid(4242, Some(sid + 1)),
+        Err(SessionMismatch),
+        "a cross-session refresh must be refused"
+    );
+    assert_eq!(
+        sup.live_pid(),
+        Some(restarted),
+        "a refused refresh leaves live_pid untouched"
+    );
+    // an UNKNOWN claimed session refuses (None/Some is not admissible)
+    assert_eq!(sup.refresh_live_pid(4242, None), Err(SessionMismatch));
+    // a zero pid refuses
+    assert_eq!(sup.refresh_live_pid(0, Some(sid)), Err(SessionMismatch));
+    assert_eq!(sup.live_pid(), Some(restarted));
+
+    sup.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
