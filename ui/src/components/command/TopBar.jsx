@@ -6,7 +6,7 @@ import { Megaphone, Network, Radio, LayoutTemplate, Plus, Power } from "lucide-r
 // `onBroadcast`, which opens the one-shot "send this text once" prompt.
 // Fleet Pause/Stop/Skip (playmode cluster) removed: Pause was local-only state, Stop was
 // an unconfirmed closeWorkspace duplicate of CLOSE WORKSPACE, Skip was a no-op stub.
-export default function TopBar({ activeCount, localWorking = 0, capMax = null, atCap = false, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace }) {
+export default function TopBar({ activeCount, needsYou = 0, live = 0, errors = 0, capMax = null, atCap = false, broadcastActive, onBroadcastToggle, onNewAgent, onBroadcast, onDelegate, onTemplates, onCloseWorkspace }) {
   return (
     <div className="flex items-center gap-6 px-5 py-4 border-b border-cyan-900/60 bg-[#0A0E13]">
       <button
@@ -55,8 +55,16 @@ export default function TopBar({ activeCount, localWorking = 0, capMax = null, a
         <LayoutTemplate className="w-4 h-4" /> TEMPLATES
       </button>
       <div className="ml-auto flex items-center gap-5">
-        <div className="font-heading tracking-[0.2em] text-lg font-bold text-cyan-300">
-          ACTIVE AGENTS: <span className="text-cyan-200">{activeCount}</span>
+        {/* C1 (F-OBS-4 honesty): "ACTIVE AGENTS: N" under-counted the fleet the operator must
+            attend to (it was the working-only count while blocked/needs_input panes were hidden).
+            Show LIVE / NEED YOU / WORKING — color reinforces the label, never replaces it (R8). */}
+        <div className="flex items-center gap-4 font-heading tracking-[0.18em] text-sm font-bold">
+          <span className="text-cyan-300 tabular-nums">{live} <span className="text-cyan-600">LIVE</span></span>
+          <span className="text-need tabular-nums">{needsYou} <span className="opacity-80">NEED YOU</span></span>
+          <span className="text-success tabular-nums">{activeCount} <span className="opacity-80">WORKING</span></span>
+          {errors > 0 && (
+            <span className="text-danger tabular-nums">{errors} <span className="opacity-80">ERROR</span></span>
+          )}
         </div>
         <button
           onClick={onCloseWorkspace}
