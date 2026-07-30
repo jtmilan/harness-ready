@@ -499,3 +499,151 @@ fn add_worktree_rejects_a_plain_dir_squatting_the_path() {
 
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+#[cfg(unix)]
+fn refresh_live_pid_rejects_session_mismatch() {
+    // Coordinator-gate-fix: the pane's PTY session id is captured at spawn; `refresh_live_pid`
+    // admits a new pid ONLY when the claimed session is known-equal to it, and REFUSES
+    // (leaving live_pid untouched → the gate falls through to refusal) on a cross-session
+    // claim, an unknown session, or a zero pid.
+    let dir = std::env::temp_dir().join(format!("at-sup-sess-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = WorkspaceSpec {
+        id: "wssess".into(),
+        harness: Harness::Bash,
+        worktree: dir.clone(),
+        session_id: None,
+        resume: false,
+        role: None,
+        is_worker: false,
+        extra_dirs: vec![],
+        model: None,
+    };
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
+    let state = std::env::temp_dir().join("at-sup-state-sess");
+    // Bash skips injection entirely, so the sidecar path is never read (16-01).
+    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+
+    let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
+    let spawn_pid = sup.process_id().expect("the PTY child has a pid");
+    // portable-pty's child calls setsid → it LEADS its own session → getsid(child) == child pid
+    let sid = sup.session_id().expect("the session id is captured at spawn");
+    assert_eq!(sid, spawn_pid, "the PTY child leads its own session");
+    assert_eq!(sup.live_pid(), Some(spawn_pid), "live pid is init to the spawn pid");
+
+    // a same-session claim ADMITS → the live pid is replaced (the CLI-restart re-adopt path)
+    let restarted = std::process::id(); // any non-zero pid; refresh verifies the SESSION claim
+    sup.refresh_live_pid(restarted, Some(sid))
+        .expect("a same-session refresh is admitted");
+    assert_eq!(sup.live_pid(), Some(restarted));
+
+    // a cross-session claim REFUSES → live_pid untouched (fail closed)
+    assert_eq!(
+        sup.refresh_live_pid(4242, Some(sid + 1)),
+        Err(SessionMismatch),
+        "a cross-session refresh must be refused"
+    );
+    assert_eq!(
+        sup.live_pid(),
+        Some(restarted),
+        "a refused refresh leaves live_pid untouched"
+    );
+    // an UNKNOWN claimed session refuses (None/Some is not admissible)
+    assert_eq!(sup.refresh_live_pid(4242, None), Err(SessionMismatch));
+    // a zero pid refuses
+    assert_eq!(sup.refresh_live_pid(0, Some(sid)), Err(SessionMismatch));
+    assert_eq!(sup.live_pid(), Some(restarted));
+
+    sup.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn foreground_pgid_tracks_the_pty_foreground_job() {
+    // Coordinator-gate-fix audit lock: `foreground_pgid()` (tcgetpgrp on the PTY master)
+    // reflects the pane's CURRENT foreground job — the equality key the gate's re-adopt
+    // admits on. Interactive bash on the PTY runs job control: a backgrounded job gets
+    // its OWN pgroup and is NOT the foreground; `fg` promotes it.
+    let dir = std::env::temp_dir().join(format!("at-sup-fgpgid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = WorkspaceSpec {
+        id: "wsfgpgid".into(),
+        harness: Harness::Bash,
+        worktree: dir.clone(),
+        session_id: None,
+        resume: false,
+        role: None,
+        is_worker: false,
+        extra_dirs: vec![],
+        model: None,
+    };
+    let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
+    let state = std::env::temp_dir().join("at-sup-state-fgpgid");
+    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+
+    let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
+    let bash_pid = sup.process_id().expect("the PTY child has a pid");
+
+    // FORCE job control: the bare `bash` the test harness spawns may not self-detect as
+    // interactive, and without job control background children SHARE the shell's pgroup
+    // (the fg/bg distinction this test asserts would not exist). `set -m` is deterministic.
+    sup.write(b"set -m\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // launch a BACKGROUND sleep + capture its pid
+    sup.write(b"sleep 45 & echo BGPID:$!\n").unwrap();
+    // PTY echo puts the command line (with the literal `BGPID:$!`) in the scrollback
+    // BEFORE the real output → parse the LAST line carrying a NUMERIC marker value.
+    fn last_marker(snapshot: &str, mark: &str) -> Option<u32> {
+        snapshot.lines().rev().find_map(|l| {
+            l.split(mark)
+                .nth(1)
+                .and_then(|n| n.trim().split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+        })
+    }
+    let start = Instant::now();
+    let mut job_pid: Option<u32> = None;
+    while start.elapsed() < Duration::from_secs(5) {
+        if let Some(p) = last_marker(&sup.snapshot(), "BGPID:") {
+            job_pid = Some(p);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let job_pid = job_pid.expect("the pane echoed the background pid");
+
+    // the background job's pgroup is NOT the pane's foreground group (bash keeps it)
+    let job_pgid = unsafe { libc::getpgid(job_pid as libc::pid_t) } as u32;
+    let fg = sup.foreground_pgid().expect("the PTY has a foreground group");
+    assert_ne!(
+        fg, job_pgid,
+        "a BACKGROUND job must not read as the pane's foreground group"
+    );
+    // the pane's foreground is the shell's own group while the job is backgrounded
+    let bash_pgid = unsafe { libc::getpgid(bash_pid as libc::pid_t) } as u32;
+    assert_eq!(fg, bash_pgid, "bash holds the foreground while the job is background");
+    // same PTY session either way (backgrounding does not change the session)
+    let job_sid = unsafe { libc::getsid(job_pid as libc::pid_t) } as u32;
+    assert_eq!(Some(job_sid), sup.session_id());
+
+    // promote the job → the foreground group flips to the job's pgroup
+    sup.write(b"fg %1\n").unwrap();
+    let start = Instant::now();
+    let mut flipped = false;
+    while start.elapsed() < Duration::from_secs(5) {
+        if sup.foreground_pgid() == Some(job_pgid) {
+            flipped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(flipped, "fg must promote the job to the pane's foreground group");
+
+    sup.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}

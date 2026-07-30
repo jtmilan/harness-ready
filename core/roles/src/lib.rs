@@ -299,23 +299,266 @@ pub fn resolve_role_from_ancestry(
     pid_roles: &HashMap<u32, Option<AgentRole>>,
     parent: impl Fn(u32) -> Option<u32>,
 ) -> Option<AgentRole> {
+    // DELEGATES to the diagnostic walk (coordinator-gate-fix): ONE body owns the walk
+    // semantics; this keeps the bare `Option` shape every existing call site + test uses.
+    resolve_role_from_ancestry_diag(peer_pid, pid_roles, parent).0
+}
+
+/// WHY an ancestry walk ended — the diagnostic reason code behind a gate miss (or the
+/// positive `TrackedMatch`). Exhaustive + unit-tested so a FORBIDDEN can name the exact
+/// failure mode instead of a bare unit error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AncestryOutcome {
+    /// The walk reached a pid that is a KEY in the tracked map. `matched_role` carries
+    /// that pane's stored role VERBATIM — including `None` (a tracked no-role pane stops
+    /// the walk exactly like the bare fn).
+    TrackedMatch,
+    /// The ppid chain ended (parent lookup `None`, or the defensive self/zero-parent
+    /// break) BEFORE reaching any tracked pid.
+    ChainExhausted,
+    /// The walk ran the full [`MAX_ANCESTRY_HOPS`] cap without reaching a tracked pid
+    /// (pid-reuse / cycle guard tripped).
+    MaxHops,
+    /// The tracked map was empty — the short-circuit, zero parent lookups performed.
+    EmptyMap,
+}
+
+impl fmt::Display for AncestryOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AncestryOutcome::TrackedMatch => "tracked-match",
+            AncestryOutcome::ChainExhausted => "chain-exhausted",
+            AncestryOutcome::MaxHops => "max-hops",
+            AncestryOutcome::EmptyMap => "empty-map",
+        })
+    }
+}
+
+/// The diagnostic record of ONE ancestry walk: enough for a FORBIDDEN reply (or an audit
+/// row) to name the peer, how far the walk got, where it stopped, and why. PURE output of
+/// [`resolve_role_from_ancestry_diag`] — the impure ppid lookup stays injected there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestryDiagnostics {
+    /// The socket peer pid the walk started at (or the caller's kernel-reported peer pid
+    /// when attached via [`Self::with_peer_pid`] on a walk-less refusal).
+    pub peer_pid: u32,
+    /// Pids VISITED (map probes), 1-based; 0 only on the [`AncestryOutcome::EmptyMap`]
+    /// short-circuit.
+    pub hops: usize,
+    /// The LAST pid the walk visited (the match on `TrackedMatch`; the chain end /
+    /// cap-stop otherwise).
+    pub terminal_pid: u32,
+    /// The tracked pane's role on [`AncestryOutcome::TrackedMatch`] (verbatim — may be
+    /// `None` for a tracked no-role pane); `None` on every miss reason. `reason`
+    /// disambiguates a tracked-`None` from an unmatched walk.
+    pub matched_role: Option<AgentRole>,
+    /// Why the walk ended.
+    pub reason: AncestryOutcome,
+    /// The pids the walk probed, in order (peer first). Lets a FORBIDDEN render the
+    /// actual chain; empty on the [`AncestryOutcome::EmptyMap`] short-circuit.
+    pub chain: Vec<u32>,
+    /// The workspace the refused op targeted, when the request carried one (attached by
+    /// the gate's call site via [`Self::with_workspace`]); `None` for ops with no single
+    /// target (e.g. broadcast) or before attachment.
+    pub workspace: Option<String>,
+}
+
+impl AncestryDiagnostics {
+    /// Attach the workspace the refused op targeted (the gate call site threads the
+    /// request's id / target through here so the FORBIDDEN names it).
+    pub fn with_workspace(mut self, wsid: impl Into<String>) -> Self {
+        self.workspace = Some(wsid.into());
+        self
+    }
+
+    /// Override the peer pid (a walk-less gate refusal still carries the kernel-reported
+    /// connecting pid).
+    pub fn with_peer_pid(mut self, pid: u32) -> Self {
+        self.peer_pid = pid;
+        self
+    }
+}
+
+impl fmt::Display for AncestryDiagnostics {
+    /// The one-line FORBIDDEN detail: names peer, workspace, resolved role, the probed
+    /// chain, and the miss reason — so a refusal is actionable without a second read of
+    /// the registry or the process table.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let role = self
+            .matched_role
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let ws = self.workspace.as_deref().unwrap_or("-");
+        let chain = self
+            .chain
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(
+            f,
+            "coordinator-gate refused: peer_pid={} workspace={} resolved_role={} chain=[{}] reason={}",
+            self.peer_pid, ws, role, chain, self.reason
+        )
+    }
+}
+
+/// The diagnostic ancestry walk behind [`resolve_role_from_ancestry`] (which delegates
+/// here): IDENTICAL walk semantics — first-tracked-ancestor wins verbatim, one memoized
+/// parent lookup per distinct pid, [`MAX_ANCESTRY_HOPS`] cap — plus the
+/// [`AncestryDiagnostics`] record of how it ended. Returns `(resolved_role, diag)`; the
+/// role is exactly what the bare fn returns.
+pub fn resolve_role_from_ancestry_diag(
+    peer_pid: u32,
+    pid_roles: &HashMap<u32, Option<AgentRole>>,
+    parent: impl Fn(u32) -> Option<u32>,
+) -> (Option<AgentRole>, AncestryDiagnostics) {
     if pid_roles.is_empty() {
-        return None;
+        return (
+            None,
+            AncestryDiagnostics {
+                peer_pid,
+                hops: 0,
+                terminal_pid: peer_pid,
+                matched_role: None,
+                reason: AncestryOutcome::EmptyMap,
+                chain: Vec::new(),
+                workspace: None,
+            },
+        );
     }
     let mut memo: HashMap<u32, Option<u32>> = HashMap::new();
     let mut cur = peer_pid;
+    let mut hops = 0usize;
+    let mut terminal = peer_pid; // the last pid PROBED (never an unvisited advance)
+    let mut chain: Vec<u32> = Vec::new(); // every probed pid, in walk order
+    let mut chain_ended = false;
     for _ in 0..MAX_ANCESTRY_HOPS {
+        hops += 1;
+        terminal = cur;
+        chain.push(cur);
         if let Some(role) = pid_roles.get(&cur) {
-            return *role;
+            return (
+                *role,
+                AncestryDiagnostics {
+                    peer_pid,
+                    hops,
+                    terminal_pid: cur,
+                    matched_role: *role,
+                    reason: AncestryOutcome::TrackedMatch,
+                    chain,
+                    workspace: None,
+                },
+            );
         }
         let p = *memo.entry(cur).or_insert_with(|| parent(cur));
         match p {
-            None => break,
-            Some(p) if p == cur || p == 0 => break, // defensive: no self/zero loop
+            None => {
+                chain_ended = true;
+                break;
+            }
+            Some(p) if p == cur || p == 0 => {
+                chain_ended = true; // defensive: no self/zero loop
+                break;
+            }
             Some(p) => cur = p,
         }
     }
-    None
+    (
+        None,
+        AncestryDiagnostics {
+            peer_pid,
+            hops,
+            terminal_pid: terminal,
+            matched_role: None,
+            reason: if chain_ended {
+                AncestryOutcome::ChainExhausted
+            } else {
+                AncestryOutcome::MaxHops
+            },
+            chain,
+            workspace: None,
+        },
+    )
+}
+
+/// The coordinator-only decision WITH its walk diagnostics: `Ok(())` iff the resolved
+/// role is `Coordinator`, else `Err(diag)` carrying the [`AncestryDiagnostics`] that
+/// explains the refusal (same admit rule as [`coordinator_gate`] — fail closed on `None`
+/// and every non-Coordinator role). The call site turns the diag into the FORBIDDEN
+/// detail + audit row; the boolean gate stays for callers that only need the bit.
+pub fn coordinator_gate_diag(
+    diag: AncestryDiagnostics,
+) -> Result<(), AncestryDiagnostics> {
+    match coordinator_gate(diag.matched_role) {
+        Ok(()) => Ok(()),
+        Err(()) => Err(diag),
+    }
+}
+
+// ───────────────────────── PTY-session matchers (coordinator-gate-fix) ─────────────────────────
+//
+// The ancestry walk keys on the agent-CLI pid, which DIES when the CLI restarts inside a
+// pane. The PTY SESSION id (`getsid` of the PTY child) survives that restart — the new CLI
+// is a descendant of the same PTY/session — so the gate can re-adopt a restarted
+// coordinator pane by session. These matchers are the PURE half (O(1) map lookup + an
+// equality rule); the impure `getsid`/`getpgid` reads live in the app/daemon socket
+// owners, which share ONE admit rule through these fns. Every unknown (a `None` session)
+// fails CLOSED — an admit requires positive identity on BOTH sides.
+
+/// Resolve a socket peer's owning-pane role by PTY session id (pure, O(1)): `pane_sessions`
+/// = {pane PTY session id → its role}; `peer_sid` = the peer's session (an injected
+/// `getsid` read). `None` peer session OR no pane owns that session → `None` → the gate
+/// refuses (fail closed). Unlike the ancestry walk this is NOT a first-tracked-ancestor
+/// search: a session is an EXACT identity key, so the lookup is a single map probe.
+pub fn resolve_role_from_session(
+    peer_sid: Option<u32>,
+    pane_sessions: &HashMap<u32, Option<AgentRole>>,
+) -> Option<AgentRole> {
+    peer_sid.and_then(|sid| pane_sessions.get(&sid).copied()).flatten()
+}
+
+/// The session admit rule: a peer is re-associatable to a pane IFF BOTH sessions are known
+/// and equal. ANY `None` (peer session unreadable, or a pane whose session was never
+/// captured) fails CLOSED — most pointedly `None`/`None` is NOT "both unknown, admit", it
+/// is "no identity on either side, refuse".
+pub fn session_admissible(peer_sid: Option<u32>, pane_session: Option<u32>) -> bool {
+    matches!((peer_sid, pane_session), (Some(a), Some(b)) if a == b)
+}
+
+/// The FULL re-association admit rule (coordinator-gate-fix): a peer re-joins a pane's
+/// identity IFF its PTY session matches ([`session_admissible`]) AND its process group is
+/// the pane's PTY FOREGROUND group (both known + equal). The session match proves "same
+/// PTY lineage, survives a CLI restart"; the foreground-pgroup match proves "the pane's
+/// current foreground job, not a backgrounded/daemonized runaway in the same session".
+/// Every unknown fails closed: a `None` on any of the four inputs → refuse. This is the
+/// PURE rule shared by the app + daemon socket owners; the impure `getsid`/`getpgid`/
+/// `TIOCGPGRP` reads stay at those call sites.
+pub fn admit_by_session_and_pgroup(
+    peer_sid: Option<u32>,
+    peer_pgid: Option<u32>,
+    pane_session: Option<u32>,
+    pane_fg_pgid: Option<u32>,
+) -> bool {
+    session_admissible(peer_sid, pane_session)
+        && matches!((peer_pgid, pane_fg_pgid), (Some(a), Some(b)) if a == b)
+}
+
+/// Resolve a socket peer's owning-pane role by session + foreground-pgroup re-association
+/// (the miss path behind the pid-ancestry walk, coordinator-gate-fix): the FIRST pane
+/// entry `(session, foreground pgid, role)` that [`admit_by_session_and_pgroup`] admits
+/// wins, returning its role VERBATIM — including `None` (a matched no-role pane stops the
+/// search and resolves `None` → the gate refuses), mirroring the ancestry walk's
+/// first-tracked-ancestor rule. No match → `None` → the gate refuses (fail closed).
+pub fn resolve_role_via_session_pgroup(
+    peer_sid: Option<u32>,
+    peer_pgid: Option<u32>,
+    panes: &[(Option<u32>, Option<u32>, Option<AgentRole>)],
+) -> Option<AgentRole> {
+    panes
+        .iter()
+        .find(|(sid, pgid, _)| admit_by_session_and_pgroup(peer_sid, peer_pgid, *sid, *pgid))
+        .and_then(|(_, _, role)| *role)
 }
 
 // ───────────────────── Role-prompt section library (ADE governance P1/P3/P4/P5) ─────────────────────
@@ -1007,6 +1250,224 @@ mod gate_tests {
         // parent(p) == p must not loop forever (the defensive self-loop break).
         let map = HashMap::from([(100u32, Some(AgentRole::Coordinator))]);
         assert_eq!(resolve_role_from_ancestry(7, &map, Some), None);
+    }
+}
+
+#[cfg(test)]
+mod diag_session_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn diag_delegation_is_parity_with_the_bare_walk() {
+        // The diagnostic walk IS the walk the bare fn delegates to: same resolution on
+        // hit + miss (the bare fn's `.0` projection of the pair).
+        let map = HashMap::from([(100u32, Some(AgentRole::Coordinator)), (300u32, None)]);
+        let parents = HashMap::from([(555u32, 444u32), (444u32, 100u32), (999u32, 300u32)]);
+        let lookup = |p: u32| parents.get(&p).copied();
+        for peer in [100u32, 555, 999, 12345] {
+            assert_eq!(
+                resolve_role_from_ancestry(peer, &map, lookup),
+                resolve_role_from_ancestry_diag(peer, &map, lookup).0,
+                "peer {peer}: bare fn must equal the diag walk's role"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_captures_the_tracked_match() {
+        let map = HashMap::from([(100u32, Some(AgentRole::Coordinator))]);
+        let parents = HashMap::from([(555u32, 100u32)]);
+        let (role, diag) =
+            resolve_role_from_ancestry_diag(555, &map, |p| parents.get(&p).copied());
+        assert_eq!(role, Some(AgentRole::Coordinator));
+        assert_eq!(diag.peer_pid, 555);
+        assert_eq!(diag.hops, 2, "visited 555 (miss) then 100 (hit)");
+        assert_eq!(diag.terminal_pid, 100);
+        assert_eq!(diag.matched_role, Some(AgentRole::Coordinator));
+        assert_eq!(diag.reason, AncestryOutcome::TrackedMatch);
+        // a DIRECT hit is a one-hop match at the peer itself
+        let (_, direct) = resolve_role_from_ancestry_diag(100, &map, |_| panic!("no lookup"));
+        assert_eq!(direct.hops, 1);
+        assert_eq!(direct.terminal_pid, 100);
+        assert_eq!(direct.reason, AncestryOutcome::TrackedMatch);
+    }
+
+    #[test]
+    fn diag_tracked_none_role_is_a_match_not_a_miss() {
+        // A tracked pane with role None STOPS the walk (first-tracked-ancestor rule): the
+        // outcome is TrackedMatch with matched_role None — `reason` disambiguates it from
+        // an unmatched walk (which a bare `matched_role: None` alone could not).
+        let map = HashMap::from([(300u32, None)]);
+        let (role, diag) = resolve_role_from_ancestry_diag(300, &map, |_| None);
+        assert_eq!(role, None);
+        assert_eq!(diag.reason, AncestryOutcome::TrackedMatch);
+        assert_eq!(diag.matched_role, None);
+    }
+
+    #[test]
+    fn diag_chain_captured_on_miss() {
+        // A miss records the peer, every hop visited, the chain-end pid, and WHY: the
+        // chain exhausted (parent lookup None) before any tracked pid.
+        let map = HashMap::from([(100u32, Some(AgentRole::Coordinator))]); // non-empty, unreachable
+        let parents = HashMap::from([(9u32, 8u32), (8u32, 7u32)]); // 7 → no parent
+        let (role, diag) =
+            resolve_role_from_ancestry_diag(9, &map, |p| parents.get(&p).copied());
+        assert_eq!(role, None);
+        assert_eq!(diag.peer_pid, 9);
+        assert_eq!(diag.hops, 3, "visited 9, 8, 7 — each a map miss");
+        assert_eq!(diag.terminal_pid, 7, "the walk stopped at the chain end");
+        assert_eq!(diag.matched_role, None);
+        assert_eq!(diag.reason, AncestryOutcome::ChainExhausted);
+        // the self-parent break is ALSO chain-exhausted (a defensive end, not a cap stop)
+        let (_, selfp) = resolve_role_from_ancestry_diag(5, &map, Some);
+        assert_eq!(selfp.reason, AncestryOutcome::ChainExhausted);
+        assert_eq!(selfp.terminal_pid, 5);
+    }
+
+    #[test]
+    fn diag_empty_map_short_circuits_with_zero_hops() {
+        let map: HashMap<u32, Option<AgentRole>> = HashMap::new();
+        let calls = Cell::new(0u32);
+        let (role, diag) = resolve_role_from_ancestry_diag(42, &map, |_| {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(role, None);
+        assert_eq!(diag.reason, AncestryOutcome::EmptyMap);
+        assert_eq!(diag.hops, 0, "empty map → zero map probes");
+        assert_eq!(diag.terminal_pid, 42, "terminal is the peer itself");
+        assert_eq!(calls.get(), 0, "empty map → zero parent lookups");
+    }
+
+    #[test]
+    fn diag_beyond_hop_cap_reports_max_hops() {
+        // A chain longer than the cap whose only tracked pid is unreachable: the walk
+        // runs exactly MAX_ANCESTRY_HOPS probes, then stops on the cap (NOT chain end).
+        let far = (MAX_ANCESTRY_HOPS as u32) + 50;
+        let map = HashMap::from([(far, Some(AgentRole::Coordinator))]);
+        let (role, diag) = resolve_role_from_ancestry_diag(1, &map, |p| Some(p + 1));
+        assert_eq!(role, None);
+        assert_eq!(diag.hops, MAX_ANCESTRY_HOPS);
+        assert_eq!(diag.reason, AncestryOutcome::MaxHops);
+        assert_eq!(
+            diag.terminal_pid,
+            MAX_ANCESTRY_HOPS as u32,
+            "the last pid visited is peer + (cap - 1)"
+        );
+    }
+
+    #[test]
+    fn coordinator_gate_diag_admits_coordinator_and_returns_the_diag_on_refusal() {
+        // Ok only on a resolved Coordinator; Err hands the SAME diag back so the caller
+        // can render workspace + chain (the admit rule is coordinator_gate's, verbatim).
+        let map = HashMap::from([
+            (1u32, Some(AgentRole::Coordinator)),
+            (2u32, Some(AgentRole::Builder)),
+            (3u32, None),
+        ]);
+        let ok = resolve_role_from_ancestry_diag(1, &map, |_| None).1;
+        assert!(coordinator_gate_diag(ok).is_ok());
+        for peer in [2u32, 3, 99] {
+            let diag = resolve_role_from_ancestry_diag(peer, &map, |_| None).1;
+            let err = coordinator_gate_diag(diag.clone())
+                .expect_err(&format!("peer {peer} must be refused"));
+            assert_eq!(err, diag, "the refusal returns the walk diag verbatim");
+        }
+    }
+
+    #[test]
+    fn diag_display_names_peer_workspace_role_chain_and_reason() {
+        // The FORBIDDEN detail contract: one actionable line.
+        let parents = HashMap::from([(555u32, 444u32), (444u32, 100u32)]);
+        let map = HashMap::from([(100u32, Some(AgentRole::Builder))]);
+        let (_, diag) = resolve_role_from_ancestry_diag(555, &map, |p| parents.get(&p).copied());
+        let line = diag.with_workspace("ws777x3").to_string();
+        assert_eq!(
+            line,
+            "coordinator-gate refused: peer_pid=555 workspace=ws777x3 resolved_role=builder \
+             chain=[555,444,100] reason=tracked-match"
+        );
+        // a miss renders its own reason + the probed chain, workspace "-" when untargeted
+        let (_, miss) = resolve_role_from_ancestry_diag(42, &map, |_| None);
+        let line = miss.to_string();
+        assert!(line.contains("peer_pid=42"));
+        assert!(line.contains("workspace=-"));
+        assert!(line.contains("resolved_role=none"));
+        assert!(line.contains("chain=[42]"));
+        assert!(line.contains("reason=chain-exhausted"));
+        // with_peer_pid overrides (a walk-less refusal carries the kernel peer)
+        assert!(miss.with_peer_pid(9).to_string().contains("peer_pid=9"));
+    }
+
+    #[test]
+    fn session_admissible_none_none_is_closed() {
+        // The load-bearing fail-closed rule: no identity on EITHER side is a refusal —
+        // None/None is NOT "both unknown, admit".
+        assert!(
+            !session_admissible(None, None),
+            "None/None MUST fail closed"
+        );
+        assert!(!session_admissible(Some(7), None), "unknown pane session → refuse");
+        assert!(!session_admissible(None, Some(7)), "unknown peer session → refuse");
+        assert!(!session_admissible(Some(7), Some(8)), "distinct sessions → refuse");
+        assert!(session_admissible(Some(7), Some(7)), "equal known sessions → admit");
+    }
+
+    #[test]
+    fn foreground_pgroup_admit() {
+        // session match AND foreground-pgroup match → admit (the restarted-CLI case: new
+        // pid, same session, the pane's current foreground job).
+        assert!(admit_by_session_and_pgroup(Some(9), Some(123), Some(9), Some(123)));
+    }
+
+    #[test]
+    fn background_pgroup_refuse() {
+        // same session but the peer is a BACKGROUND process (its pgid is not the pane's
+        // foreground group) → refuse — the whole point of the two-part rule.
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(555), Some(9), Some(123)));
+        // distinct sessions refuse even with an equal pgroup (cross-session collision).
+        assert!(!admit_by_session_and_pgroup(Some(8), Some(123), Some(9), Some(123)));
+        // ANY unknown fails closed.
+        assert!(!admit_by_session_and_pgroup(None, Some(123), Some(9), Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), None, Some(9), Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(123), None, Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(123), Some(9), None));
+        assert!(!admit_by_session_and_pgroup(None, None, None, None));
+    }
+
+    #[test]
+    fn resolve_role_via_session_pgroup_first_match_wins_verbatim() {
+        let panes = [
+            (Some(7u32), Some(70u32), Some(AgentRole::Builder)),
+            (Some(9u32), Some(90u32), Some(AgentRole::Coordinator)),
+            (Some(9u32), Some(91u32), None),
+        ];
+        assert_eq!(
+            resolve_role_via_session_pgroup(Some(9), Some(90), &panes),
+            Some(AgentRole::Coordinator)
+        );
+        // a matched NO-ROLE pane stops the search at None (walk semantics, NOT a skip)
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(91), &panes), None);
+        // no session/pgroup match → None (fail closed)
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(99), &panes), None);
+        assert_eq!(resolve_role_via_session_pgroup(None, Some(90), &panes), None);
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(90), &[]), None);
+    }
+
+    #[test]
+    fn resolve_role_from_session_is_an_exact_o1_lookup() {
+        let panes = HashMap::from([(10u32, Some(AgentRole::Coordinator)), (20u32, None)]);
+        assert_eq!(
+            resolve_role_from_session(Some(10), &panes),
+            Some(AgentRole::Coordinator)
+        );
+        // a tracked no-role session resolves None verbatim (stops the gate, like the walk)
+        assert_eq!(resolve_role_from_session(Some(20), &panes), None);
+        // no peer session / unknown session / empty map → None (fail closed)
+        assert_eq!(resolve_role_from_session(None, &panes), None);
+        assert_eq!(resolve_role_from_session(Some(99), &panes), None);
+        assert_eq!(resolve_role_from_session(Some(10), &HashMap::new()), None);
     }
 }
 

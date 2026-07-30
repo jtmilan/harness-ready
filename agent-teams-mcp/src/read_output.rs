@@ -52,7 +52,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use agent_teams_core::{
-    read_mcp_config, read_registry, validate_session_id, validate_spawn_id, LivenessSource,
+    read_mcp_config, read_registry, unified_liveness, validate_session_id, validate_spawn_id,
+    LivenessSource,
 };
 
 /// Default + hard cap on returned content bytes (the newest tail is kept). SSOT in
@@ -137,7 +138,8 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     let mut pane_is_live = reg_row.is_some();
     let (harness, repo, session_id) = reg_row.unwrap_or((None, None, None));
 
-    // Phase-0 reconciler (INERT by default): when reconcile_liveness is ON,
+    // Phase-0 reconciler (ON by default since the coordinator-gate-fix): when
+    // reconcile_liveness is ON,
     // widen `pane_is_live` to include disk-recent panes the registry omits.
     // The `reconcile_source` is carried for the none-path note (diagnostic).
     // Flag-OFF → this block is a no-op (pane_is_live stays registry-only).
@@ -359,18 +361,19 @@ fn live_scrollback_via_socket(state_dir: &Path, id: &str, cap: usize) -> Option<
 }
 
 /// Look up `(harness, repo, session_id)` for a pane id from the live registry.
-/// `None` when the registry is absent/malformed or the id isn't live — the OUTER
-/// Option IS the pane-liveness signal the gap-7 live-scrollback attempt keys on.
-/// `session_id` is the pane's stable claude conversation id the app recorded at spawn
-/// (C1) — it is the transcript FILENAME, so [`resolve`] can locate the transcript by
-/// session id regardless of the launch-cwd encoding of the project dir. It is
-/// REGISTRY-SOURCED (never caller-supplied), preserving the traversal-proof contract.
+/// `None` when the registry is absent/malformed/STALE (dead owner — coordinator-gate-fix
+/// `unified_liveness`) or the id isn't live — the OUTER Option IS the pane-liveness
+/// signal the gap-7 live-scrollback attempt keys on. `session_id` is the pane's stable
+/// claude conversation id the app recorded at spawn (C1) — it is the transcript
+/// FILENAME, so [`resolve`] can locate the transcript by session id regardless of the
+/// launch-cwd encoding of the project dir. It is REGISTRY-SOURCED (never caller-supplied),
+/// preserving the traversal-proof contract.
 #[allow(clippy::type_complexity)]
 fn registry_lookup(
     state_dir: &Path,
     id: &str,
 ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let reg = read_registry(state_dir)?;
+    let reg = unified_liveness(read_registry(state_dir)).registry?;
     let ws = reg.workspaces.iter().find(|w| w.id == id)?;
     Some((ws.harness.clone(), ws.repo.clone(), ws.session_id.clone()))
 }
@@ -917,8 +920,12 @@ mod tests {
         let id = "ws44-p3";
         // Registry lists the pane (pane_is_live true) but no report/transcript on disk; on the
         // default (non phase-b) build there is no live scrollback either ⇒ honest none.
+        // app_pid = THIS test process (LIVE): `unified_liveness` (coordinator-gate-fix)
+        // reads a registry owned by a DEAD pid as stale/empty, which would (correctly)
+        // flip this fixture to the absent path.
         let reg = format!(
-            r#"{{"schema":1,"app_pid":4242,"workspaces":[{{"id":"{id}","pid":5001,"harness":"claude"}}]}}"#
+            r#"{{"schema":1,"app_pid":{},"workspaces":[{{"id":"{id}","pid":5001,"harness":"claude"}}]}}"#,
+            std::process::id()
         );
         fs::write(root.join("agent-teams-live.json"), reg).unwrap();
         let r = resolve(&state, id, None);

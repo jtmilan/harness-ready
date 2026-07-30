@@ -51,8 +51,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use agent_teams_core::{
-    compute_queue_identified, list_workspaces, read_registry, sharing_enabled, ws_of_pane,
-    QueueRow,
+    compute_queue_identified, list_workspaces, read_registry, sharing_enabled, unified_liveness,
+    ws_of_pane, QueueRow,
 };
 
 /// PHASE B — the LIVE mutation tool surface (Unix-socket dial + wire protocol).
@@ -1337,24 +1337,27 @@ impl ServerHandler for TeamServer {
 ///   which may include stale workspaces; rows carry only the id-derived
 ///   `workspace` (role/tag omitted — the serde-additive contract).
 ///
-/// Known Phase-A approximation: a *crashed* app leaves a stale registry, so this
-/// can momentarily trust a dead set; event-gating means only ids that still have
-/// `events.jsonl` rows ever surface. Precise app-liveness lands in Phase B (over
-/// the socket). **Sidecar-side only** — the app writes the registry; we read it.
+/// Known Phase-A approximation, CLOSED by the coordinator-gate-fix: a *crashed* app
+/// leaves a stale registry; `unified_liveness` probes its `app_pid` and reads a DEAD
+/// owner as EMPTY (`stale_registry`), so a crashed app's live set can no longer mask
+/// the panes that survived it. **Sidecar-side only** — the app writes the registry;
+/// we read it.
 ///
-/// ## Phase-0 liveness reconciler (v1, INERT by default)
+/// ## Phase-0 liveness reconciler (ON by default since the coordinator-gate-fix)
 ///
-/// When `McpConfig.reconcile_liveness` is `true`, the registry's live set is
-/// reconciled with a disk signal (`recent_event_ids` — `events.jsonl` mtime
-/// within a TTL) via [`agent_teams_core::observed_live_ids`], so disk-only
-/// panes (absent from a stale/missing registry) are included in the queue.
-/// When `false` (the DEFAULT), the existing registry-only logic executes
-/// byte-for-byte — the reconciler is INERT.
+/// When `McpConfig.reconcile_liveness` is `true` (the DEFAULT since the gate-fix),
+/// the EFFECTIVE (post-`unified_liveness`) registry's live set is reconciled with a
+/// disk signal (`recent_event_ids` — `events.jsonl` mtime within a TTL) via
+/// [`agent_teams_core::observed_live_ids`], so disk-only panes (absent from a
+/// stale/missing registry) are included in the queue — a stale registry narrows to
+/// empty, then the disk leg re-includes the recently-active ids. When `false`, the
+/// registry-only logic executes byte-for-byte.
 /// See docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md.
 fn identified_queue(state_dir: &Path) -> Vec<QueueRow> {
-    let registry = read_registry(state_dir);
+    // Coordinator-gate-fix: a registry owned by a DEAD app reads as empty + stale.
+    let registry = unified_liveness(read_registry(state_dir)).registry;
 
-    // Phase-0 reconciler (INERT by default): read the flag ONCE.
+    // Phase-0 reconciler: read the flag ONCE.
     // Flag-off → EXACT existing logic (registry-only, byte-for-byte).
     let cfg = agent_teams_core::read_mcp_config(state_dir);
     if !cfg.reconcile_liveness {

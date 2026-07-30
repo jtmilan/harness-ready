@@ -17,6 +17,7 @@ use state_adapter::inject::{
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -735,6 +736,19 @@ pub struct Supervisor {
     /// attribution so the fan-in can label each contribution by harness + model. `None`
     /// = account default (no `--model` pinned at spawn).
     pub model: Option<String>,
+    /// Coordinator-gate-fix: the PTY session id of the pane's PTY child (`getsid` of the
+    /// child pid), captured ONCE at spawn. Unlike the agent-CLI pid (the gate's ancestry
+    /// key, which DIES when the CLI restarts inside the pane), the session id is STABLE
+    /// across that restart — the restarted CLI is still a descendant of this same PTY
+    /// session — so it is the gate's re-association key on an ancestry miss. `None` =
+    /// unknown (backend gave no pid, or `getsid` failed) → every session re-association
+    /// fails CLOSED (`roles::session_admissible` admits only known-equal sessions).
+    session_id: Option<u32>,
+    /// Coordinator-gate-fix: the pane's CURRENT live child pid — initialized to the spawn
+    /// pid, replaced ONLY by [`Self::refresh_live_pid`] (which refuses a cross-session /
+    /// unknown-session write). `0` = unknown. Atomic so a stale-pane re-adopt can refresh
+    /// it through a `&self` snapshot borrow under the app's registry lock.
+    live_pid: AtomicU32,
     master: Box<dyn MasterPty + Send>, // kept for resize (sync PTY size to the UI terminal)
     child: Box<dyn Child + Send + Sync>,
     /// Shared with the reader thread so it can auto-answer terminal capability probes
@@ -1564,6 +1578,24 @@ fn login_shell() -> String {
     "bash".to_string()
 }
 
+/// The PTY session id (`getsid(2)`) of `pid` — the coordinator-gate-fix re-association
+/// key: the portable-pty child calls `setsid`, so it LEADS its own session and every
+/// process later spawned inside the pane (incl. a RESTARTED agent CLI) inherits that
+/// session id even though its pid is brand new. `None` on any error (ESRCH = the pid
+/// vanished between spawn and capture) → session re-association fails closed.
+#[cfg(unix)]
+fn child_session_id(pid: u32) -> Option<u32> {
+    // SAFETY: getsid(2) on a live just-spawned child pid; a pure syscall that returns
+    // the session id or -1 (errno set) — checked below.
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid > 0).then_some(sid as u32)
+}
+
+#[cfg(not(unix))]
+fn child_session_id(_pid: u32) -> Option<u32> {
+    None // no session notion → unknown → session re-association fails closed
+}
+
 impl Supervisor {
     /// Inject hooks (unless Bash test harness), open a PTY, spawn the harness in
     /// the worktree with `AGENT_TEAMS_STATE_DIR` set, and start draining output.
@@ -1967,6 +1999,13 @@ impl Supervisor {
         let child = pair.slave.spawn_command(cmd).map_err(io_err)?;
         drop(pair.slave); // let EOF propagate when the child exits
 
+        // Coordinator-gate-fix: capture the PTY session identity ONCE while the child pid
+        // is fresh (the session id — unlike the agent-CLI pid — survives an in-pane CLI
+        // restart, so it is the gate's re-association key on an ancestry miss). `None` on
+        // any failure → session re-association fails closed later, never a broken spawn.
+        let spawn_pid = child.process_id();
+        let session_id = spawn_pid.and_then(child_session_id);
+
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pair.master.take_writer().map_err(io_err)?));
@@ -2044,6 +2083,10 @@ impl Supervisor {
             // already keyed the permission flags off spec.is_worker.
             is_worker: spec.is_worker,
             model: spec.model.clone(),
+            // Coordinator-gate-fix: session identity captured above; live pid starts at
+            // the spawn pid (0 = unknown when the backend exposes no pid).
+            session_id,
+            live_pid: AtomicU32::new(spawn_pid.unwrap_or(0)),
             master: pair.master,
             child,
             writer,
@@ -2165,7 +2208,84 @@ impl Supervisor {
     pub fn child_pid(&self) -> Option<u32> {
         self.child.process_id()
     }
+
+    /// The pane's PTY session id captured at spawn (coordinator-gate-fix) — stable
+    /// across an in-pane agent-CLI restart. `None` = unknown → every session
+    /// re-association through this pane fails closed.
+    pub fn session_id(&self) -> Option<u32> {
+        self.session_id
+    }
+
+    /// The PTY master's raw fd (coordinator-gate-fix; unix only) — lets the app run the
+    /// re-adopt `TIOCGPGRP` check through the portable-pty-owned descriptor. `None` when
+    /// the backend exposes no fd → the caller must refuse the re-adopt (fail closed).
+    /// The fd is OWNED by `master` and valid for the Supervisor's life; the caller must
+    /// not close it.
+    #[cfg(unix)]
+    pub fn master_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.master.as_raw_fd()
+    }
+
+    /// The pane's PTY FOREGROUND process group (coordinator-gate-fix) — `tcgetpgrp` on
+    /// the master fd via portable-pty's `process_group_leader`. This is "the job
+    /// currently in front in this pane": the gate admits a re-association only when the
+    /// peer's own pgroup equals it (a background process in the same session is
+    /// refused). `None` on any failure (no foreground group / ioctl error) → the caller
+    /// must refuse (fail closed).
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        self.master
+            .process_group_leader()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+    }
+
+    /// The pane's CURRENT live child pid (coordinator-gate-fix): the spawn pid until a
+    /// session-verified [`Self::refresh_live_pid`] replaces it after an in-pane CLI
+    /// restart. `None` = unknown (backend exposed no pid at spawn).
+    pub fn live_pid(&self) -> Option<u32> {
+        match self.live_pid.load(Ordering::SeqCst) {
+            0 => None,
+            p => Some(p),
+        }
+    }
+
+    /// Replace the recorded live pid after a re-adopt verified the new process sits in
+    /// THIS pane's PTY session (coordinator-gate-fix: the CLI inside the pane restarted
+    /// under a new pid). FAIL CLOSED: the admit is `roles::session_admissible` — sessions
+    /// KNOWN and EQUAL on both sides — so a cross-session claim, an unknown claimed
+    /// session, a pane whose session was never captured, or a zero pid is refused with
+    /// [`SessionMismatch`] and `live_pid` left UNTOUCHED (the gate then falls through to
+    /// its existing refusal). `&self` (AtomicU32) so the app can refresh under a
+    /// snapshot borrow of the registry.
+    pub fn refresh_live_pid(
+        &self,
+        new_pid: u32,
+        claimed_session: Option<u32>,
+    ) -> Result<(), SessionMismatch> {
+        if new_pid == 0 || !roles::session_admissible(claimed_session, self.session_id) {
+            return Err(SessionMismatch);
+        }
+        self.live_pid.store(new_pid, Ordering::SeqCst);
+        Ok(())
+    }
 }
+
+/// The `refresh_live_pid` refusal (coordinator-gate-fix): the claimed session is not
+/// known-equal to the pane's spawn session (or the new pid is zero). The live pid is
+/// left UNTOUCHED — a failed re-association never widens the gate, it falls through to
+/// the existing refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionMismatch;
+
+impl std::fmt::Display for SessionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "live-pid refresh refused: claimed PTY session does not match the pane's spawn session",
+        )
+    }
+}
+
+impl std::error::Error for SessionMismatch {}
 
 /// Reset a (reused) worktree's branch back to `target` and remove untracked files,
 /// so a Bridge pane never starts on a STALE base (07-03 / D41, RC-2). DESTRUCTIVE:

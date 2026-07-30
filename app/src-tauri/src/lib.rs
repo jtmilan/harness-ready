@@ -1565,6 +1565,17 @@ fn do_spawn(state: &AppState, ps: &PendingSpawn) -> Result<(), String> {
     } else {
         &state.sidecar_bin
     };
+    // Coordinator-gate-fix regression lock: the pane's sidecar config must be baked with
+    // THIS app's OWN state root — `inject_mcp_config` renders `{{STATE_DIR}}` verbatim from
+    // the spawn parameter, so baking another install's root (the bug: a dev binary baking
+    // the prod path) makes the dev-spawned sidecar dial prod's socket, which never knew the
+    // workspace. `state.state_root` is `default_state_root()` captured at setup; re-resolve
+    // to prove they agree (debug builds only — zero release cost).
+    debug_assert_eq!(
+        state.state_root,
+        default_state_root(),
+        "spawn must inject the app's OWN state root (flavor isolation)"
+    );
     let sup = match Supervisor::spawn(&spec, &state.hooks_dir, &state.state_root, chosen_sidecar) {
         Ok(s) => s,
         Err(e) => {
@@ -2965,6 +2976,45 @@ fn reconcile_daemon_panes(state: tauri::State<AppState>) -> Result<Vec<String>, 
     reconcile_daemon_panes_inner(state.inner())
 }
 
+/// Coordinator-gate-fix (criterion 2): the panes the daemon STILL owns across this
+/// app's restart — the intersection of the prior run's live registry (a sibling file
+/// that survives the app) with the daemon's authoritative `ListLive`, via
+/// `partition_reattach` — the EXACT pure re-attach decision the reopen loop uses (ONE
+/// adoption rule, never two). Empty when: the daemon is down (transport failure ⇒
+/// fail-closed, never a false adopt), the daemon has no live panes, no prior registry
+/// exists, or it recorded no owner. App-local panes are absent from `ListLive` → never
+/// survive → never re-added (their PTY master died with the app).
+fn startup_daemon_survivors(state_root: &std::path::Path) -> Vec<LiveWorkspace> {
+    let live = match daemon_client::daemon_list_live(state_root) {
+        Ok(live) if !live.is_empty() => live,
+        _ => return Vec::new(),
+    };
+    startup_survivors_from(read_registry(state_root).as_ref(), &live)
+}
+
+/// The PURE adoption decision (unit-tested without a daemon socket): the rows of the
+/// prior registry that survive into the new run, given the daemon's live id set —
+/// every id `partition_reattach` decides `Reattach` (listed in the prior registry AND
+/// daemon-live AND an owner recorded), returned with its prior registry row verbatim.
+fn startup_survivors_from(
+    prev_registry: Option<&LiveRegistry>,
+    daemon_live: &[String],
+) -> Vec<LiveWorkspace> {
+    let Some(reg) = prev_registry else {
+        return Vec::new();
+    };
+    agent_teams_daemon::reattach::partition_reattach(reg, daemon_live)
+        .into_iter()
+        .filter(|(_, decision)| {
+            matches!(
+                decision,
+                agent_teams_daemon::reattach::ReattachDecision::Reattach { .. }
+            )
+        })
+        .filter_map(|(id, _)| reg.workspaces.iter().find(|w| w.id == id).cloned())
+        .collect()
+}
+
 /// Testable body of [`reconcile_daemon_panes`] (the command is a thin `state.inner()` wrapper).
 fn reconcile_daemon_panes_inner(state: &AppState) -> Result<Vec<String>, String> {
     // Gate on the DURABLE write-ahead store, NOT the live `daemon_spawn` routing flag. The daemon
@@ -3078,9 +3128,38 @@ fn set_active_workspace(state: tauri::State<AppState>, id: Option<String>) {
 }
 
 fn default_state_root() -> PathBuf {
+    // The flavor primitive (coordinator-gate-fix): ONE deterministic decision, in priority
+    // order — (1) the explicit `AGENT_TEAMS_STATE_DIR` escape hatch (Dev.app's baked
+    // LSEnvironment, or an operator override); (2) a DEBUG build (`tauri dev` / `cargo
+    // run`, `cfg!(debug_assertions)`) is a DEV install → the canonical dev sandbox, so a
+    // bare dev run can NEVER bake the prod root into its spawned sidecars (the bug:
+    // dev-spawned sidecars dialed prod's socket, which never knew the workspace); (3) the
+    // prod root. Deterministic code — NO per-machine config. (The plan's `env!("PROFILE")`
+    // is unavailable outside build scripts; `debug_assertions` is the same build-time
+    // signal, set by cargo for exactly the debug profile.) The socket + live registry are
+    // fixed-name SIBLINGS of this root, so a distinct root isolates them by construction
+    // (prod + dev coexist; the instance.lock flock can't false-collide).
     if let Ok(d) = std::env::var("AGENT_TEAMS_STATE_DIR") {
         return PathBuf::from(d);
     }
+    if cfg!(debug_assertions) {
+        return dev_state_root();
+    }
+    prod_state_root()
+}
+
+/// The canonical DEV state root — the ONE dev dir the scripts (scripts/dev.sh) + the
+/// Harness Ready Dev LSEnvironment bake agree on (coordinator-gate-fix port). NESTED
+/// under `harness-ready-dev/` so the fixed-name sibling files (MCP socket, live
+/// registry, HTTP port/token) land in `harness-ready-dev/`, NOT in `Application
+/// Support/` where they would collide with production's.
+fn dev_state_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/harness-ready-dev/state")
+}
+
+/// The prod state root (release builds without an env override).
+fn prod_state_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     // NESTED under harness-ready/ (one level below Application Support) so the fixed-name
     // SIBLINGS of state_root — agent-teams-mcp.sock, the live registry, persist/audit files —
@@ -6586,6 +6665,65 @@ fn parent_pid(pid: u32) -> Option<u32> {
     }
 }
 
+/// Whether `pid` is live right now (`kill(2)` signal-0 probe) — the staleness check
+/// behind the coordinator gate's pane re-adoption (coordinator-gate-fix). EPERM counts
+/// as ALIVE: the process EXISTS, it is merely not ours — a live pane pid must never be
+/// treated as stale and re-adopted over.
+#[cfg(all(unix, target_os = "macos"))]
+fn pid_alive_now(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) performs the existence/permission check with NO signal
+    // delivered; returns 0 (live), or -1 with errno (ESRCH dead / EPERM exists-not-ours).
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The PTY session id of `pid` (`getsid(2)`); `None` on any error (fail closed). The
+/// coordinator-gate-fix session identity: unlike the agent-CLI pid, it survives an
+/// in-pane CLI restart (the new CLI is a descendant of the same PTY session).
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_session_id(pid: u32) -> Option<u32> {
+    // SAFETY: getsid(2) on an existing pid; pure syscall, -1 + errno on error.
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid > 0).then_some(sid as u32)
+}
+
+/// The process group id of `pid` (`getpgid(2)`); `None` on any error (fail closed).
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_process_group(pid: u32) -> Option<u32> {
+    // SAFETY: getpgid(2) on an existing pid; pure syscall, -1 + errno on error.
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
+/// Re-adopt a pane whose recorded live pid is DEAD but whose PTY still has a foreground
+/// group (coordinator-gate-fix): the agent CLI inside the pane restarted under a new
+/// pid. Reads the PTY's CURRENT foreground pgid (`Supervisor::foreground_pgid`,
+/// tcgetpgrp on the master) and records it via `Supervisor::refresh_live_pid` — which
+/// ADMITS only when that foreground group's own session (`getsid`) is known-equal to
+/// the pane's spawn session, so a cross-session / unknown claim is REFUSED with the
+/// live pid left untouched → the gate then falls through to its existing refusal (fail
+/// closed). Panic-free pure syscalls on the pane's OWN pid + fd (the DaemonSups
+/// closure contract); best-effort — never fails the caller.
+#[cfg(all(unix, target_os = "macos"))]
+fn re_adopt_if_stale(sup: &Supervisor) {
+    let Some(stale) = sup.live_pid() else { return };
+    if pid_alive_now(stale) {
+        return; // the recorded pid is live — nothing stale to re-adopt
+    }
+    // Foreground group of the pane's PTY; an ioctl failure leaves live_pid untouched
+    // (fail closed — the gate falls through to refusal).
+    let Some(fg) = sup.foreground_pgid() else { return };
+    if sup.refresh_live_pid(fg, peer_session_id(fg)).is_ok() {
+        eprintln!(
+            "[agent-teams] coordinator-gate: re-adopted pane {} — stale live pid {} replaced by foreground pgid {}",
+            sup.id, stale, fg
+        );
+    }
+}
+
 /// PURE ancestry walk behind [`caller_pane_role`] — resolve a socket peer's role by walking
 /// its parent-pid chain (bounded to 32 hops — pid-reuse + cycle guard) until a pid matches a
 /// LIVE pane's harness child pid. `roles` = {harness child pid → role}; `parent` = the ppid
@@ -6597,27 +6735,69 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg_attr(not(all(unix, target_os = "macos")), allow(dead_code))] // prod caller is macOS-only
 // Thin wrapper over the shared pure ancestry walk in `core/roles` (SSOT with the daemon). NOTE the
 // arg order differs: the shared fn is `(peer_pid, pid_roles, parent)`; this app-local order is kept
-// so existing call sites/tests are unchanged.
+// so existing call sites/tests are unchanged. Returns the walk's DIAGNOSTICS too
+// (coordinator-gate-fix): the caller needs the outcome reason to decide whether a `None`
+// is a tracked-pane refusal (stop) or a miss (fall through to session re-association).
 fn resolve_caller_role_via_ancestry(
     pid_roles: &HashMap<u32, Option<roles::AgentRole>>,
     parent: impl Fn(u32) -> Option<u32>,
     peer_pid: u32,
-) -> Option<roles::AgentRole> {
-    roles::resolve_role_from_ancestry(peer_pid, pid_roles, parent)
+) -> (Option<roles::AgentRole>, roles::AncestryDiagnostics) {
+    roles::resolve_role_from_ancestry_diag(peer_pid, pid_roles, parent)
 }
 
-/// Resolve the coordinator-only gate's CALLER role: snapshot {harness child pid → role} for
-/// every live pane under the registry lock, then run the pure ancestry walk above with the
-/// `/bin/ps`-backed ppid lookup.
+/// Resolve the coordinator-only gate's CALLER role (coordinator-gate-fix):
+///  1. RE-ADOPT stale panes first: a pane whose recorded live pid died (the in-pane CLI
+///     restarted) but whose PTY still has a foreground group in its spawn session gets
+///     that foreground pgid recorded as its live pid ([`re_adopt_if_stale`], fail closed).
+///  2. FAST PATH: the pid-ancestry walk (semantics unchanged — first-tracked-ancestor
+///     wins verbatim, a tracked no-role pane stops the walk and REFUSES) — but keyed on
+///     the CURRENT live pid instead of the spawn-captured pid.
+///  3. MISS PATH: re-association by PTY session + foreground pgroup
+///     (`roles::resolve_role_via_session_pgroup`) — a restarted agent CLI has a new pid
+///     yet sits in the SAME PTY session as the pane's current foreground job. Admit
+///     requires positive session AND pgroup identity; any unknown fails closed. A
+///     harness that `setsid`s itself into a NEW session is NOT re-associatable and
+///     degrades to the ancestry-only behavior (today's, still fail closed).
 #[cfg(all(unix, target_os = "macos"))]
-fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::AgentRole> {
+fn caller_pane_role(
+    app: &tauri::AppHandle,
+    peer_pid: u32,
+) -> (Option<roles::AgentRole>, Option<roles::AncestryDiagnostics>) {
     let st = app.state::<AppState>();
+    // (1) re-adopt BEFORE building the walk map so a stale pane's fresh pgid is a key.
+    st.sups.with_map(|m| {
+        for sup in m.values() {
+            re_adopt_if_stale(sup);
+        }
+    });
+    // (2) ancestry walk keyed on the CURRENT live pid.
     let pid_roles: HashMap<u32, Option<roles::AgentRole>> = st.sups.with_map(|m| {
         m.values()
-            .filter_map(|sup| sup.process_id().map(|pid| (pid, sup.role)))
+            .filter_map(|sup| sup.live_pid().map(|pid| (pid, sup.role)))
             .collect()
     });
-    resolve_caller_role_via_ancestry(&pid_roles, parent_pid, peer_pid)
+    let (walked, diag) = resolve_caller_role_via_ancestry(&pid_roles, parent_pid, peer_pid);
+    if diag.reason == roles::AncestryOutcome::TrackedMatch {
+        // First-tracked-ancestor wins VERBATIM — a tracked no-role pane resolves None
+        // here and the gate refuses; it must NOT fall through to the session path.
+        // The diag rides back so the FORBIDDEN can name the chain (coordinator-gate-fix).
+        return (walked, Some(diag));
+    }
+    // (3) miss → session + foreground-pgroup re-association (restarted-CLI identity).
+    let peer_sid = peer_session_id(peer_pid);
+    let peer_pgid = peer_process_group(peer_pid);
+    let panes: Vec<(Option<u32>, Option<u32>, Option<roles::AgentRole>)> =
+        st.sups.with_map(|m| {
+            m.values()
+                .map(|sup| (sup.session_id(), sup.foreground_pgid(), sup.role))
+                .collect()
+        });
+    (
+        roles::resolve_role_via_session_pgroup(peer_sid, peer_pgid, &panes),
+        // the walk's miss diag still names peer + chain + reason on a refusal
+        Some(diag),
+    )
 }
 
 /// Mirror of [`caller_pane_role`]'s ancestry walk that returns the PANE ID whose harness
@@ -6891,12 +7071,36 @@ fn external_spawn_admit(allow_external_spawn: bool, op_allowed: bool, ancestry_m
 /// dispatched). Best-effort: a failed write never blocks the op. Sibling of the state
 /// root, mirroring the live registry / socket file placement.
 fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid: Option<u32>) {
-    let st = app.state::<AppState>();
-    let Some(parent) = st.state_root.parent() else { return };
-    let path = parent.join("agent-teams-external-mutations.jsonl");
-    // `details` carries op-specific structured fields (per-pane role/model/count for spawns)
-    // so the forensic trail records the SECURITY-relevant role, not just harness×count.
-    let (op, target, text, details): (&str, Option<String>, Option<String>, serde_json::Value) = match req {
+    let (op, target, text, details) = mutation_audit_fields(req);
+    write_mutation_audit_row(app, "external_orchestrator", op, target, text, details, None, peer_pid);
+}
+
+/// Coordinator-gate-fix: a DENIED mutation leaves an audit row too (written BEFORE the
+/// FORBIDDEN returns) — a denied attempt is exactly what a gate audit must show. Same
+/// file + row shape as [`audit_external_mutation`], `source` names the denial and the
+/// FORBIDDEN detail (peer + workspace + chain + reason) rides in `reason`.
+fn audit_denied_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid: Option<u32>, reason: &str) {
+    let (op, target, text, details) = mutation_audit_fields(req);
+    write_mutation_audit_row(
+        app,
+        "coordinator_gate_denied",
+        op,
+        target,
+        text,
+        details,
+        Some(reason.to_string()),
+        peer_pid,
+    );
+}
+
+/// The per-op audit fields shared by the admit + deny rows (coordinator-gate-fix
+/// extraction — one decomposition, never two). `details` carries op-specific structured
+/// fields (per-pane role/model/count for spawns) so the forensic trail records the
+/// SECURITY-relevant role, not just harness×count.
+fn mutation_audit_fields(
+    req: &SocketRequest,
+) -> (&'static str, Option<String>, Option<String>, serde_json::Value) {
+    match req {
         SocketRequest::SendInput { id, text } => ("send_input", Some(id.clone()), Some(text.clone()), serde_json::Value::Null),
         SocketRequest::Broadcast { text } => ("broadcast", None, Some(text.clone()), serde_json::Value::Null),
         SocketRequest::Orchestrate { goal, dispatch, target_workspace } => (
@@ -6937,7 +7141,26 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
             serde_json::json!({ "harness": harness, "role": role, "model": model }),
         ),
         _ => ("other", None, None, serde_json::Value::Null),
-    };
+    }
+}
+
+/// Append one audit row to `agent-teams-external-mutations.jsonl` (a sibling of the
+/// state root). `reason` rides only on denial rows (coordinator-gate-fix). Best-effort:
+/// a failed write never blocks the caller.
+#[allow(clippy::too_many_arguments)]
+fn write_mutation_audit_row(
+    app: &tauri::AppHandle,
+    source: &str,
+    op: &str,
+    target: Option<String>,
+    text: Option<String>,
+    details: serde_json::Value,
+    reason: Option<String>,
+    peer_pid: Option<u32>,
+) {
+    let st = app.state::<AppState>();
+    let Some(parent) = st.state_root.parent() else { return };
+    let path = parent.join("agent-teams-external-mutations.jsonl");
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -6964,13 +7187,14 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
     });
     let rec = serde_json::json!({
         "ts": ts,
-        "source": "external_orchestrator",
+        "source": source,
         "peer_pid": peer_pid,
         "op": op,
         "target": target,
         "text": text_snip,
         "details": details,
         "ws": ws,
+        "reason": reason,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
@@ -7782,9 +8006,50 @@ struct SocketGateCfg {
 // `SocketResponse` is the shared core wire enum returned all along this socket path; boxing the
 // Err here alone would diverge from every other SocketResponse-returning fn for no real gain.
 #[allow(clippy::result_large_err)]
+/// The workspace a socket op targets, when the request carries a single one — threaded
+/// into the FORBIDDEN diag (coordinator-gate-fix) so the refusal names it. `None` for
+/// ops with no single target (broadcast) or an absent optional scope. Pane ids embed
+/// their workspace (`${wsId}-p${idx}`), so a pane-scoped op names the pane verbatim —
+/// the prefix is derivable by the reader.
+fn req_workspace_hint(req: &SocketRequest) -> Option<&str> {
+    match req {
+        SocketRequest::SendInput { id, .. }
+        | SocketRequest::Focus { id }
+        | SocketRequest::Attach { id }
+        | SocketRequest::Detach { id }
+        | SocketRequest::ReadOutput { id, .. } => Some(id.as_str()),
+        SocketRequest::Orchestrate { target_workspace, .. } => target_workspace.as_deref(),
+        SocketRequest::Handoff { from, .. } => Some(from.as_str()),
+        SocketRequest::Delegate { parent_id, .. } => Some(parent_id.as_str()),
+        SocketRequest::AddPane { target_workspace, .. } => target_workspace.as_deref(),
+        SocketRequest::CreateWorkspace { tag, .. } => tag.as_deref(),
+        _ => None,
+    }
+}
+
+/// The coordinator-gate FORBIDDEN detail (coordinator-gate-fix): render the walk's
+/// [`roles::AncestryDiagnostics`] — peer pid, targeted workspace, resolved role, the
+/// probed pid chain, and the miss reason — when available; the legacy static message
+/// on the walk-less paths (non-macOS, unresolved peer).
+fn forbidden_detail(
+    caller_diag: Option<roles::AncestryDiagnostics>,
+    req: &SocketRequest,
+) -> String {
+    match caller_diag {
+        Some(mut d) => {
+            if let Some(ws) = req_workspace_hint(req) {
+                d = d.with_workspace(ws);
+            }
+            d.to_string()
+        }
+        None => "coordinator-only: the calling pane is not an AgentRole::Coordinator".to_string(),
+    }
+}
+
 fn gate_socket_request(
     cfg: SocketGateCfg,
     caller_role: Option<roles::AgentRole>,
+    caller_diag: Option<roles::AncestryDiagnostics>,
     ancestry_match: bool,
     req: &SocketRequest,
 ) -> Result<bool, SocketResponse> {
@@ -7817,9 +8082,12 @@ fn gate_socket_request(
         if admitted {
             external_admitted = true;
         } else {
+            // Coordinator-gate-fix: the FORBIDDEN NAMES the workspace + the peer's pid
+            // chain + the resolved role + the miss reason (the walk diag), so a refusal
+            // is actionable without a second registry / process-table read.
             return Err(SocketResponse::err(
                 response_code::FORBIDDEN,
-                "coordinator-only: the calling pane is not an AgentRole::Coordinator",
+                forbidden_detail(caller_diag, req),
             ));
         }
     }
@@ -7852,6 +8120,7 @@ fn handle_socket_request(
     app: &tauri::AppHandle,
     req: SocketRequest,
     caller_role: Option<roles::AgentRole>,
+    caller_diag: Option<roles::AncestryDiagnostics>,
     peer_pid: Option<u32>,
     caller_pane_id: Option<String>,
 ) -> SocketResponse {
@@ -7893,6 +8162,7 @@ fn handle_socket_request(
             allow_external_spawn: cfg.allow_external_spawn,
         },
         caller_role,
+        caller_diag,
         ancestry_match,
         &req,
     ) {
@@ -7901,7 +8171,15 @@ fn handle_socket_request(
         // happens in the CreateWorkspace/AddPane arms below).
         Ok(true) => audit_external_mutation(app, &req, peer_pid),
         Ok(false) => {}
-        Err(deny) => return deny,
+        // Coordinator-gate-fix: a DENIED mutation leaves an audit row too — the refusal
+        // is written BEFORE it returns (a denied attempt is exactly what a gate audit
+        // must show), carrying the same op fields as an admit + the FORBIDDEN detail.
+        Err(deny) => {
+            if deny.code == response_code::FORBIDDEN && op_requires_mutations(&req) {
+                audit_denied_mutation(app, &req, peer_pid, &deny.detail);
+            }
+            return deny;
+        }
     }
     match req {
         SocketRequest::SendInput { id, text } => {
@@ -13236,9 +13514,14 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                         #[cfg(not(target_os = "macos"))]
                         let peer_pid: Option<u32> = None;
                         #[cfg(target_os = "macos")]
-                        let caller_role = peer_pid.and_then(|pid| caller_pane_role(app, pid));
+                        let (caller_role, caller_diag) = match peer_pid {
+                            Some(pid) => caller_pane_role(app, pid),
+                            None => (None, None),
+                        };
                         #[cfg(not(target_os = "macos"))]
                         let caller_role: Option<roles::AgentRole> = None;
+                        #[cfg(not(target_os = "macos"))]
+                        let caller_diag: Option<roles::AncestryDiagnostics> = None;
                         // WORKSPACE-ISOLATION (Phase 1): mirror the role walk to recover the
                         // caller's PANE ID (and thus its workspace) from the same peer pid.
                         // None → external / reparented caller → the gate denies cross-ws writes.
@@ -13247,7 +13530,7 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                         #[cfg(not(target_os = "macos"))]
                         let caller_pane_id: Option<String> = None;
                         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_socket_request(app, req, caller_role, peer_pid, caller_pane_id)
+                            handle_socket_request(app, req, caller_role, caller_diag, peer_pid, caller_pane_id)
                         })) {
                             Ok(resp) => resp,
                             Err(payload) => {
@@ -13627,7 +13910,7 @@ fn serve_http_request(
             // caller_pane_id None, so both the coordinator gate, the external-orchestrator
             // path, AND the workspace-isolation gate refuse cross-ws writes (external
             // admission is UDS-only by construction; D1 hard-deny). Fail closed.
-            let resp = handle_socket_request(app, parsed, None, None, None);
+            let resp = handle_socket_request(app, parsed, None, None, None, None);
             let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
                 r#"{"ok":false,"code":"INTERNAL","message":"serialize failed"}"#.to_string()
             });
@@ -14010,6 +14293,19 @@ pub fn run() {
             // within-session only (D7): clear stale per-workspace event files from
             // prior runs so the queue reflects only sessions live in THIS process. SKIP on a
             // detected second instance so we don't clobber the first instance's state.
+            // Coordinator-gate-fix (criterion 2): BEFORE the wipe, capture which prior-run
+            // panes are still live in the daemon — the registry is a sibling (survives the
+            // wipe) and the daemon outlives the app. App-local panes never appear in
+            // `daemon_list_live` (their PTY master died with the prior app), so they are
+            // never re-added: post-restart the registry honestly reflects daemon-live /
+            // app-local-absent. Daemon down / transport failure ⇒ empty ⇒ nothing adopted
+            // (fail-closed, never a false adopt); skipped on a detected second instance
+            // (the first instance owns the registry).
+            let daemon_survivors: Vec<LiveWorkspace> = if single_instance {
+                startup_daemon_survivors(&state_root)
+            } else {
+                Vec::new()
+            };
             if single_instance {
                 let _ = std::fs::remove_dir_all(&state_root);
             } else {
@@ -14095,6 +14391,55 @@ pub fn run() {
                 // P3 LOOP: no loop tag at launch (loop_iteration stamps it per-fire).
                 delegate_loop_id: Mutex::new(String::new()),
             });
+
+            // Coordinator-gate-fix (criterion 2): re-adopt the daemon panes that
+            // survived the restart — registry rows, the ownership set, the write-ahead
+            // anchor, and an attach stream each — the SAME adoption reconcile_daemon_
+            // panes_inner performs on reopen, but IMMEDIATE, so the registry never
+            // reports empty while daemon panes live (the old gap: empty until the
+            // frontend's reopen loop happened to reconcile). App-local panes are
+            // deliberately NOT re-added (PTY master died with the app; get_workspace
+            // correctly returns null for them — honest, not contradictory).
+            if !daemon_survivors.is_empty() {
+                let st = app.state::<AppState>().inner();
+                let ids: Vec<String> = daemon_survivors.iter().map(|w| w.id.clone()).collect();
+                live_registry_update(st, |ws| {
+                    for row in &daemon_survivors {
+                        if !ws.iter().any(|w| w.id == row.id) {
+                            ws.push(row.clone());
+                        }
+                    }
+                });
+                {
+                    let mut owned = st
+                        .daemon_panes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for id in &ids {
+                        owned.insert(id.clone());
+                    }
+                }
+                {
+                    let _g = st
+                        .daemon_spawn_ahead_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut stored = daemon_ahead_read(&st.daemon_spawn_ahead);
+                    for id in &ids {
+                        if !stored.contains(id) {
+                            stored.push(id.clone());
+                        }
+                    }
+                    daemon_ahead_write(&st.daemon_spawn_ahead, &stored);
+                }
+                for id in &ids {
+                    ensure_daemon_stream(st, id);
+                }
+                eprintln!(
+                    "[agent-teams] re-adopted {} daemon pane(s) after restart: {ids:?}",
+                    ids.len()
+                );
+            }
 
             // ── 06-02 phase-b socket listener ──
             // Bind the Unix-domain mutation socket (sibling of state_root) on a
@@ -19508,7 +19853,7 @@ mod socket_seam_tests {
         for req in &gated {
             // Even a Coordinator caller is denied when mutations are off — the capability
             // gate comes FIRST, the role gate second.
-            let deny = gate_socket_request(cfg, Some(roles::AgentRole::Coordinator), false, req)
+            let deny = gate_socket_request(cfg, Some(roles::AgentRole::Coordinator), None, false, req)
                 .expect_err("mutations-off must deny");
             assert_eq!(deny.code, response_code::MUTATIONS_DISABLED, "{req:?}");
         }
@@ -19517,6 +19862,7 @@ mod socket_seam_tests {
         let deny = gate_socket_request(
             cfg,
             Some(roles::AgentRole::Coordinator),
+            None,
             false,
             &SocketRequest::SendInput { id: "w".into(), text: "y".into() },
         )
@@ -19652,7 +19998,7 @@ mod socket_seam_tests {
                         } else {
                             None
                         };
-                        let got = gate_socket_request(cfg, role, false, &req);
+                        let got = gate_socket_request(cfg, role, None, false, &req);
                         match expect {
                             None => assert!(
                                 got.is_ok(),
@@ -19688,7 +20034,7 @@ mod socket_seam_tests {
             let ext_spawn = op_external_spawn_allowed(&req);
             // Control axis armed only:
             let ctl_cfg = SocketGateCfg { allow_external_orchestrator: true, ..base };
-            let got = gate_socket_request(ctl_cfg, None, true, &req);
+            let got = gate_socket_request(ctl_cfg, None, None, true, &req);
             if op_requires_mutations(&req) {
                 if ext_ctl {
                     assert_eq!(got, Ok(true), "control-allowlisted op admits externally: {req:?}");
@@ -19704,7 +20050,7 @@ mod socket_seam_tests {
             }
             // Spawn axis armed only — spawn ops admit; control ops must NOT ride it:
             let spawn_cfg = SocketGateCfg { allow_external_spawn: true, ..base };
-            let got = gate_socket_request(spawn_cfg, None, true, &req);
+            let got = gate_socket_request(spawn_cfg, None, None, true, &req);
             if ext_spawn {
                 assert_eq!(got, Ok(true), "spawn-allowlisted op admits externally: {req:?}");
             } else if op_requires_mutations(&req) {
@@ -19722,11 +20068,62 @@ mod socket_seam_tests {
             };
             if op_requires_mutations(&req) || matches!(req, SocketRequest::ReadOutput { .. }) {
                 assert!(
-                    gate_socket_request(both, None, false, &req).is_err(),
+                    gate_socket_request(both, None, None, false, &req).is_err(),
                     "no pid-ancestry match ⇒ refused: {req:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn forbidden_carries_workspace_and_chain() {
+        // Coordinator-gate-fix: the coordinator FORBIDDEN carries the walk's diagnostic
+        // line — peer + targeted workspace + resolved role + probed chain + reason — not
+        // a bare static string, so a refusal is actionable.
+        let cfg = SocketGateCfg {
+            allow_mutations: true,
+            send_input_enabled: true,
+            allow_external_orchestrator: false,
+            allow_external_spawn: false,
+        };
+        // a Builder pane (end of a two-hop chain) tries to write a pane:
+        let diag = roles::AncestryDiagnostics {
+            peer_pid: 555,
+            hops: 2,
+            terminal_pid: 100,
+            matched_role: Some(roles::AgentRole::Builder),
+            reason: roles::AncestryOutcome::TrackedMatch,
+            chain: vec![555, 100],
+            workspace: None,
+        };
+        let deny = gate_socket_request(
+            cfg,
+            Some(roles::AgentRole::Builder),
+            Some(diag),
+            false,
+            &SocketRequest::SendInput { id: "ws77x2-p0".into(), text: "y".into() },
+        )
+        .expect_err("a non-coordinator must be refused");
+        assert_eq!(deny.code, response_code::FORBIDDEN);
+        assert_eq!(
+            deny.detail,
+            "coordinator-gate refused: peer_pid=555 workspace=ws77x2-p0 resolved_role=builder chain=[555,100] reason=tracked-match",
+            "the FORBIDDEN names the workspace + peer + role + chain + reason"
+        );
+        // a walk-less refusal (diag None — non-macOS / unresolved peer) keeps the legacy
+        // static message verbatim.
+        let deny = gate_socket_request(
+            cfg,
+            None,
+            None,
+            false,
+            &SocketRequest::Broadcast { text: "x".into() },
+        )
+        .expect_err("an unresolved caller is refused");
+        assert_eq!(
+            deny.detail,
+            "coordinator-only: the calling pane is not an AgentRole::Coordinator"
+        );
     }
 
     /// Deep-review item 21: the pure ancestry walk behind `caller_pane_role` — hit, miss,
@@ -19744,24 +20141,24 @@ mod socket_seam_tests {
         let parents: HashMap<u32, u32> = HashMap::from([(555, 444), (444, 100)]);
         let lookup = |p: u32| parents.get(&p).copied();
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 100),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 100).0,
             Some(roles::AgentRole::Coordinator)
         );
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 555),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 555).0,
             Some(roles::AgentRole::Coordinator),
             "descendant resolves through the ancestry walk"
         );
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 200),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 200).0,
             Some(roles::AgentRole::Builder)
         );
         // A tracked pane with no role resolves to None (→ coordinator_gate refuses).
-        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, lookup, 300), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, lookup, 300).0, None);
 
         // MISS: an ancestry that never reaches a tracked pid.
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, |_| None, 999),
+            resolve_caller_role_via_ancestry(&roles_map, |_| None, 999).0,
             None,
             "unresolvable peer → None (fail closed)"
         );
@@ -19771,7 +20168,7 @@ mod socket_seam_tests {
             *called.borrow_mut() += 1;
             None
         };
-        assert_eq!(resolve_caller_role_via_ancestry(&HashMap::new(), counting, 1), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&HashMap::new(), counting, 1).0, None);
         assert_eq!(*called.borrow(), 0, "empty role set → zero ppid lookups");
 
         // CYCLE: a↔b never resolves AND the memo caps lookups at one per distinct pid
@@ -19785,7 +20182,7 @@ mod socket_seam_tests {
                 _ => None,
             }
         };
-        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, cycle_lookup, 10), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, cycle_lookup, 10).0, None);
         assert_eq!(*cyc.borrow(), 2, "memoized: one lookup per DISTINCT pid, even cycling");
 
         // HOP-CAP: a chain longer than 32 hops never reaches the tracked pid at its end.
@@ -19796,7 +20193,7 @@ mod socket_seam_tests {
         let mut deep_roles: HashMap<u32, Option<roles::AgentRole>> = HashMap::new();
         deep_roles.insert(1040, Some(roles::AgentRole::Coordinator)); // 40 hops away
         assert_eq!(
-            resolve_caller_role_via_ancestry(&deep_roles, |p| long.get(&p).copied(), 1000),
+            resolve_caller_role_via_ancestry(&deep_roles, |p| long.get(&p).copied(), 1000).0,
             None,
             "beyond the 32-hop cap → refused"
         );
@@ -19804,7 +20201,7 @@ mod socket_seam_tests {
         let mut near_roles: HashMap<u32, Option<roles::AgentRole>> = HashMap::new();
         near_roles.insert(1010, Some(roles::AgentRole::Coordinator)); // 10 hops away
         assert_eq!(
-            resolve_caller_role_via_ancestry(&near_roles, |p| long.get(&p).copied(), 1000),
+            resolve_caller_role_via_ancestry(&near_roles, |p| long.get(&p).copied(), 1000).0,
             Some(roles::AgentRole::Coordinator)
         );
     }
@@ -19955,6 +20352,259 @@ mod socket_seam_tests {
         // (If catch_unwind propagated the panic the test binary would abort before here.)
         let proof_of_survival: u32 = 42;
         assert_eq!(proof_of_survival, 42, "thread survives: listener loop would keep accepting");
+    }
+}
+
+// ─────────────── coordinator-gate-fix: dual-install flavor isolation ────────────────
+//
+// Prod + dev installs coexist BY CONSTRUCTION: one deterministic `default_state_root`
+// decision (env escape hatch → debug PROFILE → dev sandbox → prod), and the socket +
+// live registry are fixed-name SIBLINGS of that root — so distinct roots yield distinct
+// sockets with zero renaming and the single-instance flock can't false-collide.
+#[cfg(test)]
+mod flavor_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn dev_prod_state_roots_differ_and_dev_is_nested() {
+        let dev = dev_state_root();
+        let prod = prod_state_root();
+        assert_ne!(dev, prod, "dev and prod must NEVER share a state root");
+        // the dev root is NESTED under harness-ready-dev/ so the fixed-name sibling
+        // files (socket, live registry) land INSIDE harness-ready-dev/, not Application
+        // Support/
+        assert_eq!(
+            dev.parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned()),
+            Some("harness-ready-dev".to_string()),
+            "dev root nested → siblings isolated from prod"
+        );
+        assert!(
+            prod.ends_with("Library/Application Support/harness-ready/agent-teams"),
+            "prod root unchanged (this fork's nested prod path)"
+        );
+    }
+
+    #[test]
+    fn socket_path_isolated_by_flavor() {
+        // the socket is a fixed-name SIBLING of state_root → distinct roots give
+        // distinct sockets by construction (the dual-install coexistence guarantee).
+        let dev_sock = agent_teams_core::socket_path(&dev_state_root()).unwrap();
+        let prod_sock = agent_teams_core::socket_path(&prod_state_root()).unwrap();
+        assert_ne!(dev_sock, prod_sock);
+        assert_ne!(
+            dev_sock.parent(),
+            prod_sock.parent(),
+            "the dev socket must NOT sit in prod's parent dir"
+        );
+    }
+
+    #[test]
+    fn default_state_root_is_the_dev_root_on_a_debug_build() {
+        // cargo test compiles a debug build (debug_assertions on) → the flavor primitive
+        // selects the dev sandbox (unless the env escape hatch is set — untestable
+        // without racing other tests' env reads, so skip that branch when present).
+        if std::env::var("AGENT_TEAMS_STATE_DIR").is_ok() {
+            return;
+        }
+        assert_eq!(
+            default_state_root(),
+            dev_state_root(),
+            "a debug build must default to the dev sandbox — never prod"
+        );
+    }
+}
+
+// ─────────────── coordinator-gate-fix: app-restart daemon re-adoption ────────────────
+//
+// An app restart wipes the in-memory pane set + rewrites an EMPTY live registry; daemon
+// panes OUTLIVE that (approach B). The startup adoption re-adds exactly the prior
+// registry rows the daemon still lists live — never app-local panes (their PTY master
+// died with the app).
+#[cfg(test)]
+mod daemon_restart_readopt_tests {
+    use super::*;
+
+    fn registry(json: &str) -> LiveRegistry {
+        serde_json::from_str(json).expect("valid LiveRegistry json")
+    }
+
+    #[test]
+    fn app_restart_readopts_daemon_pane() {
+        // prior registry: one app-local + one daemon-owned pane; the daemon still keeps
+        // the daemon-owned one live → exactly that row survives, verbatim.
+        let reg = registry(
+            r#"{"schema":1,"app_pid":111,"workspaces":[
+                {"id":"ws1-p0","harness":"claude"},
+                {"id":"ws2-p0","harness":"codex","repo":"/r"}]}"#,
+        );
+        let survivors = startup_survivors_from(Some(&reg), &["ws2-p0".to_string()]);
+        assert_eq!(survivors.len(), 1, "only the daemon-live pane survives");
+        assert_eq!(survivors[0].id, "ws2-p0");
+        assert_eq!(survivors[0].repo.as_deref(), Some("/r"), "the prior row rides verbatim");
+    }
+
+    #[test]
+    fn app_local_pane_not_reattached() {
+        let reg = registry(r#"{"schema":1,"app_pid":111,"workspaces":[{"id":"ws1-p0"}]}"#);
+        // the daemon lists NO live panes → the app-local pane is never re-added
+        assert!(startup_survivors_from(Some(&reg), &[]).is_empty());
+        // a daemon-live id that was NEVER in the prior registry is not adopted either
+        // (the GUI only acts on what it remembers)
+        assert!(startup_survivors_from(Some(&reg), &["ws9-p0".to_string()]).is_empty());
+        // no prior registry → nothing to adopt (fail closed)
+        assert!(startup_survivors_from(None, &["ws1-p0".to_string()]).is_empty());
+        // a registry with NO recorded owner → partition decides everything cold → empty
+        let no_owner = registry(r#"{"schema":1,"workspaces":[{"id":"ws1-p0"}]}"#);
+        assert!(startup_survivors_from(Some(&no_owner), &["ws1-p0".to_string()]).is_empty());
+    }
+}
+
+// ─────────────── coordinator-gate-fix: session re-association path ────────────────
+//
+// The lockout fix: a coordinator pane whose in-pane CLI restarted must keep the gate.
+// The PURE admit rule (session AND foreground-pgroup) is unit-tested in core/roles;
+// here the app's OWN wiring is locked — `pid_alive_now` staleness + the real-PTY
+// `re_adopt_if_stale` flow (stale live pid → PTY foreground pgid, session-verified) —
+// plus the fall-through composition (a tracked no-role pane must STOP at refusal, not
+// leak into the session path).
+#[cfg(all(test, unix, target_os = "macos"))]
+mod session_readopt_tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_now_reports_real_process_state() {
+        // the test process itself is trivially live; pid 0 is the sentinel "unknown"
+        // (never alive); a pid past the kernel's range is dead.
+        assert!(pid_alive_now(std::process::id()));
+        assert!(!pid_alive_now(0));
+        assert!(!pid_alive_now(0x7FFFEFFF));
+    }
+
+    #[test]
+    fn session_path_composition_admits_foreground_refuses_background_and_cross_session() {
+        // App-shaped pane snapshots (session, foreground pgid, role) as
+        // `caller_pane_role`'s miss path composes them, through the shared pure rule.
+        let coord = Some(roles::AgentRole::Coordinator);
+        let panes = [(Some(9u32), Some(123u32), coord)];
+        // a restarted CLI: new pid, SAME session, the pane's foreground job → admit
+        assert_eq!(
+            roles::resolve_role_via_session_pgroup(Some(9), Some(123), &panes),
+            Some(coord.unwrap()),
+            "same-session foreground peer resolves the pane role"
+        );
+        // a background process in the same session → refuse (the load-bearing check)
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(9), Some(555), &panes), None);
+        // a foreground process in ANOTHER session → refuse
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(8), Some(123), &panes), None);
+        // unreadable peer identity → refuse
+        assert_eq!(roles::resolve_role_via_session_pgroup(None, Some(123), &panes), None);
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(9), None, &panes), None);
+    }
+
+    #[test]
+    fn re_adopt_if_stale_replaces_a_dead_live_pid_with_the_verified_foreground_pgroup() {
+        // Real-PTY regression lock for the re-adopt path:
+        //  1. coordinator bash pane; 2. a background job stands in for a restarted CLI
+        //  and is recorded as the live pid (same session → `refresh_live_pid` admits);
+        //  3. that pid dies → `re_adopt_if_stale` must read the PTY's current foreground
+        //  pgid, verify its session, and record it — fail-closed on every check.
+        let dir = std::env::temp_dir().join(format!("at-app-readopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = WorkspaceSpec {
+            id: "wsreadopt".into(),
+            harness: Harness::Bash,
+            worktree: dir.clone(),
+            session_id: None,
+            resume: false,
+            role: Some(roles::AgentRole::Coordinator),
+            is_worker: false,
+            extra_dirs: vec![],
+            model: None,
+        };
+        let hooks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/hooks");
+        let state = std::env::temp_dir().join("at-app-readopt-state");
+        let sidecar = std::path::PathBuf::from("/unused/agent-teams-mcp");
+
+        let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
+        let bash_pid = sup.process_id().expect("the PTY child has a pid");
+        let session = sup.session_id().expect("session captured at spawn");
+
+        // deterministic job control (the bare test `bash` may not self-detect interactive)
+        sup.write(b"set -m\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // (2) a background sleep = the "restarted CLI": new pid, SAME session.
+        sup.write(b"sleep 45 & echo NEWPID:$!\n").unwrap();
+        // PTY echo puts the command line (literal `NEWPID:$!`) in the scrollback before
+        // the real output → parse the LAST line carrying a NUMERIC marker value.
+        fn last_marker(snapshot: &str, mark: &str) -> Option<u32> {
+            snapshot.lines().rev().find_map(|l| {
+                l.split(mark)
+                    .nth(1)
+                    .and_then(|n| n.trim().split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+            })
+        }
+        let start = std::time::Instant::now();
+        let mut new_pid: Option<u32> = None;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if let Some(p) = last_marker(&sup.snapshot(), "NEWPID:") {
+                new_pid = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let new_pid = new_pid.expect("the pane echoed the background job's pid");
+        assert_ne!(new_pid, bash_pid);
+        // same session → the session-verified refresh admits (the earlier adoption)
+        assert!(peer_session_id(new_pid) == Some(session));
+        sup.refresh_live_pid(new_pid, Some(session))
+            .expect("same-session refresh admits");
+        assert_eq!(sup.live_pid(), Some(new_pid));
+        // a live pid is NOT stale — re-adopt is a no-op
+        re_adopt_if_stale(&sup);
+        assert_eq!(sup.live_pid(), Some(new_pid));
+
+        // (3) kill the "CLI" → the live pid goes stale; bash reclaims the foreground.
+        unsafe { libc::kill(new_pid as libc::pid_t, libc::SIGKILL) };
+        let bash_pgid = peer_process_group(bash_pid);
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if sup.foreground_pgid() == bash_pgid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            sup.foreground_pgid(),
+            bash_pgid,
+            "bash reclaims the foreground after the job dies"
+        );
+
+        // the re-adopt: stale pid → foreground pgid, session-verified → recorded.
+        // POLL: a just-killed pid can read as "alive" while it is still an unreaped
+        // ZOMBIE (kill(0) succeeds on zombies) — the real gate re-adopts on the next
+        // connection attempt, once the shell has reaped; same contract here.
+        let start = std::time::Instant::now();
+        let mut readopted = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            re_adopt_if_stale(&sup);
+            if sup.live_pid() == bash_pgid {
+                readopted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            readopted,
+            "re-adopt records the session-verified foreground pgid once the stale pid is reaped"
+        );
+
+        sup.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
