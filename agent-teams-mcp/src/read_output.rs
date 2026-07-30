@@ -138,7 +138,8 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     let mut pane_is_live = reg_row.is_some();
     let (harness, repo, session_id) = reg_row.unwrap_or((None, None, None));
 
-    // Phase-0 reconciler (INERT by default): when reconcile_liveness is ON,
+    // Phase-0 reconciler (ON by default since the coordinator-gate-fix): when
+    // reconcile_liveness is ON,
     // widen `pane_is_live` to include disk-recent panes the registry omits.
     // The `reconcile_source` is carried for the none-path note (diagnostic).
     // Flag-OFF → this block is a no-op (pane_is_live stays registry-only).
@@ -919,8 +920,12 @@ mod tests {
         let id = "ws44-p3";
         // Registry lists the pane (pane_is_live true) but no report/transcript on disk; on the
         // default (non phase-b) build there is no live scrollback either ⇒ honest none.
+        // app_pid = THIS test process (LIVE): `unified_liveness` (coordinator-gate-fix)
+        // reads a registry owned by a DEAD pid as stale/empty, which would (correctly)
+        // flip this fixture to the absent path.
         let reg = format!(
-            r#"{{"schema":1,"app_pid":4242,"workspaces":[{{"id":"{id}","pid":5001,"harness":"claude"}}]}}"#
+            r#"{{"schema":1,"app_pid":{},"workspaces":[{{"id":"{id}","pid":5001,"harness":"claude"}}]}}"#,
+            std::process::id()
         );
         fs::write(root.join("agent-teams-live.json"), reg).unwrap();
         let r = resolve(&state, id, None);

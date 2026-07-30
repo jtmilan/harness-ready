@@ -773,6 +773,13 @@ fn default_true() -> Option<bool> {
     Some(true)
 }
 
+/// Serde default for [`McpConfig::reconcile_liveness`]: ON since the
+/// coordinator-gate-fix (the disk leg pairs with `unified_liveness` — a stale
+/// registry narrows to empty, the disk recency re-includes surviving panes).
+fn reconcile_liveness_default() -> bool {
+    true
+}
+
 /// Omit `strip_ansi` on the wire when it is the default (`true` / `None`).
 fn is_true_or_none(v: &Option<bool>) -> bool {
     v.unwrap_or(true)
@@ -2055,13 +2062,16 @@ pub struct McpConfig {
     /// `team_read_output` and `team_get_queue`/`identified_queue` reconcile the
     /// registry's "live" set with a disk signal (`events.jsonl` recency) so a
     /// stale/missing registry does not silently drop running panes from the
-    /// read/queue path. DEFAULT `false` — INERT: when off, the existing
-    /// registry-only logic is preserved byte-for-byte (the flag-off path is
-    /// the unchanged existing logic). See docs/REQUIRES-HUMAN-DESIGN-liveness-
-    /// blindness.md. v1 uses `events.jsonl` mtime only (no pid kill-0); state-
-    /// blind panes with no events fall back to registry trust. The flag is
-    /// PROVISIONAL pending human Q1–Q7. File-only; not LLM-settable.
-    #[serde(default)]
+    /// read/queue path. DEFAULT `true` since the coordinator-gate-fix (was
+    /// provisional-OFF pending human Q1–Q7): paired with `unified_liveness`
+    /// (a dead owner's registry narrows to EMPTY), the disk leg re-includes the
+    /// recently-active panes a crashed app left behind — the two halves of the
+    /// same liveness story. v1 uses `events.jsonl` mtime only (no pid kill-0);
+    /// state-blind panes with no events fall back to registry trust. File-only;
+    /// not LLM-settable; an explicit `false` in mcp-config.json restores the
+    /// byte-for-byte registry-only logic. See docs/REQUIRES-HUMAN-DESIGN-
+    /// liveness-blindness.md.
+    #[serde(default = "reconcile_liveness_default")]
     pub reconcile_liveness: bool,
     /// UNKNOWN-KEY PRESERVATION (Settings RMW safety): every key this build does not
     /// model — a NEWER build's gate, or an unrelated tool's sibling setting kept in the
@@ -2111,7 +2121,7 @@ impl Default for McpConfig {
             memory_harvest: false,
             memory_capture: false,
             ws_isolation_enabled: false,
-            reconcile_liveness: false,
+            reconcile_liveness: reconcile_liveness_default(),
             extra: serde_json::Map::new(),
         }
     }
@@ -2448,9 +2458,11 @@ pub struct IdentityProof {
 // Mismatch signal is intentionally not emitted in v1 (pid-probe is future work,
 // Q4/Q5). The flag is provisional pending human Q1–Q7; default OFF.
 //
-// OFF-BY-DEFAULT: the `reconcile_liveness` key in `McpConfig` defaults to `false`.
-// When OFF, the existing registry-only logic is preserved byte-for-byte — this
-// module's pure helpers are never invoked from the hot path.
+// ON-BY-DEFAULT since the coordinator-gate-fix (was provisional-OFF pending human
+// Q1–Q7): the `reconcile_liveness` key in `McpConfig` defaults to `true`. Paired
+// with `unified_liveness` (dead owner ⇒ registry reads as EMPTY), the disk leg
+// re-includes recently-active panes a crashed app left behind. An explicit `false`
+// restores the byte-for-byte registry-only logic.
 
 /// Where a pane's "observed live" signal came from (Phase-0 reconciler, v1).
 ///
@@ -3203,6 +3215,7 @@ mod tests {
                 tag: None,
                 session_id: None,
                 spawned_at: None,
+                allow_sharing: false,
             }],
         };
         // a LIVE owner (this test process) → passes through unchanged, not stale
