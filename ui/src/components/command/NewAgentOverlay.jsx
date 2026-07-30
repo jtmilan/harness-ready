@@ -5,6 +5,12 @@ import { AGENT_KINDS, KIND_IDS } from "@/lib/agentTypes";
 const inputCls = "w-full bg-[#081019] border border-cyan-800 text-cyan-200 font-mono text-sm px-3 py-2 focus:outline-none focus:border-cyan-400";
 const labelCls = "font-heading text-[10px] tracking-[0.3em] text-cyan-600 font-bold";
 
+// F-ORCH-1: closed role-cast presets. Selecting one sets the SAME `role` value the free-text
+// field edits, so it is a quick-set, not a second source of truth. The value is the pane's
+// registry role stamp (set_pane_roles) — what the queue / orchestrator / broker see — so it has
+// a REAL coordination effect (advisory persona, not a fake toggle). Custom roles still allowed.
+const ROLE_CAST = ["coordinator", "builder", "scout", "reviewer"];
+
 export default function NewAgentOverlay({ onLaunch, onClose }) {
   const [role, setRole] = useState("");
   const [kind, setKind] = useState("claude-code");
@@ -22,19 +28,40 @@ export default function NewAgentOverlay({ onLaunch, onClose }) {
       <div className="w-full max-w-lg bg-[#0A1219] border-2 border-cyan-400/70 shadow-[0_0_30px_rgba(0,229,255,0.25)]" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-cyan-800">
           <span className="font-heading font-bold tracking-[0.25em] text-cyan-300 text-sm">SPAWN NEW AGENT</span>
-          <button onClick={onClose} className="text-cyan-700 hover:text-cyan-300"><X className="w-4 h-4" /></button>
+          <button type="button" onClick={onClose} className="text-cyan-700 hover:text-cyan-300"><X className="w-4 h-4" /></button>
         </div>
         <div className="p-4 space-y-4">
           <div className="space-y-1.5">
-            <div className={labelCls}>ROLE / MISSION</div>
+            <div className={labelCls}>ROLE / MISSION · <span className="text-cyan-800">free override</span></div>
             <input
               autoFocus
               value={role}
               onChange={(e) => setRole(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && launch()}
-              placeholder="e.g. Refactor auth module"
+              placeholder="pick a cast below, or type a custom role"
               className={inputCls}
             />
+          </div>
+          <div className="space-y-1.5">
+            <div className={labelCls}>ROLE CAST · <span className="text-cyan-800">advisory persona stamp</span></div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+              {ROLE_CAST.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => setRole(c)}
+                  aria-pressed={role.toLowerCase() === c}
+                  title={`Set role to ${c} — stamped on the pane and read by the queue / orchestrator (advisory)`}
+                  className={`px-2 py-2 border font-heading text-[10px] font-bold tracking-[0.15em] uppercase transition-colors ${
+                    role.toLowerCase() === c
+                      ? "border-cyan-400 bg-cyan-400/15 text-cyan-200 shadow-[0_0_8px_rgba(0,229,255,0.3)]"
+                      : "border-cyan-900 text-cyan-700 hover:border-cyan-500 hover:text-cyan-300"
+                  }`}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
           </div>
           <div className="space-y-1.5">
             <div className={labelCls}>HARNESS</div>
@@ -42,6 +69,7 @@ export default function NewAgentOverlay({ onLaunch, onClose }) {
               {KIND_IDS.map((k) => (
                 <button
                   key={k}
+                  type="button"
                   onClick={() => setKind(k)}
                   className={`px-2 py-2 border font-heading text-[10px] font-bold tracking-[0.15em] transition-colors ${
                     kind === k
@@ -78,6 +106,7 @@ export default function NewAgentOverlay({ onLaunch, onClose }) {
             </div>
           </div>
           <button
+            type="button"
             onClick={launch}
             disabled={!role.trim()}
             className="w-full flex items-center justify-center gap-2 px-5 py-2.5 bg-cyan-400/15 border-2 border-cyan-400 text-cyan-300 font-heading tracking-[0.2em] text-sm font-bold shadow-[0_0_14px_rgba(0,229,255,0.3)] hover:bg-cyan-400/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
