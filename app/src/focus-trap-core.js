@@ -1,4 +1,4 @@
-// Agent Teams — modal focus-trap helpers (shared).
+// Harness Ready — modal focus-trap helpers (shared).
 //
 // Lifted out of main.js so the standalone wizard (wizard.js — imports NO Tauri/xterm)
 // can trap focus in its role=dialog exactly like the app's other 9 dialogs, without

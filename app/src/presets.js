@@ -1,4 +1,4 @@
-// Agent Teams — workspace presets (Phase 0: store only, no UI yet).
+// Harness Ready — workspace presets (Phase 0: store only, no UI yet).
 //
 // A Preset is a reusable workspace template: a named, per-pane list of harnesses
 // ("4 × Claude", "2 Claude + 2 Cursor") plus optional folder/seed-prompt. It is the

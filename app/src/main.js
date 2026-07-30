@@ -1,4 +1,4 @@
-// Agent Teams — frontend. One xterm Terminal PER workspace (no reset/replay on
+// Harness Ready — frontend. One xterm Terminal PER workspace (no reset/replay on
 // switch); PTY size synced to xterm only when it actually changes (no SIGWINCH
 // feedback loop). No bundler: ESM-vendored xterm + withGlobalTauri.
 import { Terminal } from "/vendor/xterm.mjs";
@@ -8588,7 +8588,7 @@ if (tauriEvent && tauriEvent.listen) {
 // own binary), so it's never automatic — "just don't close it" until I click.
 function showUpdate(version) {
   const sub = document.getElementById("up-sub");
-  if (sub) sub.textContent = version ? `Agent Teams v${version}` : "Agent Teams";
+  if (sub) sub.textContent = version ? `Harness Ready v${version}` : "Harness Ready";
   document.getElementById("update-card")?.classList.remove("hidden");
   document.getElementById("update-pill")?.classList.remove("hidden");
 }
