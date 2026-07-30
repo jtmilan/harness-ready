@@ -1,8 +1,8 @@
-//! Agent Teams — core queue projection (MCP Phase A).
+//! Harness Ready — core queue projection (MCP Phase A).
 //!
 //! A **read-only**, serde-able view of the cross-harness state adapter, sized to
 //! be the single home for the wire `QueueRow` (PRD §14 / `.paul/analysis/
-//! context-router-mcp.md`). The MCP sidecar (`agent-teams-mcp`) and — in a later
+//! context-router-mcp.md`). The MCP sidecar (`harness-ready-mcp`) and — in a later
 //! phase — the Tauri app's `list_queue` are meant to be thin callers of the
 //! functions here.
 //!
@@ -508,7 +508,7 @@ fn app_pid_alive(_pid: u32) -> bool {
 //
 // The Unix-domain socket path + wire protocol + config live HERE (beside
 // `registry_path`) so the **app-side binder** (`app/src-tauri/src/lib.rs`) and the
-// **sidecar dialer** (`agent-teams-mcp`) serialize the EXACT SAME definition and
+// **sidecar dialer** (`harness-ready-mcp`) serialize the EXACT SAME definition and
 // can never drift. Promoting these out of the sidecar's hand-defined copy is the
 // MUST-DO prerequisite the Phase-B skeleton doc-comments flag. These types are NOT
 // behind the `phase-b-mutations` feature: both crates always need the shape (only
@@ -1165,7 +1165,7 @@ pub fn external_orchestrator_pins(cfg: &McpConfig) -> Vec<String> {
 }
 
 /// Default returned-bytes cap for a [`SocketRequest::ReadOutput`] live-scrollback tail.
-/// MIRRORS the sidecar's `agent-teams-mcp/src/read_output.rs` disk-read default so the
+/// MIRRORS the sidecar's `harness-ready-mcp/src/read_output.rs` disk-read default so the
 /// two read surfaces (disk artifact vs live buffer) obey ONE tail contract.
 pub const READ_OUTPUT_DEFAULT_MAX_BYTES: usize = 65_536;
 
@@ -1830,7 +1830,7 @@ pub struct McpConfig {
     /// frontend human-confirm still apply. File-only; not LLM-settable.
     #[serde(default)]
     pub allow_external_spawn: bool,
-    /// EXTERNAL-SPAWN confirm bypass (#262 ext): default `false` ⇒ the Agent Teams app pops a
+    /// EXTERNAL-SPAWN confirm bypass (#262 ext): default `false` ⇒ the Harness Ready app pops a
     /// human Allow/Cancel before creating panes (the out-of-band intent gate the pid-pin can't
     /// give). Set `true` to spawn STRAIGHT THROUGH once `allow_external_spawn` is armed — the
     /// other guards (trusted-repo allowlist, no-bash harness allowlist, count cap, pid-pin,

@@ -1,4 +1,4 @@
-//! Agent Teams — PURE worker/harness logic extracted from the supervisor
+//! Harness Ready — PURE worker/harness logic extracted from the supervisor
 //! (Plan: feat/core-harness-extract). Dep-light: depends only on `state-adapter`
 //! (for `InjectHarness` in the harness descriptor) + std. NO portable-pty / roles /
 //! ringbuf here — those stay in the supervisor. The supervisor re-exports every

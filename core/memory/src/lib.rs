@@ -1,4 +1,4 @@
-//! Agent Teams — BridgeMemory note store (Mem-1, Phase 10 / D49).
+//! Harness Ready — BridgeMemory note store (Mem-1, Phase 10 / D49).
 //!
 //! A zero-dep (serde + std) note store targeting **pain #3 (context loss)**: the
 //! operator loses the thread of *why* a thing was decided across panes, restarts,

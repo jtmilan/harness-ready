@@ -3,13 +3,13 @@
 **Status:** Draft · **Date:** 2026-07-29 · **Companion docs:** `docs/PRD.md` (what/why), `docs/DESIGN-BRIEF.md` (UX/IA/visual).
 **How to read this:** each phase maps a PRD requirement to the exact crates/files it touches, in dependency order, with the test gate, an effort size, and an explicit **HD** (REQUIRES-HUMAN-DESIGN) flag where a phase crosses a mutation / schema / service boundary. Phases flagged HD **stop for a design note before any code** — that is a coordinator hard rule, not a scheduling nicety.
 
-> **Grounding.** Crate/file references below are read from the repo as it stands: the cargo workspace `core/{state-adapter, supervisor, harness, flywheel, mcp, daemon, task, ringbuf, memory, roles, agent}` + `agent-teams-mcp`, the Tauri shell `app/src-tauri`, and the React front-end `ui/` (shadcn/Vite, over `ui/src/lib/agentBridge.js` → `tauriAgentBridge.js`). [EXTRACTED: Cargo.toml, ui/HANDOFF.md.] The repo already uses git worktrees (`.agent-teams-worktrees/` exists at root), so per-slice isolation is available.
+> **Grounding.** Crate/file references below are read from the repo as it stands: the cargo workspace `core/{state-adapter, supervisor, harness, flywheel, mcp, daemon, task, ringbuf, memory, roles, agent}` + `harness-ready-mcp`, the Tauri shell `app/src-tauri`, and the React front-end `ui/` (shadcn/Vite, over `ui/src/lib/agentBridge.js` → `tauriAgentBridge.js`). [EXTRACTED: Cargo.toml, ui/HANDOFF.md.] The repo already uses git worktrees (`.agent-teams-worktrees/` exists at root), so per-slice isolation is available.
 
 ---
 
 ## 0. Operating rules (non-negotiable)
 
-1. **Test gate is read, never redefined.** The coordinator does not set or weaken the gate. Each phase runs the repo's *existing* canonical checks, discovered from config, not invented here: `cargo test --workspace` (core crates + `agent-teams-mcp`); the app shell's own suite (see `app/` — vitest per `app/vitest.config.js`, plus Playwright/visual tests under `app/tests-visual` + `app/playwright.config.js`); and the UI's `npx vitest run` + `vite build` (see `ui/package.json`, `ui/vitest.config.js`). Build via whatever entry the repo already documents (`app/README.md`, `ui/README.md`, `scripts/`); **do not add new build paths.** A phase is not done until the checks it affects are green *by these commands*.
+1. **Test gate is read, never redefined.** The coordinator does not set or weaken the gate. Each phase runs the repo's *existing* canonical checks, discovered from config, not invented here: `cargo test --workspace` (core crates + `harness-ready-mcp`); the app shell's own suite (see `app/` — vitest per `app/vitest.config.js`, plus Playwright/visual tests under `app/tests-visual` + `app/playwright.config.js`); and the UI's `npx vitest run` + `vite build` (see `ui/package.json`, `ui/vitest.config.js`). Build via whatever entry the repo already documents (`app/README.md`, `ui/README.md`, `scripts/`); **do not add new build paths.** A phase is not done until the checks it affects are green *by these commands*.
 2. **One logical slice per PR; human deep-review; never auto-merge; commit-on-ask.** "The AI wrote it" is not a justification — every change must be explainable in the PR.
 3. **Stay in file boundaries.** Debt spotted outside a phase's owned files is *filed as a note*, not silently fixed (Boy-Scout, not bulldozer).
 4. **No fake affordances** (Design Brief §1.2): ship a control only with its backing command/state.
@@ -40,7 +40,7 @@ Critical path = **0 → 1b** (honest liveness unlocks correct per-agent attribut
 
 ### Phase 0 — Close the trust gates (R-GATES) · **HD** · effort L
 - **Goal:** one source of liveness; branch info wires through. This unblocks honest monitoring and queue correctness.
-- **Owned files (indicative):** `app/src-tauri/src/lib.rs` (startup `live_registry_write` empty-clobber; multi-instance path), `core/mcp` (registry vs `sups` filter in `compute_queue_identified`), `core/daemon` (handlers liveness resolution), `agent-teams-mcp/src/read_output.rs` + `main.rs` (live-scrollback + queue membership), and the branch wire-through surface.
+- **Owned files (indicative):** `app/src-tauri/src/lib.rs` (startup `live_registry_write` empty-clobber; multi-instance path), `core/mcp` (registry vs `sups` filter in `compute_queue_identified`), `core/daemon` (handlers liveness resolution), `harness-ready-mcp/src/read_output.rs` + `main.rs` (live-scrollback + queue membership), and the branch wire-through surface.
 - **Stop condition:** produce/refresh `docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md` with the *chosen* single-source-of-liveness design (in-memory `sups` vs disk registry vs a reconciled view) and the multi-instance rule, **then** implement. Do not code from the investigation notes alone.
 - **Gate:** the existing read-only-form unit tests (`branch_name_args`, `is_readonly_git`, etc.) stay green; add a regression test that a pane alive to mutation is visible to the read/queue path; `cargo test --workspace`.
 - **Risk:** multi-instance footgun (Instance B clobbering Instance A's registry). Mitigation: design the instance-lock + registry-write ordering explicitly.
@@ -103,7 +103,7 @@ Critical path = **0 → 1b** (honest liveness unlocks correct per-agent attribut
 ### Phase 7 — Read-write shared-state MCP layer (R-MCP-RW) · **HD** · effort L · last
 - **Goal:** a BridgeMCP-*like* shared task/context layer agents can read **and** write under gates, complementing the current read-only `core/mcp` projection.
 - **Stop condition (HD):** this crosses the mutation boundary — design the write gate, the injection-safety of any agent-authored content, and the channel-A/B split **before** code. Mirror the existing `REQUIRES-HUMAN-DESIGN` convention and the broker's "mutations gated, read-only by default" model.
-- **Owned files (after design):** `core/mcp`, `core/task`, `core/supervisor`, `agent-teams-mcp`.
+- **Owned files (after design):** `core/mcp`, `core/task`, `core/supervisor`, `harness-ready-mcp`.
 - **Gate:** security-focused review (the `security` polyglot posture: enumerate untrusted inputs/sinks, fail closed); `cargo test --workspace`; no write path enabled by default.
 - **DoD:** writes are gated-OFF by default and armed only by an explicit human decision; read surface unchanged for existing consumers.
 
