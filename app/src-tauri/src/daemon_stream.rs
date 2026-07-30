@@ -52,7 +52,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agent_teams_core::{response_code, socket_path, SocketRequest, SocketResponse};
-use agent_teams_daemon::frames::{b64_decode, code, StreamFrame};
+use harness_ready_daemon::frames::{b64_decode, code, StreamFrame};
 use supervisor::{PaneBuffer, RETAIN_CAP};
 
 /// How long a reader `read` blocks before returning so the loop can re-check the stop flag
@@ -570,7 +570,7 @@ mod tests {
 
     static N: AtomicU32 = AtomicU32::new(0);
 
-    /// A temp dir whose CHILD is the state_root, so `socket_path` = `<dir>/agent-teams-mcp.sock`
+    /// A temp dir whose CHILD is the state_root, so `socket_path` = `<dir>/harness-ready-mcp.sock`
     /// stays under the macOS AF_UNIX ~104-byte path limit and is cleaned on drop.
     struct Scratch {
         dir: PathBuf,

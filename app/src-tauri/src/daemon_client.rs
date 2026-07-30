@@ -17,7 +17,7 @@
 //! the local `do_spawn` sentinel). NO behavior change on a default build.
 //!
 //! Implemented with `std` + `agent_teams_core` ONLY (the app already links core/mcp); it
-//! replicates the newline-JSON round-trip the sidecar uses (`agent-teams-mcp` `phase_b::socket`)
+//! replicates the newline-JSON round-trip the sidecar uses (`harness-ready-mcp` `phase_b::socket`)
 //! without depending on the sidecar crate.
 
 #![allow(dead_code)] // called only on the `daemon_spawn`-ON routing path.
@@ -205,11 +205,11 @@ mod tests {
         rx
     }
 
-    // A SHORT unique dir name keeps `<dir>/agent-teams-mcp.sock` under the macOS AF_UNIX
+    // A SHORT unique dir name keeps `<dir>/harness-ready-mcp.sock` under the macOS AF_UNIX
     // ~104-byte path limit (temp_dir is ~48 + the 21-char socket name).
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// A temp dir whose CHILD is the state_root, so `socket_path` = `<dir>/agent-teams-mcp.sock`
+    /// A temp dir whose CHILD is the state_root, so `socket_path` = `<dir>/harness-ready-mcp.sock`
     /// lands inside the temp dir (cleaned on drop).
     struct Scratch {
         dir: std::path::PathBuf,
@@ -221,7 +221,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }
-        /// state_root is a CHILD of the temp dir → `socket_path` is `<dir>/agent-teams-mcp.sock`.
+        /// state_root is a CHILD of the temp dir → `socket_path` is `<dir>/harness-ready-mcp.sock`.
         fn state_root(&self) -> std::path::PathBuf {
             self.dir.join("s")
         }

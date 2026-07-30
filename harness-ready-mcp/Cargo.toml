@@ -1,11 +1,11 @@
 [package]
-name = "agent-teams-mcp"
+name = "harness-ready-mcp"
 version = "0.1.0"
 edition = "2021"
 description = "Agent Teams — read-only MCP sidecar (rmcp, stdio): exposes the ranked queue + workspaces to your own MCP clients (PRD §14 Phase A)"
 
 [[bin]]
-name = "agent-teams-mcp"
+name = "harness-ready-mcp"
 path = "src/main.rs"
 
 # Phase A is read-only + stdio only. tokio + serde + rmcp land here (never in

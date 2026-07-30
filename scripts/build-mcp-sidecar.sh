@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# build-mcp-sidecar.sh — build the agent-teams-mcp sidecar for the Tauri
+# build-mcp-sidecar.sh — build the harness-ready-mcp sidecar for the Tauri
 # externalBin. Build → cp to binaries/<host-triple> (the committed prebuilt the
 # app bundles). Tauri strips the triple suffix at bundle time →
-# Contents/MacOS/agent-teams-mcp.
+# Contents/MacOS/harness-ready-mcp.
 #
 # AGENT-WRITE ENABLED (enablement slice). This builds with
 #   --features "memory-notes task-tools"
@@ -25,13 +25,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # host triple — hardcoded aarch64-apple-darwin (macOS aarch64 host only; cross-arch
 # is out of scope).
 TRIPLE="aarch64-apple-darwin"
-DEST="$REPO/app/src-tauri/binaries/agent-teams-mcp-$TRIPLE"
+DEST="$REPO/app/src-tauri/binaries/harness-ready-mcp-$TRIPLE"
 
 # The enablement feature set. memory-notes + task-tools = the agent-write surface.
 # phase-b-mutations is deliberately ABSENT (the gated PTY axis).
 FEATURES="memory-notes task-tools"
 
-echo "==> building agent-teams-mcp (--features \"$FEATURES\" — agent-write enabled; NO phase-b-mutations)"
+echo "==> building harness-ready-mcp (--features \"$FEATURES\" — agent-write enabled; NO phase-b-mutations)"
 
 # Guard: the bundled externalBin must carry the memory/task write features AND must
 # NOT carry the Phase-B PTY mutation feature (a different, allow_mutations-gated axis).
@@ -47,9 +47,9 @@ if [[ "$FEATURES" != *memory-notes* || "$FEATURES" != *task-tools* ]]; then
   exit 1
 fi
 
-cargo build --release -p agent-teams-mcp --features "$FEATURES" --manifest-path "$REPO/Cargo.toml"
+cargo build --release -p harness-ready-mcp --features "$FEATURES" --manifest-path "$REPO/Cargo.toml"
 
-SRC="$REPO/target/release/agent-teams-mcp"
+SRC="$REPO/target/release/harness-ready-mcp"
 if [[ ! -x "$SRC" ]]; then
   echo "ERROR: expected built binary not found at $SRC" >&2
   exit 1
@@ -66,7 +66,7 @@ if ! file "$DEST" | grep -q "Mach-O"; then
   echo "ERROR: $DEST is not a Mach-O executable" >&2
   exit 1
 fi
-echo "==> OK: agent-write sidecar bundled (memory-notes + task-tools). Commit binaries/agent-teams-mcp-$TRIPLE alongside the source."
+echo "==> OK: agent-write sidecar bundled (memory-notes + task-tools). Commit binaries/harness-ready-mcp-$TRIPLE alongside the source."
 
 # ── COORDINATOR sidecar: the SAME crate built ALSO with phase-b-mutations (the gated PTY/Model-A
 # axis: team_send_input / team_orchestrate). This is the ONLY binary permitted to carry phase-b.
@@ -76,10 +76,10 @@ echo "==> OK: agent-write sidecar bundled (memory-notes + task-tools). Commit bi
 # pane externalBin guard above (refusing phase-b in $FEATURES) is intentionally NOT relaxed — only
 # this explicit, separately-named coordinator binary carries it.
 COORD_FEATURES="$FEATURES phase-b-mutations"
-COORD_DEST="$REPO/app/src-tauri/binaries/agent-teams-mcp-coordinator-$TRIPLE"
-echo "==> building agent-teams-mcp COORDINATOR (--features \"$COORD_FEATURES\" — phase-b PTY axis ON)"
-cargo build --release -p agent-teams-mcp --features "$COORD_FEATURES" --manifest-path "$REPO/Cargo.toml"
-# (this overwrites target/release/agent-teams-mcp — the read-only pane binary was already cp'd to $DEST)
+COORD_DEST="$REPO/app/src-tauri/binaries/harness-ready-mcp-coordinator-$TRIPLE"
+echo "==> building harness-ready-mcp COORDINATOR (--features \"$COORD_FEATURES\" — phase-b PTY axis ON)"
+cargo build --release -p harness-ready-mcp --features "$COORD_FEATURES" --manifest-path "$REPO/Cargo.toml"
+# (this overwrites target/release/harness-ready-mcp — the read-only pane binary was already cp'd to $DEST)
 if [[ ! -x "$SRC" ]]; then
   echo "ERROR: expected coordinator binary not found at $SRC" >&2
   exit 1
@@ -91,4 +91,4 @@ if ! file "$COORD_DEST" | grep -q "Mach-O"; then
   exit 1
 fi
 echo "==> installed coordinator externalBin: $COORD_DEST ($(du -h "$COORD_DEST" | cut -f1)) — phase-b ON"
-echo "==> OK: coordinator sidecar bundled. Commit binaries/agent-teams-mcp-coordinator-$TRIPLE too."
+echo "==> OK: coordinator sidecar bundled. Commit binaries/harness-ready-mcp-coordinator-$TRIPLE too."

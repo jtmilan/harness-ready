@@ -25,35 +25,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-teams-daemon"
-version = "0.1.0"
-dependencies = [
- "agent-teams-core",
- "libc",
- "roles",
- "serde",
- "serde_json",
- "supervisor",
-]
-
-[[package]]
-name = "agent-teams-mcp"
-version = "0.1.0"
-dependencies = [
- "agent-teams-core",
- "agent-teams-memory",
- "agent-teams-task",
- "anyhow",
- "getrandom",
- "libc",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "agent-teams-memory"
 version = "0.1.0"
 dependencies = [
@@ -392,6 +363,35 @@ dependencies = [
  "serde",
  "serde_json",
  "state-adapter",
+]
+
+[[package]]
+name = "harness-ready-daemon"
+version = "0.1.0"
+dependencies = [
+ "agent-teams-core",
+ "libc",
+ "roles",
+ "serde",
+ "serde_json",
+ "supervisor",
+]
+
+[[package]]
+name = "harness-ready-mcp"
+version = "0.1.0"
+dependencies = [
+ "agent-teams-core",
+ "agent-teams-memory",
+ "agent-teams-task",
+ "anyhow",
+ "getrandom",
+ "libc",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

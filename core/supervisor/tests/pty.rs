@@ -233,7 +233,7 @@ fn spawn_injects_dev_path() {
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state");
     // Bash skips injection entirely, so the sidecar path is never read (16-01).
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     sup.write(b"printf 'PATHIS:%s\\n' \"$PATH\"\n").unwrap();
@@ -289,7 +289,7 @@ fn pty_io_roundtrip_and_lifecycle() {
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state");
     // Bash skips injection entirely, so the sidecar path is never read (16-01).
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     assert!(sup.is_alive(), "session alive after spawn");
@@ -344,7 +344,7 @@ fn spawn_never_runs_child_at_filesystem_root() {
     };
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state");
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     // `CWD%sIS` in the typed line keeps the ECHOED input from matching the marker —
@@ -391,7 +391,7 @@ fn spawn_runs_child_in_the_given_worktree_dir() {
     };
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state");
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     sup.write(b"printf 'CWD%sIS:%s\\n' '' \"$PWD\"\n").unwrap();
@@ -440,7 +440,7 @@ fn kill_reaps_the_child_no_zombie_left() {
     };
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state");
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     let pid = sup.child_pid().expect("live child pid");
@@ -524,7 +524,7 @@ fn refresh_live_pid_rejects_session_mismatch() {
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state-sess");
     // Bash skips injection entirely, so the sidecar path is never read (16-01).
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     let spawn_pid = sup.process_id().expect("the PTY child has a pid");
@@ -583,7 +583,7 @@ fn foreground_pgid_tracks_the_pty_foreground_job() {
     };
     let hooks = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hooks");
     let state = std::env::temp_dir().join("at-sup-state-fgpgid");
-    let sidecar = PathBuf::from("/unused/agent-teams-mcp");
+    let sidecar = PathBuf::from("/unused/harness-ready-mcp");
 
     let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
     let bash_pid = sup.process_id().expect("the PTY child has a pid");

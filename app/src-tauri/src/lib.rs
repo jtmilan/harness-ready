@@ -41,7 +41,7 @@ use supervisor::{add_worktree, freshen_worktree, remove_worktree, Harness, Super
 // 08-T4: the daemon-owned live-pane map abstraction. `DaemonSups` (== `DaemonSups<Supervisor>`)
 // replaces the raw `Mutex<HashMap<String, Supervisor>>` as `AppState.sups`, running in-process in
 // this slice (the daemon is not yet the socket server — Sub-build 3).
-use agent_teams_daemon::sups::DaemonSups;
+use harness_ready_daemon::sups::DaemonSups;
 use tauri::{Emitter, Manager};
 
 // P10.1/P10.3 — InsForge dashboard emitter (additive, default-OFF, fail-soft; the ONLY new
@@ -124,7 +124,7 @@ struct AppState {
     // app — unseeded ⇒ the watcher is simply never armed.
     app_handle: std::sync::OnceLock<tauri::AppHandle>,
     hooks_dir: PathBuf,
-    // resolved absolute path to the bundled read-only `agent-teams-mcp` stdio
+    // resolved absolute path to the bundled read-only `harness-ready-mcp` stdio
     // sidecar (16-01 / D56). Resolved ONCE at setup (mirrors hooks_dir) and threaded
     // into Supervisor::spawn so every Claude/Cursor pane gets the read-only MCP
     // surface. A missing binary degrades to "no MCP in the pane" (never a spawn err).
@@ -3003,12 +3003,12 @@ fn startup_survivors_from(
     let Some(reg) = prev_registry else {
         return Vec::new();
     };
-    agent_teams_daemon::reattach::partition_reattach(reg, daemon_live)
+    harness_ready_daemon::reattach::partition_reattach(reg, daemon_live)
         .into_iter()
         .filter(|(_, decision)| {
             matches!(
                 decision,
-                agent_teams_daemon::reattach::ReattachDecision::Reattach { .. }
+                harness_ready_daemon::reattach::ReattachDecision::Reattach { .. }
             )
         })
         .filter_map(|(id, _)| reg.workspaces.iter().find(|w| w.id == id).cloned())
@@ -14107,7 +14107,7 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
 }
 // ════════════════ 06-02 phase-b HTTP transport [END] ════════════════
 
-/// Resolve the bundled read-only `agent-teams-mcp` stdio sidecar (16-01 / D56),
+/// Resolve the bundled read-only `harness-ready-mcp` stdio sidecar (16-01 / D56),
 /// returning a `PathBuf` (not a `Result`): the sidecar is OPTIONAL, so a missing
 /// binary must degrade to "no MCP in the pane" (the supervisor's
 /// `inject_mcp_config`/`mcp_args` handle a bogus path / failed inject without
@@ -14116,10 +14116,10 @@ fn spawn_http_listener(app: tauri::AppHandle, state_root: std::path::PathBuf) {
 /// Precedence:
 /// 1. `AGENT_TEAMS_MCP_BIN` override (dev / tests).
 /// 2. The externalBin beside the running app binary (Tauri strips the host-triple
-///    suffix at bundle time → just `agent-teams-mcp` in `Contents/MacOS/`).
-/// 3. Dev fallback — PREFER the committed `binaries/agent-teams-mcp-<triple>`
+///    suffix at bundle time → just `harness-ready-mcp` in `Contents/MacOS/`).
+/// 3. Dev fallback — PREFER the committed `binaries/harness-ready-mcp-<triple>`
 ///    prebuilt (ALWAYS present in the tree), then a fresher local
-///    `target/{release,debug}/agent-teams-mcp` if one exists (a `cargo build`).
+///    `target/{release,debug}/harness-ready-mcp` if one exists (a `cargo build`).
 ///
 /// If nothing resolves, return the (possibly-absent) `current_exe`-adjacent path
 /// as a best-effort last resort — the supervisor degrades gracefully on a miss.
@@ -14129,19 +14129,19 @@ fn resolve_sidecar_bin() -> PathBuf {
     }
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp")));
+        .and_then(|exe| exe.parent().map(|d| d.join("harness-ready-mcp")));
     if let Some(cand) = &beside {
         if cand.exists() {
             return cand.clone();
         }
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let prebuilt = manifest.join("binaries/agent-teams-mcp-aarch64-apple-darwin");
+    let prebuilt = manifest.join("binaries/harness-ready-mcp-aarch64-apple-darwin");
     if prebuilt.exists() {
         return prebuilt;
     }
     for profile in ["release", "debug"] {
-        let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
+        let cand = manifest.join(format!("../../target/{profile}/harness-ready-mcp"));
         if cand.exists() {
             return cand;
         }
@@ -14151,10 +14151,10 @@ fn resolve_sidecar_bin() -> PathBuf {
 
 /// Resolve the phase-b (mutation) sidecar handed ONLY to Coordinator-role panes — the
 /// capability half of the coordinator-only broadcast gate. Precedence mirrors
-/// [`resolve_sidecar_bin`] but targets a SEPARATE `agent-teams-mcp-coordinator` binary:
+/// [`resolve_sidecar_bin`] but targets a SEPARATE `harness-ready-mcp-coordinator` binary:
 /// 1. `AGENT_TEAMS_MCP_COORDINATOR_BIN` override (dev/tests).
-/// 2. The bundled `agent-teams-mcp-coordinator` beside the running app.
-/// 3. Dev fallback — a local `target/{release,debug}/agent-teams-mcp` (a
+/// 2. The bundled `harness-ready-mcp-coordinator` beside the running app.
+/// 3. Dev fallback — a local `target/{release,debug}/harness-ready-mcp` (a
 ///    `--features phase-b-mutations` build).
 ///
 /// If NONE resolve, fall back to [`resolve_sidecar_bin`] (read-only) so a coordinator
@@ -14166,7 +14166,7 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
     }
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("agent-teams-mcp-coordinator")));
+        .and_then(|exe| exe.parent().map(|d| d.join("harness-ready-mcp-coordinator")));
     if let Some(cand) = &beside {
         if cand.exists() {
             return cand.clone();
@@ -14174,7 +14174,7 @@ fn resolve_coordinator_sidecar_bin() -> PathBuf {
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for profile in ["release", "debug"] {
-        let cand = manifest.join(format!("../../target/{profile}/agent-teams-mcp"));
+        let cand = manifest.join(format!("../../target/{profile}/harness-ready-mcp"));
         if cand.exists() {
             return cand;
         }
@@ -14899,7 +14899,7 @@ struct McpTasksCache {
 /// Read-only projection of the Phase-14 task model (MCP task log/store) for the
 /// board. Folds the append-only transition log ONCE — operator-store tasks (with
 /// their folded lifecycle) ∪ log-only agent-created tasks, the store winning on id
-/// overlap — mirroring `agent-teams-mcp::list_views`. Never mutates.
+/// overlap — mirroring `harness-ready-mcp::list_views`. Never mutates.
 ///
 /// PERF: served through a process-global (mtime,len)-keyed cache (`McpTasksCache`) so the
 /// 1s board poll costs two stats when nothing changed — the whole-log re-parse and the
@@ -20526,7 +20526,7 @@ mod session_readopt_tests {
         };
         let hooks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/hooks");
         let state = std::env::temp_dir().join("at-app-readopt-state");
-        let sidecar = std::path::PathBuf::from("/unused/agent-teams-mcp");
+        let sidecar = std::path::PathBuf::from("/unused/harness-ready-mcp");
 
         let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
         let bash_pid = sup.process_id().expect("the PTY child has a pid");

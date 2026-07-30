@@ -27,7 +27,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
-    "externalBin": ["binaries/agent-teams-mcp", "binaries/agent-teams-mcp-coordinator", "binaries/agent-teams-daemon"],
+    "externalBin": ["binaries/harness-ready-mcp", "binaries/harness-ready-mcp-coordinator", "binaries/harness-ready-daemon"],
     "resources": {
       "../../core/hooks/state-writer.sh": "hooks/state-writer.sh",
       "../../core/hooks/codex-notify.sh": "hooks/codex-notify.sh",

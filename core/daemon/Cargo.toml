@@ -1,15 +1,15 @@
 [package]
-name = "agent-teams-daemon"
+name = "harness-ready-daemon"
 version = "0.1.0"
 edition = "2021"
 description = "Agent Teams — detached daemon skeleton (Phase 08 Sub-build 1): launch-agnostic lifecycle DECISION LOGIC + trait/placeholder surfaces. Owns NO PTY and NO socket yet (later sub-builds)."
 
 [lib]
-name = "agent_teams_daemon"
+name = "harness_ready_daemon"
 path = "src/lib.rs"
 
 [[bin]]
-name = "agent-teams-daemon"
+name = "harness-ready-daemon"
 path = "src/main.rs"
 
 # SSOT: reuse core/mcp's `socket_path` / `registry_path` / `LiveRegistry` by PATH
