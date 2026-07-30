@@ -1,6 +1,6 @@
 {
   "mcp": {
-    "agent-teams": {
+    "harness-ready": {
       "type": "local",
       "command": ["/bin/sh", "-c", "exec '{{SIDECAR}}'"],
       "environment": {
