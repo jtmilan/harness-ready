@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -4284,6 +4285,7 @@ dependencies = [
  "agent-teams-memory",
  "agent-teams-ringbuf",
  "harness",
+ "libc",
  "portable-pty",
  "roles",
  "serde_json",
