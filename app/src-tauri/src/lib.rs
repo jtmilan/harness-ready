@@ -6586,6 +6586,65 @@ fn parent_pid(pid: u32) -> Option<u32> {
     }
 }
 
+/// Whether `pid` is live right now (`kill(2)` signal-0 probe) — the staleness check
+/// behind the coordinator gate's pane re-adoption (coordinator-gate-fix). EPERM counts
+/// as ALIVE: the process EXISTS, it is merely not ours — a live pane pid must never be
+/// treated as stale and re-adopted over.
+#[cfg(all(unix, target_os = "macos"))]
+fn pid_alive_now(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: kill(pid, 0) performs the existence/permission check with NO signal
+    // delivered; returns 0 (live), or -1 with errno (ESRCH dead / EPERM exists-not-ours).
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The PTY session id of `pid` (`getsid(2)`); `None` on any error (fail closed). The
+/// coordinator-gate-fix session identity: unlike the agent-CLI pid, it survives an
+/// in-pane CLI restart (the new CLI is a descendant of the same PTY session).
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_session_id(pid: u32) -> Option<u32> {
+    // SAFETY: getsid(2) on an existing pid; pure syscall, -1 + errno on error.
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid > 0).then_some(sid as u32)
+}
+
+/// The process group id of `pid` (`getpgid(2)`); `None` on any error (fail closed).
+#[cfg(all(unix, target_os = "macos"))]
+fn peer_process_group(pid: u32) -> Option<u32> {
+    // SAFETY: getpgid(2) on an existing pid; pure syscall, -1 + errno on error.
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
+/// Re-adopt a pane whose recorded live pid is DEAD but whose PTY still has a foreground
+/// group (coordinator-gate-fix): the agent CLI inside the pane restarted under a new
+/// pid. Reads the PTY's CURRENT foreground pgid (`Supervisor::foreground_pgid`,
+/// tcgetpgrp on the master) and records it via `Supervisor::refresh_live_pid` — which
+/// ADMITS only when that foreground group's own session (`getsid`) is known-equal to
+/// the pane's spawn session, so a cross-session / unknown claim is REFUSED with the
+/// live pid left untouched → the gate then falls through to its existing refusal (fail
+/// closed). Panic-free pure syscalls on the pane's OWN pid + fd (the DaemonSups
+/// closure contract); best-effort — never fails the caller.
+#[cfg(all(unix, target_os = "macos"))]
+fn re_adopt_if_stale(sup: &Supervisor) {
+    let Some(stale) = sup.live_pid() else { return };
+    if pid_alive_now(stale) {
+        return; // the recorded pid is live — nothing stale to re-adopt
+    }
+    // Foreground group of the pane's PTY; an ioctl failure leaves live_pid untouched
+    // (fail closed — the gate falls through to refusal).
+    let Some(fg) = sup.foreground_pgid() else { return };
+    if sup.refresh_live_pid(fg, peer_session_id(fg)).is_ok() {
+        eprintln!(
+            "[agent-teams] coordinator-gate: re-adopted pane {} — stale live pid {} replaced by foreground pgid {}",
+            sup.id, stale, fg
+        );
+    }
+}
+
 /// PURE ancestry walk behind [`caller_pane_role`] — resolve a socket peer's role by walking
 /// its parent-pid chain (bounded to 32 hops — pid-reuse + cycle guard) until a pid matches a
 /// LIVE pane's harness child pid. `roles` = {harness child pid → role}; `parent` = the ppid
@@ -6597,27 +6656,61 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg_attr(not(all(unix, target_os = "macos")), allow(dead_code))] // prod caller is macOS-only
 // Thin wrapper over the shared pure ancestry walk in `core/roles` (SSOT with the daemon). NOTE the
 // arg order differs: the shared fn is `(peer_pid, pid_roles, parent)`; this app-local order is kept
-// so existing call sites/tests are unchanged.
+// so existing call sites/tests are unchanged. Returns the walk's DIAGNOSTICS too
+// (coordinator-gate-fix): the caller needs the outcome reason to decide whether a `None`
+// is a tracked-pane refusal (stop) or a miss (fall through to session re-association).
 fn resolve_caller_role_via_ancestry(
     pid_roles: &HashMap<u32, Option<roles::AgentRole>>,
     parent: impl Fn(u32) -> Option<u32>,
     peer_pid: u32,
-) -> Option<roles::AgentRole> {
-    roles::resolve_role_from_ancestry(peer_pid, pid_roles, parent)
+) -> (Option<roles::AgentRole>, roles::AncestryDiagnostics) {
+    roles::resolve_role_from_ancestry_diag(peer_pid, pid_roles, parent)
 }
 
-/// Resolve the coordinator-only gate's CALLER role: snapshot {harness child pid → role} for
-/// every live pane under the registry lock, then run the pure ancestry walk above with the
-/// `/bin/ps`-backed ppid lookup.
+/// Resolve the coordinator-only gate's CALLER role (coordinator-gate-fix):
+///  1. RE-ADOPT stale panes first: a pane whose recorded live pid died (the in-pane CLI
+///     restarted) but whose PTY still has a foreground group in its spawn session gets
+///     that foreground pgid recorded as its live pid ([`re_adopt_if_stale`], fail closed).
+///  2. FAST PATH: the pid-ancestry walk (semantics unchanged — first-tracked-ancestor
+///     wins verbatim, a tracked no-role pane stops the walk and REFUSES) — but keyed on
+///     the CURRENT live pid instead of the spawn-captured pid.
+///  3. MISS PATH: re-association by PTY session + foreground pgroup
+///     (`roles::resolve_role_via_session_pgroup`) — a restarted agent CLI has a new pid
+///     yet sits in the SAME PTY session as the pane's current foreground job. Admit
+///     requires positive session AND pgroup identity; any unknown fails closed. A
+///     harness that `setsid`s itself into a NEW session is NOT re-associatable and
+///     degrades to the ancestry-only behavior (today's, still fail closed).
 #[cfg(all(unix, target_os = "macos"))]
 fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::AgentRole> {
     let st = app.state::<AppState>();
+    // (1) re-adopt BEFORE building the walk map so a stale pane's fresh pgid is a key.
+    st.sups.with_map(|m| {
+        for sup in m.values() {
+            re_adopt_if_stale(sup);
+        }
+    });
+    // (2) ancestry walk keyed on the CURRENT live pid.
     let pid_roles: HashMap<u32, Option<roles::AgentRole>> = st.sups.with_map(|m| {
         m.values()
-            .filter_map(|sup| sup.process_id().map(|pid| (pid, sup.role)))
+            .filter_map(|sup| sup.live_pid().map(|pid| (pid, sup.role)))
             .collect()
     });
-    resolve_caller_role_via_ancestry(&pid_roles, parent_pid, peer_pid)
+    let (walked, diag) = resolve_caller_role_via_ancestry(&pid_roles, parent_pid, peer_pid);
+    if diag.reason == roles::AncestryOutcome::TrackedMatch {
+        // First-tracked-ancestor wins VERBATIM — a tracked no-role pane resolves None
+        // here and the gate refuses; it must NOT fall through to the session path.
+        return walked;
+    }
+    // (3) miss → session + foreground-pgroup re-association (restarted-CLI identity).
+    let peer_sid = peer_session_id(peer_pid);
+    let peer_pgid = peer_process_group(peer_pid);
+    let panes: Vec<(Option<u32>, Option<u32>, Option<roles::AgentRole>)> =
+        st.sups.with_map(|m| {
+            m.values()
+                .map(|sup| (sup.session_id(), sup.foreground_pgid(), sup.role))
+                .collect()
+        });
+    roles::resolve_role_via_session_pgroup(peer_sid, peer_pgid, &panes)
 }
 
 /// Mirror of [`caller_pane_role`]'s ancestry walk that returns the PANE ID whose harness
@@ -19744,24 +19837,24 @@ mod socket_seam_tests {
         let parents: HashMap<u32, u32> = HashMap::from([(555, 444), (444, 100)]);
         let lookup = |p: u32| parents.get(&p).copied();
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 100),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 100).0,
             Some(roles::AgentRole::Coordinator)
         );
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 555),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 555).0,
             Some(roles::AgentRole::Coordinator),
             "descendant resolves through the ancestry walk"
         );
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, lookup, 200),
+            resolve_caller_role_via_ancestry(&roles_map, lookup, 200).0,
             Some(roles::AgentRole::Builder)
         );
         // A tracked pane with no role resolves to None (→ coordinator_gate refuses).
-        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, lookup, 300), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, lookup, 300).0, None);
 
         // MISS: an ancestry that never reaches a tracked pid.
         assert_eq!(
-            resolve_caller_role_via_ancestry(&roles_map, |_| None, 999),
+            resolve_caller_role_via_ancestry(&roles_map, |_| None, 999).0,
             None,
             "unresolvable peer → None (fail closed)"
         );
@@ -19771,7 +19864,7 @@ mod socket_seam_tests {
             *called.borrow_mut() += 1;
             None
         };
-        assert_eq!(resolve_caller_role_via_ancestry(&HashMap::new(), counting, 1), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&HashMap::new(), counting, 1).0, None);
         assert_eq!(*called.borrow(), 0, "empty role set → zero ppid lookups");
 
         // CYCLE: a↔b never resolves AND the memo caps lookups at one per distinct pid
@@ -19785,7 +19878,7 @@ mod socket_seam_tests {
                 _ => None,
             }
         };
-        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, cycle_lookup, 10), None);
+        assert_eq!(resolve_caller_role_via_ancestry(&roles_map, cycle_lookup, 10).0, None);
         assert_eq!(*cyc.borrow(), 2, "memoized: one lookup per DISTINCT pid, even cycling");
 
         // HOP-CAP: a chain longer than 32 hops never reaches the tracked pid at its end.
@@ -19796,7 +19889,7 @@ mod socket_seam_tests {
         let mut deep_roles: HashMap<u32, Option<roles::AgentRole>> = HashMap::new();
         deep_roles.insert(1040, Some(roles::AgentRole::Coordinator)); // 40 hops away
         assert_eq!(
-            resolve_caller_role_via_ancestry(&deep_roles, |p| long.get(&p).copied(), 1000),
+            resolve_caller_role_via_ancestry(&deep_roles, |p| long.get(&p).copied(), 1000).0,
             None,
             "beyond the 32-hop cap → refused"
         );
@@ -19804,7 +19897,7 @@ mod socket_seam_tests {
         let mut near_roles: HashMap<u32, Option<roles::AgentRole>> = HashMap::new();
         near_roles.insert(1010, Some(roles::AgentRole::Coordinator)); // 10 hops away
         assert_eq!(
-            resolve_caller_role_via_ancestry(&near_roles, |p| long.get(&p).copied(), 1000),
+            resolve_caller_role_via_ancestry(&near_roles, |p| long.get(&p).copied(), 1000).0,
             Some(roles::AgentRole::Coordinator)
         );
     }
@@ -19955,6 +20048,153 @@ mod socket_seam_tests {
         // (If catch_unwind propagated the panic the test binary would abort before here.)
         let proof_of_survival: u32 = 42;
         assert_eq!(proof_of_survival, 42, "thread survives: listener loop would keep accepting");
+    }
+}
+
+// ─────────────── coordinator-gate-fix: session re-association path ────────────────
+//
+// The lockout fix: a coordinator pane whose in-pane CLI restarted must keep the gate.
+// The PURE admit rule (session AND foreground-pgroup) is unit-tested in core/roles;
+// here the app's OWN wiring is locked — `pid_alive_now` staleness + the real-PTY
+// `re_adopt_if_stale` flow (stale live pid → PTY foreground pgid, session-verified) —
+// plus the fall-through composition (a tracked no-role pane must STOP at refusal, not
+// leak into the session path).
+#[cfg(all(test, unix, target_os = "macos"))]
+mod session_readopt_tests {
+    use super::*;
+
+    #[test]
+    fn pid_alive_now_reports_real_process_state() {
+        // the test process itself is trivially live; pid 0 is the sentinel "unknown"
+        // (never alive); a pid past the kernel's range is dead.
+        assert!(pid_alive_now(std::process::id()));
+        assert!(!pid_alive_now(0));
+        assert!(!pid_alive_now(0x7FFFEFFF));
+    }
+
+    #[test]
+    fn session_path_composition_admits_foreground_refuses_background_and_cross_session() {
+        // App-shaped pane snapshots (session, foreground pgid, role) as
+        // `caller_pane_role`'s miss path composes them, through the shared pure rule.
+        let coord = Some(roles::AgentRole::Coordinator);
+        let panes = [(Some(9u32), Some(123u32), coord)];
+        // a restarted CLI: new pid, SAME session, the pane's foreground job → admit
+        assert_eq!(
+            roles::resolve_role_via_session_pgroup(Some(9), Some(123), &panes),
+            Some(coord.unwrap()),
+            "same-session foreground peer resolves the pane role"
+        );
+        // a background process in the same session → refuse (the load-bearing check)
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(9), Some(555), &panes), None);
+        // a foreground process in ANOTHER session → refuse
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(8), Some(123), &panes), None);
+        // unreadable peer identity → refuse
+        assert_eq!(roles::resolve_role_via_session_pgroup(None, Some(123), &panes), None);
+        assert_eq!(roles::resolve_role_via_session_pgroup(Some(9), None, &panes), None);
+    }
+
+    #[test]
+    fn re_adopt_if_stale_replaces_a_dead_live_pid_with_the_verified_foreground_pgroup() {
+        // Real-PTY regression lock for the re-adopt path:
+        //  1. coordinator bash pane; 2. a background job stands in for a restarted CLI
+        //  and is recorded as the live pid (same session → `refresh_live_pid` admits);
+        //  3. that pid dies → `re_adopt_if_stale` must read the PTY's current foreground
+        //  pgid, verify its session, and record it — fail-closed on every check.
+        let dir = std::env::temp_dir().join(format!("at-app-readopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = WorkspaceSpec {
+            id: "wsreadopt".into(),
+            harness: Harness::Bash,
+            worktree: dir.clone(),
+            session_id: None,
+            resume: false,
+            role: Some(roles::AgentRole::Coordinator),
+            is_worker: false,
+            extra_dirs: vec![],
+            model: None,
+        };
+        let hooks = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/hooks");
+        let state = std::env::temp_dir().join("at-app-readopt-state");
+        let sidecar = std::path::PathBuf::from("/unused/agent-teams-mcp");
+
+        let mut sup = Supervisor::spawn(&spec, &hooks, &state, &sidecar).unwrap();
+        let bash_pid = sup.process_id().expect("the PTY child has a pid");
+        let session = sup.session_id().expect("session captured at spawn");
+
+        // deterministic job control (the bare test `bash` may not self-detect interactive)
+        sup.write(b"set -m\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // (2) a background sleep = the "restarted CLI": new pid, SAME session.
+        sup.write(b"sleep 45 & echo NEWPID:$!\n").unwrap();
+        // PTY echo puts the command line (literal `NEWPID:$!`) in the scrollback before
+        // the real output → parse the LAST line carrying a NUMERIC marker value.
+        fn last_marker(snapshot: &str, mark: &str) -> Option<u32> {
+            snapshot.lines().rev().find_map(|l| {
+                l.split(mark)
+                    .nth(1)
+                    .and_then(|n| n.trim().split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+            })
+        }
+        let start = std::time::Instant::now();
+        let mut new_pid: Option<u32> = None;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if let Some(p) = last_marker(&sup.snapshot(), "NEWPID:") {
+                new_pid = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let new_pid = new_pid.expect("the pane echoed the background job's pid");
+        assert_ne!(new_pid, bash_pid);
+        // same session → the session-verified refresh admits (the earlier adoption)
+        assert!(peer_session_id(new_pid) == Some(session));
+        sup.refresh_live_pid(new_pid, Some(session))
+            .expect("same-session refresh admits");
+        assert_eq!(sup.live_pid(), Some(new_pid));
+        // a live pid is NOT stale — re-adopt is a no-op
+        re_adopt_if_stale(&sup);
+        assert_eq!(sup.live_pid(), Some(new_pid));
+
+        // (3) kill the "CLI" → the live pid goes stale; bash reclaims the foreground.
+        unsafe { libc::kill(new_pid as libc::pid_t, libc::SIGKILL) };
+        let bash_pgid = peer_process_group(bash_pid);
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if sup.foreground_pgid() == bash_pgid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            sup.foreground_pgid(),
+            bash_pgid,
+            "bash reclaims the foreground after the job dies"
+        );
+
+        // the re-adopt: stale pid → foreground pgid, session-verified → recorded.
+        // POLL: a just-killed pid can read as "alive" while it is still an unreaped
+        // ZOMBIE (kill(0) succeeds on zombies) — the real gate re-adopts on the next
+        // connection attempt, once the shell has reaped; same contract here.
+        let start = std::time::Instant::now();
+        let mut readopted = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            re_adopt_if_stale(&sup);
+            if sup.live_pid() == bash_pgid {
+                readopted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            readopted,
+            "re-adopt records the session-verified foreground pgid once the stale pid is reaped"
+        );
+
+        sup.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

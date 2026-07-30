@@ -32,3 +32,7 @@ serde_json = "1"
 # does not). libc (not nix) keeps the dep surface minimal, matching the app crate.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# tests/pty.rs asserts the real tcgetpgrp/getsid/getpgid semantics of the re-adopt path.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

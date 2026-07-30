@@ -2216,6 +2216,29 @@ impl Supervisor {
         self.session_id
     }
 
+    /// The PTY master's raw fd (coordinator-gate-fix; unix only) — lets the app run the
+    /// re-adopt `TIOCGPGRP` check through the portable-pty-owned descriptor. `None` when
+    /// the backend exposes no fd → the caller must refuse the re-adopt (fail closed).
+    /// The fd is OWNED by `master` and valid for the Supervisor's life; the caller must
+    /// not close it.
+    #[cfg(unix)]
+    pub fn master_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.master.as_raw_fd()
+    }
+
+    /// The pane's PTY FOREGROUND process group (coordinator-gate-fix) — `tcgetpgrp` on
+    /// the master fd via portable-pty's `process_group_leader`. This is "the job
+    /// currently in front in this pane": the gate admits a re-association only when the
+    /// peer's own pgroup equals it (a background process in the same session is
+    /// refused). `None` on any failure (no foreground group / ioctl error) → the caller
+    /// must refuse (fail closed).
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        self.master
+            .process_group_leader()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+    }
+
     /// The pane's CURRENT live child pid (coordinator-gate-fix): the spawn pid until a
     /// session-verified [`Self::refresh_live_pid`] replaces it after an in-pane CLI
     /// restart. `None` = unknown (backend exposed no pid at spawn).

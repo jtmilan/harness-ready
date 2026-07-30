@@ -459,6 +459,41 @@ pub fn session_admissible(peer_sid: Option<u32>, pane_session: Option<u32>) -> b
     matches!((peer_sid, pane_session), (Some(a), Some(b)) if a == b)
 }
 
+/// The FULL re-association admit rule (coordinator-gate-fix): a peer re-joins a pane's
+/// identity IFF its PTY session matches ([`session_admissible`]) AND its process group is
+/// the pane's PTY FOREGROUND group (both known + equal). The session match proves "same
+/// PTY lineage, survives a CLI restart"; the foreground-pgroup match proves "the pane's
+/// current foreground job, not a backgrounded/daemonized runaway in the same session".
+/// Every unknown fails closed: a `None` on any of the four inputs → refuse. This is the
+/// PURE rule shared by the app + daemon socket owners; the impure `getsid`/`getpgid`/
+/// `TIOCGPGRP` reads stay at those call sites.
+pub fn admit_by_session_and_pgroup(
+    peer_sid: Option<u32>,
+    peer_pgid: Option<u32>,
+    pane_session: Option<u32>,
+    pane_fg_pgid: Option<u32>,
+) -> bool {
+    session_admissible(peer_sid, pane_session)
+        && matches!((peer_pgid, pane_fg_pgid), (Some(a), Some(b)) if a == b)
+}
+
+/// Resolve a socket peer's owning-pane role by session + foreground-pgroup re-association
+/// (the miss path behind the pid-ancestry walk, coordinator-gate-fix): the FIRST pane
+/// entry `(session, foreground pgid, role)` that [`admit_by_session_and_pgroup`] admits
+/// wins, returning its role VERBATIM — including `None` (a matched no-role pane stops the
+/// search and resolves `None` → the gate refuses), mirroring the ancestry walk's
+/// first-tracked-ancestor rule. No match → `None` → the gate refuses (fail closed).
+pub fn resolve_role_via_session_pgroup(
+    peer_sid: Option<u32>,
+    peer_pgid: Option<u32>,
+    panes: &[(Option<u32>, Option<u32>, Option<AgentRole>)],
+) -> Option<AgentRole> {
+    panes
+        .iter()
+        .find(|(sid, pgid, _)| admit_by_session_and_pgroup(peer_sid, peer_pgid, *sid, *pgid))
+        .and_then(|(_, _, role)| *role)
+}
+
 // ───────────────────── Role-prompt section library (ADE governance P1/P3/P4/P5) ─────────────────────
 //
 // The prose that governs a DISPATCHED worker/verifier's behavior (trust boundary, freshness,
@@ -1286,6 +1321,47 @@ mod diag_session_tests {
         assert!(!session_admissible(None, Some(7)), "unknown peer session → refuse");
         assert!(!session_admissible(Some(7), Some(8)), "distinct sessions → refuse");
         assert!(session_admissible(Some(7), Some(7)), "equal known sessions → admit");
+    }
+
+    #[test]
+    fn foreground_pgroup_admit() {
+        // session match AND foreground-pgroup match → admit (the restarted-CLI case: new
+        // pid, same session, the pane's current foreground job).
+        assert!(admit_by_session_and_pgroup(Some(9), Some(123), Some(9), Some(123)));
+    }
+
+    #[test]
+    fn background_pgroup_refuse() {
+        // same session but the peer is a BACKGROUND process (its pgid is not the pane's
+        // foreground group) → refuse — the whole point of the two-part rule.
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(555), Some(9), Some(123)));
+        // distinct sessions refuse even with an equal pgroup (cross-session collision).
+        assert!(!admit_by_session_and_pgroup(Some(8), Some(123), Some(9), Some(123)));
+        // ANY unknown fails closed.
+        assert!(!admit_by_session_and_pgroup(None, Some(123), Some(9), Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), None, Some(9), Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(123), None, Some(123)));
+        assert!(!admit_by_session_and_pgroup(Some(9), Some(123), Some(9), None));
+        assert!(!admit_by_session_and_pgroup(None, None, None, None));
+    }
+
+    #[test]
+    fn resolve_role_via_session_pgroup_first_match_wins_verbatim() {
+        let panes = [
+            (Some(7u32), Some(70u32), Some(AgentRole::Builder)),
+            (Some(9u32), Some(90u32), Some(AgentRole::Coordinator)),
+            (Some(9u32), Some(91u32), None),
+        ];
+        assert_eq!(
+            resolve_role_via_session_pgroup(Some(9), Some(90), &panes),
+            Some(AgentRole::Coordinator)
+        );
+        // a matched NO-ROLE pane stops the search at None (walk semantics, NOT a skip)
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(91), &panes), None);
+        // no session/pgroup match → None (fail closed)
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(99), &panes), None);
+        assert_eq!(resolve_role_via_session_pgroup(None, Some(90), &panes), None);
+        assert_eq!(resolve_role_via_session_pgroup(Some(9), Some(90), &[]), None);
     }
 
     #[test]
