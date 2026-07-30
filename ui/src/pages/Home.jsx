@@ -6,6 +6,7 @@ import { useTiling } from "@/lib/layout/useTiling";
 import { bridge } from "@/lib/agentBridge";
 import { isReplyTraffic, isTauri } from "@/lib/tauriAgentBridge";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
+import { fleetCounts } from "@/lib/monitorRows";
 import TopBar from "@/components/command/TopBar";
 import LayoutToolbar from "@/components/command/LayoutToolbar";
 import AgentPane from "@/components/command/AgentPane";
@@ -601,10 +602,13 @@ export default function Home() {
       : { position: "absolute", top: r.top - HANDLE / 2, left: r.left, width: r.width, height: HANDLE, cursor: "row-resize", touchAction: "none", zIndex: 20 };
   };
 
-  const activeCount = agents.filter((a) => a.status === "working").length;
+  // C1: single source of truth for the fleet shape (shared with Monitoring) — no inline
+  // re-derivation that could drift from what the table/top-bar show.
+  const counts = fleetCounts(agents);
+  const activeCount = counts.working;
+  const needsYou = counts.needsYou;
   // B: per-workspace working count + the global admission cap (from the bridge's 1s
   // get_capacity poll). atCap gates NEW AGENT / TEMPLATES; nearCap shows a HUD warning.
-  const localWorking = visibleAgents.filter((a) => a.status === "working").length;
   const capacity = bridge.getCapacity ? bridge.getCapacity() : null;
   const capMax = capacity?.max ?? null;
   const capWorking = capacity?.working ?? activeCount;
@@ -644,7 +648,9 @@ export default function Home() {
       <TitleBar />
       <TopBar
         activeCount={activeCount}
-        localWorking={localWorking}
+        needsYou={needsYou}
+        live={agents.length}
+        errors={counts.error}
         capMax={capMax}
         atCap={atCap}
         broadcastActive={broadcast}

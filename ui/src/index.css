@@ -31,6 +31,13 @@
     --chart-4: 43 74% 66%;
     --chart-5: 27 87% 67%;
     --radius: 0.5rem;
+    /* Semantic lanes (A-VIS-1 / R5): state colors are sacred and theme-INDEPENDENT, so the
+       same four values appear in :root AND .dark — a brand/skin swap must never retune them.
+       --need amber · --success green · --danger red · --info cyan (also the brand accent). */
+    --need: 38 92% 50%;
+    --success: 142 72% 45%;
+    --danger: 0 72% 51%;
+    --info: 187 100% 50%;
     --font-heading: 'Rajdhani', ui-sans-serif, system-ui, sans-serif;
     --font-body: 'JetBrains Mono', ui-monospace, monospace;
     --font-display: 'Rajdhani', ui-sans-serif, system-ui, sans-serif;
@@ -65,6 +72,11 @@
     --border: 0 0% 14.9%;
     --input: 0 0% 14.9%;
     --ring: 0 0% 83.1%;
+    /* Semantic lanes repeated verbatim (see :root comment) — state colors do not theme. */
+    --need: 38 92% 50%;
+    --success: 142 72% 45%;
+    --danger: 0 72% 51%;
+    --info: 187 100% 50%;
     --chart-1: 220 70% 50%;
     --chart-2: 160 60% 45%;
     --chart-3: 30 80% 55%;
@@ -90,6 +102,15 @@
 
   body {
     @apply bg-background text-foreground font-body;
+  }
+
+  /* A-VIS-6 (R8): a visible focus ring on EVERY interactive element, including the panes /
+     buttons / queue rows that don't carry shadcn ring utilities. On the cyan/info lane so it
+     reads on the dark surfaces; never color-only — it is a ring shape, not a hue cue. */
+  :focus-visible {
+    outline: 2px solid hsl(var(--info));
+    outline-offset: 2px;
+    border-radius: 1px;
   }
 }
 
