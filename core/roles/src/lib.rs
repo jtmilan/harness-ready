@@ -323,12 +323,24 @@ pub enum AncestryOutcome {
     EmptyMap,
 }
 
+impl fmt::Display for AncestryOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AncestryOutcome::TrackedMatch => "tracked-match",
+            AncestryOutcome::ChainExhausted => "chain-exhausted",
+            AncestryOutcome::MaxHops => "max-hops",
+            AncestryOutcome::EmptyMap => "empty-map",
+        })
+    }
+}
+
 /// The diagnostic record of ONE ancestry walk: enough for a FORBIDDEN reply (or an audit
 /// row) to name the peer, how far the walk got, where it stopped, and why. PURE output of
 /// [`resolve_role_from_ancestry_diag`] — the impure ppid lookup stays injected there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AncestryDiagnostics {
-    /// The socket peer pid the walk started at.
+    /// The socket peer pid the walk started at (or the caller's kernel-reported peer pid
+    /// when attached via [`Self::with_peer_pid`] on a walk-less refusal).
     pub peer_pid: u32,
     /// Pids VISITED (map probes), 1-based; 0 only on the [`AncestryOutcome::EmptyMap`]
     /// short-circuit.
@@ -342,6 +354,53 @@ pub struct AncestryDiagnostics {
     pub matched_role: Option<AgentRole>,
     /// Why the walk ended.
     pub reason: AncestryOutcome,
+    /// The pids the walk probed, in order (peer first). Lets a FORBIDDEN render the
+    /// actual chain; empty on the [`AncestryOutcome::EmptyMap`] short-circuit.
+    pub chain: Vec<u32>,
+    /// The workspace the refused op targeted, when the request carried one (attached by
+    /// the gate's call site via [`Self::with_workspace`]); `None` for ops with no single
+    /// target (e.g. broadcast) or before attachment.
+    pub workspace: Option<String>,
+}
+
+impl AncestryDiagnostics {
+    /// Attach the workspace the refused op targeted (the gate call site threads the
+    /// request's id / target through here so the FORBIDDEN names it).
+    pub fn with_workspace(mut self, wsid: impl Into<String>) -> Self {
+        self.workspace = Some(wsid.into());
+        self
+    }
+
+    /// Override the peer pid (a walk-less gate refusal still carries the kernel-reported
+    /// connecting pid).
+    pub fn with_peer_pid(mut self, pid: u32) -> Self {
+        self.peer_pid = pid;
+        self
+    }
+}
+
+impl fmt::Display for AncestryDiagnostics {
+    /// The one-line FORBIDDEN detail: names peer, workspace, resolved role, the probed
+    /// chain, and the miss reason — so a refusal is actionable without a second read of
+    /// the registry or the process table.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let role = self
+            .matched_role
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let ws = self.workspace.as_deref().unwrap_or("-");
+        let chain = self
+            .chain
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(
+            f,
+            "coordinator-gate refused: peer_pid={} workspace={} resolved_role={} chain=[{}] reason={}",
+            self.peer_pid, ws, role, chain, self.reason
+        )
+    }
 }
 
 /// The diagnostic ancestry walk behind [`resolve_role_from_ancestry`] (which delegates
@@ -363,6 +422,8 @@ pub fn resolve_role_from_ancestry_diag(
                 terminal_pid: peer_pid,
                 matched_role: None,
                 reason: AncestryOutcome::EmptyMap,
+                chain: Vec::new(),
+                workspace: None,
             },
         );
     }
@@ -370,10 +431,12 @@ pub fn resolve_role_from_ancestry_diag(
     let mut cur = peer_pid;
     let mut hops = 0usize;
     let mut terminal = peer_pid; // the last pid PROBED (never an unvisited advance)
+    let mut chain: Vec<u32> = Vec::new(); // every probed pid, in walk order
     let mut chain_ended = false;
     for _ in 0..MAX_ANCESTRY_HOPS {
         hops += 1;
         terminal = cur;
+        chain.push(cur);
         if let Some(role) = pid_roles.get(&cur) {
             return (
                 *role,
@@ -383,6 +446,8 @@ pub fn resolve_role_from_ancestry_diag(
                     terminal_pid: cur,
                     matched_role: *role,
                     reason: AncestryOutcome::TrackedMatch,
+                    chain,
+                    workspace: None,
                 },
             );
         }
@@ -411,6 +476,8 @@ pub fn resolve_role_from_ancestry_diag(
             } else {
                 AncestryOutcome::MaxHops
             },
+            chain,
+            workspace: None,
         },
     )
 }
@@ -1307,6 +1374,30 @@ mod diag_session_tests {
                 .expect_err(&format!("peer {peer} must be refused"));
             assert_eq!(err, diag, "the refusal returns the walk diag verbatim");
         }
+    }
+
+    #[test]
+    fn diag_display_names_peer_workspace_role_chain_and_reason() {
+        // The FORBIDDEN detail contract: one actionable line.
+        let parents = HashMap::from([(555u32, 444u32), (444u32, 100u32)]);
+        let map = HashMap::from([(100u32, Some(AgentRole::Builder))]);
+        let (_, diag) = resolve_role_from_ancestry_diag(555, &map, |p| parents.get(&p).copied());
+        let line = diag.with_workspace("ws777x3").to_string();
+        assert_eq!(
+            line,
+            "coordinator-gate refused: peer_pid=555 workspace=ws777x3 resolved_role=builder \
+             chain=[555,444,100] reason=tracked-match"
+        );
+        // a miss renders its own reason + the probed chain, workspace "-" when untargeted
+        let (_, miss) = resolve_role_from_ancestry_diag(42, &map, |_| None);
+        let line = miss.to_string();
+        assert!(line.contains("peer_pid=42"));
+        assert!(line.contains("workspace=-"));
+        assert!(line.contains("resolved_role=none"));
+        assert!(line.contains("chain=[42]"));
+        assert!(line.contains("reason=chain-exhausted"));
+        // with_peer_pid overrides (a walk-less refusal carries the kernel peer)
+        assert!(miss.with_peer_pid(9).to_string().contains("peer_pid=9"));
     }
 
     #[test]

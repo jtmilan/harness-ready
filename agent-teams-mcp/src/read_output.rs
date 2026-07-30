@@ -52,7 +52,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use agent_teams_core::{
-    read_mcp_config, read_registry, validate_session_id, validate_spawn_id, LivenessSource,
+    read_mcp_config, read_registry, unified_liveness, validate_session_id, validate_spawn_id,
+    LivenessSource,
 };
 
 /// Default + hard cap on returned content bytes (the newest tail is kept). SSOT in
@@ -359,18 +360,19 @@ fn live_scrollback_via_socket(state_dir: &Path, id: &str, cap: usize) -> Option<
 }
 
 /// Look up `(harness, repo, session_id)` for a pane id from the live registry.
-/// `None` when the registry is absent/malformed or the id isn't live — the OUTER
-/// Option IS the pane-liveness signal the gap-7 live-scrollback attempt keys on.
-/// `session_id` is the pane's stable claude conversation id the app recorded at spawn
-/// (C1) — it is the transcript FILENAME, so [`resolve`] can locate the transcript by
-/// session id regardless of the launch-cwd encoding of the project dir. It is
-/// REGISTRY-SOURCED (never caller-supplied), preserving the traversal-proof contract.
+/// `None` when the registry is absent/malformed/STALE (dead owner — coordinator-gate-fix
+/// `unified_liveness`) or the id isn't live — the OUTER Option IS the pane-liveness
+/// signal the gap-7 live-scrollback attempt keys on. `session_id` is the pane's stable
+/// claude conversation id the app recorded at spawn (C1) — it is the transcript
+/// FILENAME, so [`resolve`] can locate the transcript by session id regardless of the
+/// launch-cwd encoding of the project dir. It is REGISTRY-SOURCED (never caller-supplied),
+/// preserving the traversal-proof contract.
 #[allow(clippy::type_complexity)]
 fn registry_lookup(
     state_dir: &Path,
     id: &str,
 ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let reg = read_registry(state_dir)?;
+    let reg = unified_liveness(read_registry(state_dir)).registry?;
     let ws = reg.workspaces.iter().find(|w| w.id == id)?;
     Some((ws.harness.clone(), ws.repo.clone(), ws.session_id.clone()))
 }

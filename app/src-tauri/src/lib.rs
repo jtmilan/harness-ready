@@ -6721,7 +6721,10 @@ fn resolve_caller_role_via_ancestry(
 ///     harness that `setsid`s itself into a NEW session is NOT re-associatable and
 ///     degrades to the ancestry-only behavior (today's, still fail closed).
 #[cfg(all(unix, target_os = "macos"))]
-fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::AgentRole> {
+fn caller_pane_role(
+    app: &tauri::AppHandle,
+    peer_pid: u32,
+) -> (Option<roles::AgentRole>, Option<roles::AncestryDiagnostics>) {
     let st = app.state::<AppState>();
     // (1) re-adopt BEFORE building the walk map so a stale pane's fresh pgid is a key.
     st.sups.with_map(|m| {
@@ -6739,7 +6742,8 @@ fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::Agen
     if diag.reason == roles::AncestryOutcome::TrackedMatch {
         // First-tracked-ancestor wins VERBATIM — a tracked no-role pane resolves None
         // here and the gate refuses; it must NOT fall through to the session path.
-        return walked;
+        // The diag rides back so the FORBIDDEN can name the chain (coordinator-gate-fix).
+        return (walked, Some(diag));
     }
     // (3) miss → session + foreground-pgroup re-association (restarted-CLI identity).
     let peer_sid = peer_session_id(peer_pid);
@@ -6750,7 +6754,11 @@ fn caller_pane_role(app: &tauri::AppHandle, peer_pid: u32) -> Option<roles::Agen
                 .map(|sup| (sup.session_id(), sup.foreground_pgid(), sup.role))
                 .collect()
         });
-    roles::resolve_role_via_session_pgroup(peer_sid, peer_pgid, &panes)
+    (
+        roles::resolve_role_via_session_pgroup(peer_sid, peer_pgid, &panes),
+        // the walk's miss diag still names peer + chain + reason on a refusal
+        Some(diag),
+    )
 }
 
 /// Mirror of [`caller_pane_role`]'s ancestry walk that returns the PANE ID whose harness
@@ -7024,12 +7032,36 @@ fn external_spawn_admit(allow_external_spawn: bool, op_allowed: bool, ancestry_m
 /// dispatched). Best-effort: a failed write never blocks the op. Sibling of the state
 /// root, mirroring the live registry / socket file placement.
 fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid: Option<u32>) {
-    let st = app.state::<AppState>();
-    let Some(parent) = st.state_root.parent() else { return };
-    let path = parent.join("agent-teams-external-mutations.jsonl");
-    // `details` carries op-specific structured fields (per-pane role/model/count for spawns)
-    // so the forensic trail records the SECURITY-relevant role, not just harness×count.
-    let (op, target, text, details): (&str, Option<String>, Option<String>, serde_json::Value) = match req {
+    let (op, target, text, details) = mutation_audit_fields(req);
+    write_mutation_audit_row(app, "external_orchestrator", op, target, text, details, None, peer_pid);
+}
+
+/// Coordinator-gate-fix: a DENIED mutation leaves an audit row too (written BEFORE the
+/// FORBIDDEN returns) — a denied attempt is exactly what a gate audit must show. Same
+/// file + row shape as [`audit_external_mutation`], `source` names the denial and the
+/// FORBIDDEN detail (peer + workspace + chain + reason) rides in `reason`.
+fn audit_denied_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid: Option<u32>, reason: &str) {
+    let (op, target, text, details) = mutation_audit_fields(req);
+    write_mutation_audit_row(
+        app,
+        "coordinator_gate_denied",
+        op,
+        target,
+        text,
+        details,
+        Some(reason.to_string()),
+        peer_pid,
+    );
+}
+
+/// The per-op audit fields shared by the admit + deny rows (coordinator-gate-fix
+/// extraction — one decomposition, never two). `details` carries op-specific structured
+/// fields (per-pane role/model/count for spawns) so the forensic trail records the
+/// SECURITY-relevant role, not just harness×count.
+fn mutation_audit_fields(
+    req: &SocketRequest,
+) -> (&'static str, Option<String>, Option<String>, serde_json::Value) {
+    match req {
         SocketRequest::SendInput { id, text } => ("send_input", Some(id.clone()), Some(text.clone()), serde_json::Value::Null),
         SocketRequest::Broadcast { text } => ("broadcast", None, Some(text.clone()), serde_json::Value::Null),
         SocketRequest::Orchestrate { goal, dispatch, target_workspace } => (
@@ -7070,7 +7102,26 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
             serde_json::json!({ "harness": harness, "role": role, "model": model }),
         ),
         _ => ("other", None, None, serde_json::Value::Null),
-    };
+    }
+}
+
+/// Append one audit row to `agent-teams-external-mutations.jsonl` (a sibling of the
+/// state root). `reason` rides only on denial rows (coordinator-gate-fix). Best-effort:
+/// a failed write never blocks the caller.
+#[allow(clippy::too_many_arguments)]
+fn write_mutation_audit_row(
+    app: &tauri::AppHandle,
+    source: &str,
+    op: &str,
+    target: Option<String>,
+    text: Option<String>,
+    details: serde_json::Value,
+    reason: Option<String>,
+    peer_pid: Option<u32>,
+) {
+    let st = app.state::<AppState>();
+    let Some(parent) = st.state_root.parent() else { return };
+    let path = parent.join("agent-teams-external-mutations.jsonl");
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -7097,13 +7148,14 @@ fn audit_external_mutation(app: &tauri::AppHandle, req: &SocketRequest, peer_pid
     });
     let rec = serde_json::json!({
         "ts": ts,
-        "source": "external_orchestrator",
+        "source": source,
         "peer_pid": peer_pid,
         "op": op,
         "target": target,
         "text": text_snip,
         "details": details,
         "ws": ws,
+        "reason": reason,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
@@ -7915,9 +7967,50 @@ struct SocketGateCfg {
 // `SocketResponse` is the shared core wire enum returned all along this socket path; boxing the
 // Err here alone would diverge from every other SocketResponse-returning fn for no real gain.
 #[allow(clippy::result_large_err)]
+/// The workspace a socket op targets, when the request carries a single one — threaded
+/// into the FORBIDDEN diag (coordinator-gate-fix) so the refusal names it. `None` for
+/// ops with no single target (broadcast) or an absent optional scope. Pane ids embed
+/// their workspace (`${wsId}-p${idx}`), so a pane-scoped op names the pane verbatim —
+/// the prefix is derivable by the reader.
+fn req_workspace_hint(req: &SocketRequest) -> Option<&str> {
+    match req {
+        SocketRequest::SendInput { id, .. }
+        | SocketRequest::Focus { id }
+        | SocketRequest::Attach { id }
+        | SocketRequest::Detach { id }
+        | SocketRequest::ReadOutput { id, .. } => Some(id.as_str()),
+        SocketRequest::Orchestrate { target_workspace, .. } => target_workspace.as_deref(),
+        SocketRequest::Handoff { from, .. } => Some(from.as_str()),
+        SocketRequest::Delegate { parent_id, .. } => Some(parent_id.as_str()),
+        SocketRequest::AddPane { target_workspace, .. } => target_workspace.as_deref(),
+        SocketRequest::CreateWorkspace { tag, .. } => tag.as_deref(),
+        _ => None,
+    }
+}
+
+/// The coordinator-gate FORBIDDEN detail (coordinator-gate-fix): render the walk's
+/// [`roles::AncestryDiagnostics`] — peer pid, targeted workspace, resolved role, the
+/// probed pid chain, and the miss reason — when available; the legacy static message
+/// on the walk-less paths (non-macOS, unresolved peer).
+fn forbidden_detail(
+    caller_diag: Option<roles::AncestryDiagnostics>,
+    req: &SocketRequest,
+) -> String {
+    match caller_diag {
+        Some(mut d) => {
+            if let Some(ws) = req_workspace_hint(req) {
+                d = d.with_workspace(ws);
+            }
+            d.to_string()
+        }
+        None => "coordinator-only: the calling pane is not an AgentRole::Coordinator".to_string(),
+    }
+}
+
 fn gate_socket_request(
     cfg: SocketGateCfg,
     caller_role: Option<roles::AgentRole>,
+    caller_diag: Option<roles::AncestryDiagnostics>,
     ancestry_match: bool,
     req: &SocketRequest,
 ) -> Result<bool, SocketResponse> {
@@ -7950,9 +8043,12 @@ fn gate_socket_request(
         if admitted {
             external_admitted = true;
         } else {
+            // Coordinator-gate-fix: the FORBIDDEN NAMES the workspace + the peer's pid
+            // chain + the resolved role + the miss reason (the walk diag), so a refusal
+            // is actionable without a second registry / process-table read.
             return Err(SocketResponse::err(
                 response_code::FORBIDDEN,
-                "coordinator-only: the calling pane is not an AgentRole::Coordinator",
+                forbidden_detail(caller_diag, req),
             ));
         }
     }
@@ -7985,6 +8081,7 @@ fn handle_socket_request(
     app: &tauri::AppHandle,
     req: SocketRequest,
     caller_role: Option<roles::AgentRole>,
+    caller_diag: Option<roles::AncestryDiagnostics>,
     peer_pid: Option<u32>,
     caller_pane_id: Option<String>,
 ) -> SocketResponse {
@@ -8026,6 +8123,7 @@ fn handle_socket_request(
             allow_external_spawn: cfg.allow_external_spawn,
         },
         caller_role,
+        caller_diag,
         ancestry_match,
         &req,
     ) {
@@ -8034,7 +8132,15 @@ fn handle_socket_request(
         // happens in the CreateWorkspace/AddPane arms below).
         Ok(true) => audit_external_mutation(app, &req, peer_pid),
         Ok(false) => {}
-        Err(deny) => return deny,
+        // Coordinator-gate-fix: a DENIED mutation leaves an audit row too — the refusal
+        // is written BEFORE it returns (a denied attempt is exactly what a gate audit
+        // must show), carrying the same op fields as an admit + the FORBIDDEN detail.
+        Err(deny) => {
+            if deny.code == response_code::FORBIDDEN && op_requires_mutations(&req) {
+                audit_denied_mutation(app, &req, peer_pid, &deny.detail);
+            }
+            return deny;
+        }
     }
     match req {
         SocketRequest::SendInput { id, text } => {
@@ -13369,9 +13475,14 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                         #[cfg(not(target_os = "macos"))]
                         let peer_pid: Option<u32> = None;
                         #[cfg(target_os = "macos")]
-                        let caller_role = peer_pid.and_then(|pid| caller_pane_role(app, pid));
+                        let (caller_role, caller_diag) = match peer_pid {
+                            Some(pid) => caller_pane_role(app, pid),
+                            None => (None, None),
+                        };
                         #[cfg(not(target_os = "macos"))]
                         let caller_role: Option<roles::AgentRole> = None;
+                        #[cfg(not(target_os = "macos"))]
+                        let caller_diag: Option<roles::AncestryDiagnostics> = None;
                         // WORKSPACE-ISOLATION (Phase 1): mirror the role walk to recover the
                         // caller's PANE ID (and thus its workspace) from the same peer pid.
                         // None → external / reparented caller → the gate denies cross-ws writes.
@@ -13380,7 +13491,7 @@ fn serve_socket_conn(app: &tauri::AppHandle, mut stream: std::os::unix::net::Uni
                         #[cfg(not(target_os = "macos"))]
                         let caller_pane_id: Option<String> = None;
                         match std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_socket_request(app, req, caller_role, peer_pid, caller_pane_id)
+                            handle_socket_request(app, req, caller_role, caller_diag, peer_pid, caller_pane_id)
                         })) {
                             Ok(resp) => resp,
                             Err(payload) => {
@@ -13760,7 +13871,7 @@ fn serve_http_request(
             // caller_pane_id None, so both the coordinator gate, the external-orchestrator
             // path, AND the workspace-isolation gate refuse cross-ws writes (external
             // admission is UDS-only by construction; D1 hard-deny). Fail closed.
-            let resp = handle_socket_request(app, parsed, None, None, None);
+            let resp = handle_socket_request(app, parsed, None, None, None, None);
             let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
                 r#"{"ok":false,"code":"INTERNAL","message":"serialize failed"}"#.to_string()
             });
@@ -19641,7 +19752,7 @@ mod socket_seam_tests {
         for req in &gated {
             // Even a Coordinator caller is denied when mutations are off — the capability
             // gate comes FIRST, the role gate second.
-            let deny = gate_socket_request(cfg, Some(roles::AgentRole::Coordinator), false, req)
+            let deny = gate_socket_request(cfg, Some(roles::AgentRole::Coordinator), None, false, req)
                 .expect_err("mutations-off must deny");
             assert_eq!(deny.code, response_code::MUTATIONS_DISABLED, "{req:?}");
         }
@@ -19650,6 +19761,7 @@ mod socket_seam_tests {
         let deny = gate_socket_request(
             cfg,
             Some(roles::AgentRole::Coordinator),
+            None,
             false,
             &SocketRequest::SendInput { id: "w".into(), text: "y".into() },
         )
@@ -19785,7 +19897,7 @@ mod socket_seam_tests {
                         } else {
                             None
                         };
-                        let got = gate_socket_request(cfg, role, false, &req);
+                        let got = gate_socket_request(cfg, role, None, false, &req);
                         match expect {
                             None => assert!(
                                 got.is_ok(),
@@ -19821,7 +19933,7 @@ mod socket_seam_tests {
             let ext_spawn = op_external_spawn_allowed(&req);
             // Control axis armed only:
             let ctl_cfg = SocketGateCfg { allow_external_orchestrator: true, ..base };
-            let got = gate_socket_request(ctl_cfg, None, true, &req);
+            let got = gate_socket_request(ctl_cfg, None, None, true, &req);
             if op_requires_mutations(&req) {
                 if ext_ctl {
                     assert_eq!(got, Ok(true), "control-allowlisted op admits externally: {req:?}");
@@ -19837,7 +19949,7 @@ mod socket_seam_tests {
             }
             // Spawn axis armed only — spawn ops admit; control ops must NOT ride it:
             let spawn_cfg = SocketGateCfg { allow_external_spawn: true, ..base };
-            let got = gate_socket_request(spawn_cfg, None, true, &req);
+            let got = gate_socket_request(spawn_cfg, None, None, true, &req);
             if ext_spawn {
                 assert_eq!(got, Ok(true), "spawn-allowlisted op admits externally: {req:?}");
             } else if op_requires_mutations(&req) {
@@ -19855,11 +19967,62 @@ mod socket_seam_tests {
             };
             if op_requires_mutations(&req) || matches!(req, SocketRequest::ReadOutput { .. }) {
                 assert!(
-                    gate_socket_request(both, None, false, &req).is_err(),
+                    gate_socket_request(both, None, None, false, &req).is_err(),
                     "no pid-ancestry match ⇒ refused: {req:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn forbidden_carries_workspace_and_chain() {
+        // Coordinator-gate-fix: the coordinator FORBIDDEN carries the walk's diagnostic
+        // line — peer + targeted workspace + resolved role + probed chain + reason — not
+        // a bare static string, so a refusal is actionable.
+        let cfg = SocketGateCfg {
+            allow_mutations: true,
+            send_input_enabled: true,
+            allow_external_orchestrator: false,
+            allow_external_spawn: false,
+        };
+        // a Builder pane (end of a two-hop chain) tries to write a pane:
+        let diag = roles::AncestryDiagnostics {
+            peer_pid: 555,
+            hops: 2,
+            terminal_pid: 100,
+            matched_role: Some(roles::AgentRole::Builder),
+            reason: roles::AncestryOutcome::TrackedMatch,
+            chain: vec![555, 100],
+            workspace: None,
+        };
+        let deny = gate_socket_request(
+            cfg,
+            Some(roles::AgentRole::Builder),
+            Some(diag),
+            false,
+            &SocketRequest::SendInput { id: "ws77x2-p0".into(), text: "y".into() },
+        )
+        .expect_err("a non-coordinator must be refused");
+        assert_eq!(deny.code, response_code::FORBIDDEN);
+        assert_eq!(
+            deny.detail,
+            "coordinator-gate refused: peer_pid=555 workspace=ws77x2-p0 resolved_role=builder chain=[555,100] reason=tracked-match",
+            "the FORBIDDEN names the workspace + peer + role + chain + reason"
+        );
+        // a walk-less refusal (diag None — non-macOS / unresolved peer) keeps the legacy
+        // static message verbatim.
+        let deny = gate_socket_request(
+            cfg,
+            None,
+            None,
+            false,
+            &SocketRequest::Broadcast { text: "x".into() },
+        )
+        .expect_err("an unresolved caller is refused");
+        assert_eq!(
+            deny.detail,
+            "coordinator-only: the calling pane is not an AgentRole::Coordinator"
+        );
     }
 
     /// Deep-review item 21: the pure ancestry walk behind `caller_pane_role` — hit, miss,

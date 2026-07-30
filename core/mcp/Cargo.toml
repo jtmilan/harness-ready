@@ -38,6 +38,11 @@ hex = "0.4"
 schemars = { version = "1", optional = true }
 state-adapter = { path = "../state-adapter" }
 
+# Coordinator-gate-fix: `unified_liveness` probes the registry's `app_pid` with
+# kill(pid, 0) — a present registry owned by a DEAD app is stale and reads as EMPTY.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Adds `JsonSchema` to the wire types (for MCP outputSchema generation).
 schema = ["dep:schemars"]

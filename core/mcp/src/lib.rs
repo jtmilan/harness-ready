@@ -437,6 +437,73 @@ pub fn read_registry(state_root: &Path) -> Option<LiveRegistry> {
     serde_json::from_str(&body).ok()
 }
 
+// ───────────────── unified registry liveness (coordinator-gate-fix) ─────────────────
+//
+// The registry file is presence-trusted today: present + parseable ⇒ its `workspaces`
+// are "the live set", and `app_pid` is carried but NEVER verified (the documented
+// Phase-A gap). A crashed app leaves its registry behind, and every reader then filters
+// the queue to a DEAD app's stale live set — hiding the daemon-owned panes that actually
+// survived. `unified_liveness` is the ONE view every registry reader consults: it probes
+// `app_pid` (kill(pid, 0)) and treats a registry owned by a DEAD app as EMPTY + stale,
+// so `get_workspace` / `registry_lookup` / the queue all agree — one read path, and a
+// stale registry can never mask a live pane.
+
+/// The liveness view of a registry read (coordinator-gate-fix): the EFFECTIVE registry
+/// to act on plus why. `stale_registry` distinguishes "no registry file / app-down
+/// fallback" (`registry: None`, `stale: false` — today's discovery-superset behavior)
+/// from "registry present but its owning app is DEAD" (`registry: None`, `stale: true`
+/// — same effective emptiness, but named for the reader/diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessView {
+    /// The registry to act on: `None` when absent/unreadable OR stale (dead owner) —
+    /// a `None` here means "no authoritative live set" in BOTH cases.
+    pub registry: Option<LiveRegistry>,
+    /// True iff a registry was present on disk but its recorded `app_pid` is dead.
+    pub stale_registry: bool,
+}
+
+/// The ONE liveness decision every registry reader consults (coordinator-gate-fix):
+/// a present registry whose `app_pid` is verifiably DEAD is STALE — the app crashed
+/// without cleanup — and reads as EMPTY (`registry: None`, `stale_registry: true`),
+/// never as the dead app's live set. Absent/unreadable ⇒ `(None, false)` (today's
+/// app-down superset fallback). A registry with no recorded `app_pid`, or whose owner
+/// is alive (or un-probeable on this platform), passes through UNCHANGED — this fn
+/// only EVER narrows a dead owner to empty; it never widens.
+pub fn unified_liveness(registry: Option<LiveRegistry>) -> LivenessView {
+    match &registry {
+        Some(reg) if registry_owner_is_dead(reg) => LivenessView {
+            registry: None,
+            stale_registry: true,
+        },
+        _ => LivenessView {
+            registry,
+            stale_registry: false,
+        },
+    }
+}
+
+/// True iff the registry records an owner pid AND that pid is provably dead. No owner
+/// pid ⇒ not stale (nothing to verify — the Phase-A shape passes through); an un-probeable
+/// pid (EPERM: exists but another user's) ⇒ NOT dead (fail toward presence, never mask a
+/// possibly-live registry).
+fn registry_owner_is_dead(reg: &LiveRegistry) -> bool {
+    matches!(reg.app_pid, Some(pid) if pid > 0 && !app_pid_alive(pid))
+}
+
+/// kill(pid, 0) existence probe for the registry owner. EPERM ⇒ ALIVE (the process
+/// exists; it is merely another user's — not ours to declare dead).
+#[cfg(unix)]
+fn app_pid_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) delivers NO signal — a pure existence/permission check.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn app_pid_alive(_pid: u32) -> bool {
+    true // no probe on this platform → never declare the owner dead (fail toward presence)
+}
+
 // ───────────────────── Phase-B mutation seam: shared SSOT (06-02) ───────────────
 //
 // The Unix-domain socket path + wire protocol + config live HERE (beside
@@ -3115,6 +3182,51 @@ mod tests {
         // Malformed → None (lenient app-down fallback, never panics).
         s.write_registry("{ not json");
         assert!(read_registry(s.path()).is_none());
+    }
+
+    #[test]
+    fn unified_liveness_stale_app_pid_treated_as_empty() {
+        // Coordinator-gate-fix: a registry whose owning app_pid is DEAD is STALE —
+        // it reads as EMPTY + named, never as the dead app's live set (which would
+        // mask the daemon-owned panes that survived the crash).
+        let reg = |pid: Option<u32>| LiveRegistry {
+            schema: LIVE_REGISTRY_SCHEMA,
+            app_pid: pid,
+            updated_at: None,
+            active: None,
+            workspaces: vec![LiveWorkspace {
+                id: "alive".into(),
+                pid: None,
+                harness: None,
+                repo: None,
+                role: None,
+                tag: None,
+                session_id: None,
+                spawned_at: None,
+            }],
+        };
+        // a LIVE owner (this test process) → passes through unchanged, not stale
+        let view = unified_liveness(Some(reg(Some(std::process::id()))));
+        assert!(!view.stale_registry);
+        assert_eq!(
+            view.registry.expect("live owner passes through").live_ids().len(),
+            1
+        );
+        // a DEAD owner → effective EMPTY + stale_registry named
+        let view = unified_liveness(Some(reg(Some(0x7FFFEFFF))));
+        assert!(view.stale_registry, "a dead owner is named stale");
+        assert!(
+            view.registry.is_none(),
+            "a dead owner's live set must never be acted on"
+        );
+        // NO owner recorded (the Phase-A shape) → unverifiable, NOT stale, passes through
+        let view = unified_liveness(Some(reg(None)));
+        assert!(!view.stale_registry);
+        assert!(view.registry.is_some());
+        // absent registry → the app-down fallback (neither present nor stale)
+        let view = unified_liveness(None);
+        assert!(!view.stale_registry);
+        assert!(view.registry.is_none());
     }
 
     #[test]
