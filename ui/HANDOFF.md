@@ -48,10 +48,12 @@ that order via `subscribe`.
 
 - `src/pages/Home.jsx` — command center; all actions call `bridge.*`
 - `src/components/command/AgentPane.jsx` — per-agent PTY view + inline reply (`AttentionPrompt`)
-- `src/components/command/templates/*` — team templates (save/launch); currently
-  persisted via the Base44 `AgentTemplate` entity — swap for a local store
-  (SQLite/JSON) in the desktop build, keeping the same schema
-  (`base44/entities/AgentTemplate.jsonc`)
+- `src/components/command/templates/*` — team templates (save / launch / import / export);
+  persisted **locally** via `src/api/localAgentTemplateStore.js` (localStorage key
+  `agent-templates`) behind the `base44.entities.AgentTemplate` shape (the offline stand-in
+  in `src/api/base44Client.js`) — no cloud dependency (R6). Import/export is versioned JSON
+  (schema 1, see `src/components/command/templates/templateIO.js`); ids are regenerated on
+  import (append-without-clobber), so a bundle is portable across machines.
 - `src/pages/Monitoring.jsx` — metrics dashboard; `src/lib/monitorData.js` is
   simulated — feed real per-process CPU/mem and task outcomes
 - `src/components/command/NewAgentOverlay.jsx` — manual spawn form (role + harness + priority + autonomy) → `bridge.spawnAgents`
