@@ -32,6 +32,8 @@ export function coerceTemplateAgents(agents) {
       if (!role.trim()) role = kind;
       kind = DEFAULT_TEMPLATE_KIND;
     }
-    return { ...a, kind, role };
+    // Schema pin: keep ONLY the known config keys. Spreading `...a` would carry arbitrary
+    // unexpected keys (a bloat / stored-injection vector) into localStorage and through launch.
+    return { kind, role, priority: a.priority, autonomy: a.autonomy };
   });
 }
