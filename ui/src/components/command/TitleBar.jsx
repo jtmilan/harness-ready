@@ -4,6 +4,7 @@ import { Link, useLocation } from "react-router-dom";
 const LINKS = [
   { path: "/", label: "COMMAND" },
   { path: "/monitoring", label: "MONITORING" },
+  { path: "/context", label: "CONTEXT" },
 ];
 
 export default function TitleBar() {
