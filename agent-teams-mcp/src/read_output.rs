@@ -92,6 +92,17 @@ pub struct PaneOutputResult {
     /// Human-readable explanation when `source == "none"` (or the id is invalid) —
     /// tells the brain WHY there's nothing and what to do instead.
     pub note: Option<String>,
+    /// Whether this pane id was present in the live registry (`agent-teams-live.json`) at
+    /// resolve time. Exposed so consumers (the coordinator, and later the F-GATE-UI-1 liveness
+    /// badge) can tell "pane genuinely produced nothing" apart from "registry omits a pane that
+    /// may be running" — the liveness-blindness / stale-registry divergence (R-GATES; see
+    /// docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md). On the `none` path `false` means this
+    /// read server cannot prove liveness offline; only the running app reconciles it. On a
+    /// content-bearing source it refines the story: `true` = the live pane's own artifact;
+    /// `false` = the pane produced output but has since left the registry (e.g. closed after
+    /// completing) — a distinct signal from "never existed." Additive field — `core/mcp` types
+    /// and the GUI queue are unchanged.
+    pub registry_present: bool,
 }
 
 /// Resolve a pane id to its produced output, applying the safe-read contract.
@@ -113,13 +124,14 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
                  [A-Za-z0-9_-]; never a filesystem path)"
                     .into(),
             ),
+            registry_present: false,
         };
     }
 
     let reg_row = registry_lookup(state_dir, id);
-    // Liveness drives the gap-7 live-scrollback attempt below; only consumed on
-    // phase-b builds (the base build compiles disk-only behavior).
-    #[allow(unused_variables)]
+    // Liveness (registry membership) drives the gap-7 live-scrollback attempt below AND the
+    // `registry_present` field + liveness-blindness note on EVERY build — so it is always read
+    // (no cfg-conditional `#[allow(unused_variables)]` needed).
     let pane_is_live = reg_row.is_some();
     let (harness, repo, session_id) = reg_row.unwrap_or((None, None, None));
 
@@ -135,6 +147,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
             content: Some(content),
             truncated,
             note: None,
+            registry_present: pane_is_live,
         };
     }
 
@@ -182,6 +195,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
                 content: Some(content),
                 truncated,
                 note: None,
+                registry_present: pane_is_live,
             };
         }
     }
@@ -215,6 +229,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
                          write a report via team_orchestrate."
                             .into(),
                     ),
+                    registry_present: pane_is_live,
                 };
             }
             None => {
@@ -226,19 +241,38 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
         }
     }
 
-    // 4) honest "none" — nothing on disk for this pane (NOT a permission/gate issue).
-    let note = match harness.as_deref() {
-        Some(h) => format!(
-            "No report or transcript found on disk for {id} (harness={h}) — it may not have \
-             produced output yet, or this harness keeps no on-disk transcript. Read it live in \
-             the Agent Teams app, or ask the pane to write a report via team_orchestrate.\
-             {live_note}"
-        ),
-        None => format!(
-            "Pane {id} is not in the live registry and has no report/transcript on disk — \
-             check the id (list panes with team_get_queue).{live_note}"
-        ),
+    // 4) honest "none" — nothing on disk for this pane (NOT a permission/gate issue). The note
+    //    NAMES the liveness state so the read/mutation divergence (R-GATES / liveness blindness)
+    //    is observable instead of silently reading as "the pane is gone": `registry_present`
+    //    carries the raw signal; the prose explains what it means offline.
+    let (registry_fact, divergence) = if pane_is_live {
+        (
+            "the live registry lists this pane",
+            " — but no on-disk artifact exists and the in-memory scrollback was unreadable; the \
+             app buffer may be empty or the external-read gate is off.",
+        )
+    } else {
+        (
+            "this pane is ABSENT from the live registry",
+            " — LIVENESS-BLINDNESS: if this pane is actually running (team_send_input reaches it, \
+             or it shows in the Agent Teams app), the registry is stale or out of sync with the \
+             app's in-memory panes (the read/mutation divergence; see \
+             docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md). Offline this read server cannot \
+             prove liveness; the running app is the only reconciler.",
+        )
     };
+    let note = format!(
+        "No report or transcript on disk for {id}{}; {} — it may not have produced output yet, \
+         or this harness keeps no on-disk transcript. Read it live in the Agent Teams app, or ask \
+         the pane to write a report via team_orchestrate.{}{}",
+        harness
+            .as_deref()
+            .map(|h| format!(" (harness={h})"))
+            .unwrap_or_default(),
+        registry_fact,
+        live_note,
+        divergence,
+    );
     audit_read(state_dir, id, 0, "none");
     PaneOutputResult {
         id: id.to_string(),
@@ -248,6 +282,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
         content: None,
         truncated: false,
         note: Some(note),
+        registry_present: pane_is_live,
     }
 }
 
@@ -813,6 +848,45 @@ mod tests {
                 r.note
             );
         }
+    }
+
+    // R-GATES / Stage-0: the `none` path must expose registry presence and NAME the liveness
+    // state instead of reading as "the pane is gone" (the lie the 2026-07-29 incident hit).
+    #[test]
+    fn none_path_is_registry_absent_and_names_liveness_blindness() {
+        let root = unique_root("blind-absent");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let id = "ws44-p3";
+        let r = resolve(&state, id, None);
+        assert_eq!(r.source, "none");
+        assert!(!r.registry_present, "no registry file ⇒ registry_present false");
+        let note = r.note.as_deref().unwrap_or("");
+        assert!(note.contains("ABSENT from the live registry"), "note: {note}");
+        assert!(note.contains("LIVENESS-BLINDNESS"), "note: {note}");
+    }
+
+    #[test]
+    fn none_path_with_registry_row_says_listed_not_absent() {
+        let root = unique_root("blind-listed");
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let id = "ws44-p3";
+        // Registry lists the pane (pane_is_live true) but no report/transcript on disk; on the
+        // default (non phase-b) build there is no live scrollback either ⇒ honest none.
+        let reg = format!(
+            r#"{{"schema":1,"app_pid":4242,"workspaces":[{{"id":"{id}","pid":5001,"harness":"claude"}}]}}"#
+        );
+        fs::write(root.join("agent-teams-live.json"), reg).unwrap();
+        let r = resolve(&state, id, None);
+        assert_eq!(r.source, "none");
+        assert!(r.registry_present, "registry row present ⇒ registry_present true");
+        let note = r.note.as_deref().unwrap_or("");
+        assert!(note.contains("the live registry lists this pane"), "note: {note}");
+        assert!(
+            !note.contains("ABSENT from the live registry"),
+            "must not call a listed pane absent: {note}"
+        );
     }
 
     #[test]
