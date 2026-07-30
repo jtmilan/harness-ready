@@ -667,6 +667,7 @@ export default function Home() {
       { id: "close-workspace", label: "Close workspace", keywords: ["terminate", "reset", "fleet"], run: () => setOverlay("close-workspace") },
       { id: "toggle-broadcast", label: "Toggle broadcast mode", keywords: ["mode", "mirror", "keystroke"], hint: "⌘⇧I", run: () => setBroadcast((b) => !b) },
       { id: "go-monitoring", label: "Go to Monitoring", keywords: ["metrics", "fleet", "page", "nav"], run: () => navigate("/monitoring") },
+      { id: "skills-catalog", label: "Skills catalog", keywords: ["skills", "catalog", "oss", "browse", "reference"], hint: "/skills", run: () => navigate("/skills") },
       { id: "go-command", label: "Go to Command", keywords: ["home", "main", "page", "nav"], run: () => navigate("/") },
       ...workspaces.map((w) => ({
         id: `switch-ws-${w.id}`,
