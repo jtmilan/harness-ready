@@ -111,16 +111,24 @@ export default function TemplatesOverlay({ onLaunch, onClose }) {
           <span className="px-2 py-0.5 border border-cyan-800/70 text-[9px] font-mono tracking-[0.15em] text-cyan-600">LOCAL · localStorage</span>
           <div className="ml-4 flex gap-1">
             <button className={tabCls(view === "list")} onClick={() => setView("list")}>LAUNCH</button>
+            <button className={tabCls(view === "recipes")} onClick={() => setView("recipes")}>RECIPES</button>
             <button className={tabCls(view === "new")} onClick={() => setView("new")}>SAVE NEW</button>
           </div>
           <button onClick={onClose} className="ml-auto text-cyan-600 hover:text-cyan-300">
             <X className="w-4 h-4" />
           </button>
         </div>
-        {view === "list" ? (
+        {view === "new" ? (
+          <TemplateBuilder onSave={handleSave} saving={saving} />
+        ) : (
           <TemplateList
-            templates={templates}
+            templates={view === "recipes" ? templates.filter((t) => t.playbook) : templates}
             loading={loading}
+            emptyMessage={
+              view === "recipes"
+                ? "// no recipes yet — add a PLAYBOOK in SAVE NEW to turn a template into a recipe"
+                : undefined
+            }
             onExport={handleExport}
             onImportText={handleImportText}
             onLaunch={(t) => {
@@ -131,8 +139,6 @@ export default function TemplatesOverlay({ onLaunch, onClose }) {
             }}
             onDelete={handleDelete}
           />
-        ) : (
-          <TemplateBuilder onSave={handleSave} saving={saving} />
         )}
       </div>
     </div>

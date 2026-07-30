@@ -2,7 +2,7 @@ import React, { useRef } from "react";
 import { Rocket, Trash2, Download, Upload } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 
-export default function TemplateList({ templates, loading, onLaunch, onDelete, onExport, onImportText }) {
+export default function TemplateList({ templates, loading, onLaunch, onDelete, onExport, onImportText, emptyMessage }) {
   const fileRef = useRef(null);
   const onPickFile = (e) => {
     const file = e.target.files && e.target.files[0];
@@ -55,7 +55,7 @@ export default function TemplateList({ templates, loading, onLaunch, onDelete, o
     return (
       <div>
         {toolbar}
-        <div className="p-6 font-mono text-xs text-cyan-700">// no templates saved yet — IMPORT a bundle or switch to SAVE NEW</div>
+        <div className="p-6 font-mono text-xs text-cyan-700">{emptyMessage || "// no templates saved yet — IMPORT a bundle or switch to SAVE NEW"}</div>
       </div>
     );
   }
@@ -71,6 +71,17 @@ export default function TemplateList({ templates, loading, onLaunch, onDelete, o
               <div className="font-mono text-[11px] text-cyan-500 mt-1">
                 {t.agents.length} agent(s): {t.agents.map((a) => a.role).join(", ")}
               </div>
+              {t.playbook && (
+                <>
+                  <div className="mt-1 inline-flex items-center px-1.5 py-0.5 border border-amber-500/50 text-[9px] font-mono tracking-[0.15em] text-amber-300/90">RECIPE</div>
+                  <div className="font-mono text-[11px] text-amber-200/70 mt-1">// playbook: {t.playbook.slice(0, 120)}{t.playbook.length > 120 ? "…" : ""}</div>
+                </>
+              )}
+              {t.recommended && (t.recommended.autonomy || t.recommended.priority) && (
+                <div className="font-mono text-[10px] text-cyan-600 mt-0.5">
+                  recommended (advisory):{t.recommended.autonomy ? ` autonomy=${t.recommended.autonomy}` : ""}{t.recommended.priority ? ` priority=${t.recommended.priority}` : ""}
+                </div>
+              )}
             </div>
             <button
               onClick={() => onLaunch(t)}

@@ -26,10 +26,19 @@ export function validateOneTemplate(raw) {
     return { ok: false, error: "agents must be an array" };
   }
   const description = (typeof raw.description === "string" ? raw.description : "").slice(0, 2000);
-  return {
-    ok: true,
-    template: { name, description, agents: coerceTemplateAgents(raw.agents) },
-  };
+  // F-ONB-1 recipe fields. `playbook` = first-run steps / autonomy guidance that is DISPLAYED to
+  // the operator on launch (never auto-applied → not a fake affordance). `recommended` = advisory
+  // autonomy/priority stored as operator guidance; the backend does NOT enforce it (NEEDS-BACKEND),
+  // and the UI labels it advisory. Empty values are dropped so plain templates stay plain.
+  const playbook = typeof raw.playbook === "string" ? raw.playbook.trim().slice(0, 4000) : "";
+  const rec = isObj(raw.recommended) ? raw.recommended : {};
+  const recommended = {};
+  if (typeof rec.autonomy === "string" && rec.autonomy.trim()) recommended.autonomy = rec.autonomy.trim().slice(0, 40);
+  if (typeof rec.priority === "string" && rec.priority.trim()) recommended.priority = rec.priority.trim().slice(0, 40);
+  const template = { name, description, agents: coerceTemplateAgents(raw.agents) };
+  if (playbook) template.playbook = playbook;
+  if (recommended.autonomy || recommended.priority) template.recommended = recommended;
+  return { ok: true, template };
 }
 
 /**
@@ -83,11 +92,21 @@ export function buildExportBundle(templates) {
     schema: TEMPLATE_SCHEMA_VERSION,
     source: "harness-ready",
     exported_at: new Date().toISOString(),
-    templates: safe.map((t) => ({
-      name: typeof t?.name === "string" ? t.name : "",
-      description: typeof t?.description === "string" ? t.description : "",
-      agents: coerceTemplateAgents(t?.agents),
-    })),
+    templates: safe.map((t) => {
+      const out = {
+        name: typeof t?.name === "string" ? t.name : "",
+        description: typeof t?.description === "string" ? t.description : "",
+        agents: coerceTemplateAgents(t?.agents),
+      };
+      if (typeof t?.playbook === "string" && t.playbook.trim()) out.playbook = t.playbook.trim().slice(0, 4000);
+      if (isObj(t?.recommended)) {
+        const r = {};
+        if (typeof t.recommended.autonomy === "string" && t.recommended.autonomy.trim()) r.autonomy = t.recommended.autonomy.trim().slice(0, 40);
+        if (typeof t.recommended.priority === "string" && t.recommended.priority.trim()) r.priority = t.recommended.priority.trim().slice(0, 40);
+        if (r.autonomy || r.priority) out.recommended = r;
+      }
+      return out;
+    }),
   };
 }
 
