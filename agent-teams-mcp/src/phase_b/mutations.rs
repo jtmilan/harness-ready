@@ -1093,6 +1093,7 @@ mod tests {
                 content: Some("p0 did the thing".into()),
                 truncated: false,
                 note: None,
+                registry_present: true,
             },
             PaneOutputResult {
                 id: "ws9-p1".into(),
@@ -1102,6 +1103,7 @@ mod tests {
                 content: None,
                 truncated: false,
                 note: Some("no on-disk transcript for this harness".into()),
+                registry_present: false,
             },
             PaneOutputResult {
                 id: "ws9-p2".into(),
@@ -1111,6 +1113,7 @@ mod tests {
                 content: Some("tail of p2".into()),
                 truncated: true,
                 note: None,
+                registry_present: true,
             },
         ];
         let (doc, panes) = merge_pane_outputs("ship the feature", &results);
