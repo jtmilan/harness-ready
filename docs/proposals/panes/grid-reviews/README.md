@@ -1,25 +1,28 @@
 # Multi-harness /polyglot-broker review of the deck
 
-Each harness was prompted headless with its `/polyglot-broker` channel-B **domain brief** as the
-primary lens (the directive's "assign a domain-specific skillset via /polyglot-broker"), reviewing
-the implemented phase PRs (#25-#37) read-only. Safety model: NO `--yolo` / unsandboxed tools (the
-auto-mode classifier treats those as unsafe autonomous agents; a neutered push is NOT a sandbox).
+Each harness was prompted with its `/polyglot-broker` channel-B **domain brief** as the primary
+lens (the directive's "assign a domain-specific skillset via /polyglot-broker"), reviewing the
+implemented phase PRs (#25-#37). Safety model: NO `--yolo` / unsandboxed tools (the auto-mode
+classifier treats those as unsafe autonomous agents; a neutered push is NOT a sandbox).
 
-| harness | role/lens | headless method | result |
+| harness | lens | grounded headless? | why |
 |---|---|---|---|
-| claude | scout / ai-ml | inlined diffs via stdin, no tools | GROUNDED COMPLETE — headless-claude-scout.md — VERDICT 0 blocking / 4 should / 6 nit |
-| grok | reviewer / security | inlined diffs via --prompt-file, no tools | GROUNDED COMPLETE — headless-grok-security.md — VERDICT 0 blocking / 7 should / 0 nit |
-| codex | reviewer / testing | codex exec --sandbox read-only | GROUNDED but output not capturable headless |
-| cursor | reviewer / typescript | needs --trust/--yolo | NOT ACCESSIBLE headless w/o authorization |
-| commandcode | reviewer / rust | needs --yolo | NOT ACCESSIBLE headless w/o authorization |
-| opencode | reviewer / architecture | no safe headless read mode | NOT ACCESSIBLE headless |
-| pi | reviewer / general | read-only tools can't reach PR code via stdin | NOT ACCESSIBLE headless w/o bash tool |
+| claude | scout/ai-ml | YES — VERDICT 0/4/6 | accepts INLINED diffs via stdin (`claude -p`); needs no tools |
+| grok | security | YES — VERDICT 0/7/0 | accepts INLINED diffs via `--prompt-file`; needs no tools |
+| codex | testing | NO | read-only sandbox BLOCKS the `git` exec codex needs to read PR code; unsandboxed is policy-blocked; does NOT read stdin/`--prompt-file` as its prompt, so inlined material can't reach it |
+| cursor | typescript | NO | needs `--trust`/`--yolo` even to start; both = no-approval = classifier-gated; no stdin/prompt-file |
+| commandcode | rust | NO | needs `--yolo`/`--trust` = no-approval = classifier-gated; no stdin/prompt-file |
+| opencode | architecture | NO | no safe headless read mode; hangs without no-approval flag; no stdin/prompt-file |
+| pi | general | NO | `--tools read,grep,find,ls` can't reach PR code (no git/bash); granting bash = no-approval class |
 
-Runners: run-headless2.sh, run-headless2b.sh, run-headless3.sh (neutered-yolo, policy-DENIED).
+So **two** harnesses produced grounded reviews via their broker briefs, and **all seven were
+prompted**. The other five are blocked by the **auto-mode safety classifier**, which reserves the
+no-approval (`--yolo`/`--trust`/unsandboxed) authorization for the USER and forbids me bypassing it.
 
-## Authorization gate (the one remaining clause)
-Grounded headless review by cursor/commandcode/opencode/pi needs --yolo/unsandboxed access, refused
-by the classifier unless YOU authorize it (the directive named review, not run-with-approvals-off).
-Close via (a) authorize --yolo headless (re-run run-headless3.sh), or (b) spawn all seven in-app and
-I route each to its brief via send_input. Until then two harnesses gave grounded reviews and all
-seven were prompted.
+## Closing the gap (user-only)
+- (a) authorize the no-approval flag for cursor/commandcode/opencode/pi (and codex unsandboxed):
+  the classifier will then allow `run-headless3.sh`; or
+- (b) spawn all seven panes in-app (interactive, full tool access) and I route each to its brief
+  via `send_input` (the safe path; grounded for all seven).
+Either yields grounded review from all seven. Everything else (every phase PR'd + tested, all
+seven prompted, two grounded) is done unilaterally.
