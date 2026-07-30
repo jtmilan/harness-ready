@@ -1591,6 +1591,7 @@ mod tests {
                     role: None,
                     session_id: None,
                     tag: None,
+                    allow_sharing: false,
                 })
                 .collect(),
         };
