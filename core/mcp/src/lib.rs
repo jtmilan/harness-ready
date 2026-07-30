@@ -1984,6 +1984,18 @@ pub struct McpConfig {
     /// in `mcp-config.json` to arm isolation after the backend gates land.
     #[serde(default)]
     pub ws_isolation_enabled: bool,
+    /// LIVENESS RECONCILER (Phase-0, v1, dep-free): when `true`, the sidecar's
+    /// `team_read_output` and `team_get_queue`/`identified_queue` reconcile the
+    /// registry's "live" set with a disk signal (`events.jsonl` recency) so a
+    /// stale/missing registry does not silently drop running panes from the
+    /// read/queue path. DEFAULT `false` — INERT: when off, the existing
+    /// registry-only logic is preserved byte-for-byte (the flag-off path is
+    /// the unchanged existing logic). See docs/REQUIRES-HUMAN-DESIGN-liveness-
+    /// blindness.md. v1 uses `events.jsonl` mtime only (no pid kill-0); state-
+    /// blind panes with no events fall back to registry trust. The flag is
+    /// PROVISIONAL pending human Q1–Q7. File-only; not LLM-settable.
+    #[serde(default)]
+    pub reconcile_liveness: bool,
     /// UNKNOWN-KEY PRESERVATION (Settings RMW safety): every key this build does not
     /// model — a NEWER build's gate, or an unrelated tool's sibling setting kept in the
     /// same file (e.g. `insforge_dashboard`, read as raw JSON elsewhere) — is captured
@@ -2032,6 +2044,7 @@ impl Default for McpConfig {
             memory_harvest: false,
             memory_capture: false,
             ws_isolation_enabled: false,
+            reconcile_liveness: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -2353,6 +2366,287 @@ pub struct IdentityProof {
     /// The server's HMAC-SHA256 tag, 64 ASCII-hex chars. Non-optional so an absent
     /// `mac` hits the strict reject rather than defaulting to a bypass.
     pub mac: String,
+}
+
+// ─────────────────── Phase-0 liveness reconciler (v1, dep-free, INERT) ──────────────
+//
+// OBSERVED-LIVE reconciler: reconcile the registry's "live" set with a DISK signal
+// (events.jsonl recency) so a stale/missing registry does not silently drop running
+// panes from the read/queue path.
+//
+// See docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md for the divergence this
+// addresses (RC1–RC6) and the Stage-0 read-path honesty slice. v1 is dep-free and
+// uses events.jsonl recency for the disk signal (no pid kill-0); therefore
+// state_blind panes with no events fall back to Registry trust, and a positive
+// Mismatch signal is intentionally not emitted in v1 (pid-probe is future work,
+// Q4/Q5). The flag is provisional pending human Q1–Q7; default OFF.
+//
+// OFF-BY-DEFAULT: the `reconcile_liveness` key in `McpConfig` defaults to `false`.
+// When OFF, the existing registry-only logic is preserved byte-for-byte — this
+// module's pure helpers are never invoked from the hot path.
+
+/// Where a pane's "observed live" signal came from (Phase-0 reconciler, v1).
+///
+/// A pane may appear in the registry, on disk (recent `events.jsonl`), or both;
+/// the reconciler tags each entry so downstream surfaces can tell them apart.
+/// A `Mismatch` variant is intentionally NOT emitted in v1 — pid-probe is future
+/// work (Q4/Q5); see docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessSource {
+    /// Present in the live registry only (no recent disk activity).
+    Registry,
+    /// Present on disk only (recent `events.jsonl` but absent from the registry).
+    Disk,
+    /// Present in BOTH the registry and on disk with recent activity.
+    Both,
+}
+
+/// Decide the liveness source for one pane from the two boolean signals.
+///
+/// Pure — no I/O. Returns `None` when neither signal says "live" (the pane is
+/// not observed-live and should not appear in the reconciled set).
+///
+/// | `in_registry` | `disk_recent` | result            |
+/// |---------------|---------------|-------------------|
+/// | true          | true          | `Some(Both)`      |
+/// | true          | false         | `Some(Registry)`  |
+/// | false         | true          | `Some(Disk)`      |
+/// | false         | false         | `None`            |
+pub fn liveness_source(in_registry: bool, disk_recent: bool) -> Option<LivenessSource> {
+    match (in_registry, disk_recent) {
+        (true, true) => Some(LivenessSource::Both),
+        (true, false) => Some(LivenessSource::Registry),
+        (false, true) => Some(LivenessSource::Disk),
+        (false, false) => None,
+    }
+}
+
+/// Build the OBSERVED-LIVE set: union of registry and disk-recent pane ids,
+/// each tagged with its [`LivenessSource`] (`Both` / `Registry` / `Disk`).
+///
+/// **Order:** registry ids first (in their input order), then disk-only ids
+/// (in their input order). **De-dup:** within each input (a repeated registry
+/// id appears once) AND across inputs (a disk id that is already in the
+/// registry set is skipped — the registry entry carries the correct `Both` /
+/// `Registry` tag from the first pass). Pure — no I/O; caller supplies both
+/// id sets.
+pub fn observed_live_ids<'a>(
+    registry_ids: impl IntoIterator<Item = &'a str>,
+    disk_recent_ids: impl IntoIterator<Item = &'a str>,
+) -> Vec<(&'a str, LivenessSource)> {
+    // Materialize disk-recent into an ORDERED vec (preserves caller input order
+    // for the disk-only tail of the output) AND a set (O(1) lookup during the
+    // registry pass so a registry id that is ALSO disk-recent gets `Both`).
+    let mut disk_ordered: Vec<&str> = Vec::new();
+    let mut disk_set: HashSet<&str> = HashSet::new();
+    for id in disk_recent_ids {
+        if disk_set.insert(id) {
+            disk_ordered.push(id);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out: Vec<(&str, LivenessSource)> = Vec::new();
+
+    // Registry pass first: tag each registry id with Both (if also disk-recent)
+    // or Registry (if not). De-dup within the registry input.
+    for id in registry_ids {
+        if seen.insert(id) {
+            let tag = if disk_set.contains(id) {
+                LivenessSource::Both
+            } else {
+                LivenessSource::Registry
+            };
+            out.push((id, tag));
+        }
+    }
+
+    // Disk pass: only ids NOT already in the registry set make it through (the
+    // registry pass tagged them correctly). Preserves disk input order.
+    for id in disk_ordered {
+        if seen.insert(id) {
+            out.push((id, LivenessSource::Disk));
+        }
+    }
+
+    out
+}
+
+/// Pure recency check: is the `events.jsonl` mtime within `ttl` of `now`?
+///
+/// Returns `true` iff `events_mtime` is `Some` AND `now - mtime <= ttl`. Caller
+/// supplies `now` + `mtime` (no `SystemTime::now()` call inside — pure + unit-
+/// testable). A `None` mtime means the file is absent/unreadable ⇒ not recent.
+pub fn disk_recent(
+    events_mtime: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    ttl: std::time::Duration,
+) -> bool {
+    match events_mtime {
+        None => false,
+        Some(mt) => match now.duration_since(mt) {
+            Ok(age) => age <= ttl,
+            // mtime is in the FUTURE of `now` (clock skew) — treat as recent so a
+            // legitimate pane with a skewed clock is not silently dropped.
+            Err(_) => true,
+        },
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    // ── liveness_source: every (in_registry × disk_recent) combo ────────────────
+
+    #[test]
+    fn liveness_source_both_true() {
+        assert_eq!(liveness_source(true, true), Some(LivenessSource::Both));
+    }
+
+    #[test]
+    fn liveness_source_registry_only() {
+        assert_eq!(liveness_source(true, false), Some(LivenessSource::Registry));
+    }
+
+    #[test]
+    fn liveness_source_disk_only() {
+        assert_eq!(liveness_source(false, true), Some(LivenessSource::Disk));
+    }
+
+    #[test]
+    fn liveness_source_neither() {
+        assert_eq!(liveness_source(false, false), None);
+    }
+
+    // ── observed_live_ids: ordering + dedup ────────────────────────────────────
+
+    #[test]
+    fn observed_live_ids_empty_inputs() {
+        let result = observed_live_ids(Vec::<&str>::new(), Vec::<&str>::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn observed_live_ids_registry_only() {
+        let reg = ["ws1-p0", "ws1-p1"];
+        let result = observed_live_ids(reg.iter().copied(), Vec::<&str>::new());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("ws1-p0", LivenessSource::Registry));
+        assert_eq!(result[1], ("ws1-p1", LivenessSource::Registry));
+    }
+
+    #[test]
+    fn observed_live_ids_disk_only() {
+        let disk = ["ws2-p0", "ws2-p1"];
+        let result = observed_live_ids(Vec::<&str>::new(), disk.iter().copied());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("ws2-p0", LivenessSource::Disk));
+        assert_eq!(result[1], ("ws2-p1", LivenessSource::Disk));
+    }
+
+    #[test]
+    fn observed_live_ids_both_overlap_tagged_both() {
+        let reg = ["ws1-p0", "ws1-p1"];
+        let disk = ["ws1-p0", "ws1-p1"];
+        let result = observed_live_ids(reg.iter().copied(), disk.iter().copied());
+        assert_eq!(result.len(), 2, "de-duped: two ids, not four");
+        assert_eq!(result[0], ("ws1-p0", LivenessSource::Both));
+        assert_eq!(result[1], ("ws1-p1", LivenessSource::Both));
+    }
+
+    #[test]
+    fn observed_live_ids_mixed_registry_first_then_disk_only() {
+        // Registry: [A, B, C]. Disk: [B, C, D]. Expected order:
+        // A (Registry), B (Both), C (Both), D (Disk) — registry first in
+        // input order, then disk-only in input order.
+        let reg = ["A", "B", "C"];
+        let disk = ["B", "C", "D"];
+        let result = observed_live_ids(reg.iter().copied(), disk.iter().copied());
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0], ("A", LivenessSource::Registry));
+        assert_eq!(result[1], ("B", LivenessSource::Both));
+        assert_eq!(result[2], ("C", LivenessSource::Both));
+        assert_eq!(result[3], ("D", LivenessSource::Disk));
+    }
+
+    #[test]
+    fn observed_live_ids_dedup_within_registry_input() {
+        let reg = ["A", "A", "B"];
+        let result = observed_live_ids(reg.iter().copied(), Vec::<&str>::new());
+        assert_eq!(result.len(), 2, "duplicate A appears once");
+        assert_eq!(result[0].0, "A");
+        assert_eq!(result[1].0, "B");
+    }
+
+    #[test]
+    fn observed_live_ids_dedup_within_disk_input() {
+        let disk = ["X", "X", "Y"];
+        let result = observed_live_ids(Vec::<&str>::new(), disk.iter().copied());
+        assert_eq!(result.len(), 2, "duplicate X appears once");
+        assert_eq!(result[0].0, "X");
+        assert_eq!(result[1].0, "Y");
+    }
+
+    #[test]
+    fn observed_live_ids_disk_order_preserved() {
+        // Disk-only ids appear in their input order, not hash-set order.
+        let disk = ["Z", "A", "M", "B"];
+        let result = observed_live_ids(Vec::<&str>::new(), disk.iter().copied());
+        let ids: Vec<&str> = result.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["Z", "A", "M", "B"]);
+    }
+
+    // ── disk_recent: within/outside TTL + None mtime ───────────────────────────
+
+    fn epoch_secs(s: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn disk_recent_none_mtime_is_not_recent() {
+        let now = epoch_secs(1000);
+        let ttl = Duration::from_secs(120);
+        assert!(!disk_recent(None, now, ttl));
+    }
+
+    #[test]
+    fn disk_recent_within_ttl() {
+        let now = epoch_secs(1000);
+        let mtime = epoch_secs(950); // 50s ago, ttl 120s
+        assert!(disk_recent(Some(mtime), now, Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn disk_recent_exactly_at_ttl_boundary() {
+        let now = epoch_secs(1000);
+        let mtime = epoch_secs(880); // exactly 120s ago
+        assert!(disk_recent(Some(mtime), now, Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn disk_recent_outside_ttl() {
+        let now = epoch_secs(1000);
+        let mtime = epoch_secs(800); // 200s ago, ttl 120s
+        assert!(!disk_recent(Some(mtime), now, Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn disk_recent_future_mtime_treated_as_recent() {
+        // Clock skew: mtime is AHEAD of now. Defensive: treat as recent so a
+        // legitimate pane with a skewed clock is not silently dropped.
+        let now = epoch_secs(1000);
+        let mtime = epoch_secs(1100); // 100s in the future
+        assert!(disk_recent(Some(mtime), now, Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn disk_recent_zero_ttl_only_exact_match() {
+        let now = epoch_secs(1000);
+        assert!(disk_recent(Some(epoch_secs(1000)), now, Duration::from_secs(0)));
+        assert!(!disk_recent(Some(epoch_secs(999)), now, Duration::from_secs(0)));
+    }
 }
 
 #[cfg(test)]

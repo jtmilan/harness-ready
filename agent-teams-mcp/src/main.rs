@@ -1341,9 +1341,115 @@ impl ServerHandler for TeamServer {
 /// can momentarily trust a dead set; event-gating means only ids that still have
 /// `events.jsonl` rows ever surface. Precise app-liveness lands in Phase B (over
 /// the socket). **Sidecar-side only** — the app writes the registry; we read it.
+///
+/// ## Phase-0 liveness reconciler (v1, INERT by default)
+///
+/// When `McpConfig.reconcile_liveness` is `true`, the registry's live set is
+/// reconciled with a disk signal (`recent_event_ids` — `events.jsonl` mtime
+/// within a TTL) via [`agent_teams_core::observed_live_ids`], so disk-only
+/// panes (absent from a stale/missing registry) are included in the queue.
+/// When `false` (the DEFAULT), the existing registry-only logic executes
+/// byte-for-byte — the reconciler is INERT.
+/// See docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md.
 fn identified_queue(state_dir: &Path) -> Vec<QueueRow> {
     let registry = read_registry(state_dir);
-    compute_queue_identified(state_dir, registry.as_ref())
+
+    // Phase-0 reconciler (INERT by default): read the flag ONCE.
+    // Flag-off → EXACT existing logic (registry-only, byte-for-byte).
+    let cfg = agent_teams_core::read_mcp_config(state_dir);
+    if !cfg.reconcile_liveness {
+        // ── Flag-OFF path: unchanged existing logic ──────────────────────────
+        return compute_queue_identified(state_dir, registry.as_ref());
+    }
+
+    // ── Flag-ON path: reconcile registry with disk recency ───────────────────
+    // Build the observed-live set: registry ids + disk-recent ids, tagged.
+    let reg_ids: Vec<String> = registry
+        .as_ref()
+        .map(|r| r.workspaces.iter().map(|w| w.id.clone()).collect())
+        .unwrap_or_default();
+    let reg_id_strs: Vec<&str> = reg_ids.iter().map(|s| s.as_str()).collect();
+    let disk_ids = recent_event_ids(state_dir, RECONCILE_DISK_TTL);
+    let disk_id_strs: Vec<&str> = disk_ids.iter().map(|s| s.as_str()).collect();
+    let observed = agent_teams_core::observed_live_ids(reg_id_strs, disk_id_strs);
+
+    // Build a merged registry that includes disk-only panes (as bare
+    // `LiveWorkspace` entries with only the id populated) so
+    // `compute_queue_identified` discovers their events.jsonl and includes them
+    // in the ranked queue. Registry-only + Both panes keep their original
+    // registry entry (with role/tag/etc.) unchanged.
+    let base = registry.unwrap_or_else(|| agent_teams_core::LiveRegistry {
+        schema: agent_teams_core::LIVE_REGISTRY_SCHEMA,
+        app_pid: None,
+        updated_at: None,
+        active: None,
+        workspaces: Vec::new(),
+    });
+    let mut merged = base;
+    for &(id, src) in &observed {
+        if src == agent_teams_core::LivenessSource::Disk {
+            // Disk-only: add a bare entry so compute_queue_identified's live-set
+            // filter keeps this id. role/tag stay None — the registry never knew
+            // this pane, so there's nothing to join.
+            merged.workspaces.push(agent_teams_core::LiveWorkspace {
+                id: id.to_string(),
+                pid: None,
+                harness: None,
+                repo: None,
+                role: None,
+                tag: None,
+                session_id: None,
+                spawned_at: None,
+                allow_sharing: false,
+            });
+        }
+    }
+    compute_queue_identified(state_dir, Some(&merged))
+}
+
+/// Default TTL (seconds) for the disk-recency signal in the Phase-0 reconciler.
+/// An `events.jsonl` with an mtime older than this is treated as "not recent"
+/// and does not contribute to the observed-live set. 120s is conservative: a
+/// live pane's state adapter writes events frequently enough that a 2-minute
+/// window catches any pane that is actually processing.
+pub(crate) const RECONCILE_DISK_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Scan the per-pane `events.jsonl` files under `state_dir` and return ids whose
+/// mtime is within `ttl` of `SystemTime::now()`.
+///
+/// Mirrors the directory layout used by [`state_adapter::watch::discover`]:
+/// `<state_dir>/<workspace_id>/events.jsonl`. Best-effort: any read error
+/// (missing dir, permission denied, malformed mtime) → that pane contributes
+/// nothing (never panic). No new crate dependency — std-only I/O.
+///
+/// The returned ids are workspace/pane ids (the directory name under
+/// `state_dir`), in the order `fs::read_dir` yields them (NOT sorted — the
+/// caller is responsible for ordering if needed; the reconciler's
+/// [`agent_teams_core::observed_live_ids`] preserves disk-input order).
+pub(crate) fn recent_event_ids(state_dir: &Path, ttl: std::time::Duration) -> Vec<String> {
+    let now = std::time::SystemTime::now();
+    let mut ids = Vec::new();
+    let entries = match std::fs::read_dir(state_dir) {
+        Ok(rd) => rd,
+        Err(_) => return ids, // state_dir missing/unreadable → empty
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let events = dir.join("events.jsonl");
+        let mtime = match std::fs::metadata(&events).and_then(|m| m.modified()) {
+            Ok(mt) => Some(mt),
+            Err(_) => None,
+        };
+        if agent_teams_core::disk_recent(mtime, now, ttl) {
+            if let Some(id) = dir.file_name().and_then(|s| s.to_str()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// `$AGENT_TEAMS_STATE_DIR`, else `~/Library/Application Support/harness-ready/agent-teams`

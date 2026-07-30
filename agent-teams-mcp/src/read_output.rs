@@ -51,7 +51,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use agent_teams_core::{read_registry, validate_session_id, validate_spawn_id};
+use agent_teams_core::{
+    read_mcp_config, read_registry, validate_session_id, validate_spawn_id, LivenessSource,
+};
 
 /// Default + hard cap on returned content bytes (the newest tail is kept). SSOT in
 /// `agent_teams_core` (shared with the app-side `ReadOutput` handler so the disk and
@@ -132,8 +134,36 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     // Liveness (registry membership) drives the gap-7 live-scrollback attempt below AND the
     // `registry_present` field + liveness-blindness note on EVERY build — so it is always read
     // (no cfg-conditional `#[allow(unused_variables)]` needed).
-    let pane_is_live = reg_row.is_some();
+    let mut pane_is_live = reg_row.is_some();
     let (harness, repo, session_id) = reg_row.unwrap_or((None, None, None));
+
+    // Phase-0 reconciler (INERT by default): when reconcile_liveness is ON,
+    // widen `pane_is_live` to include disk-recent panes the registry omits.
+    // The `reconcile_source` is carried for the none-path note (diagnostic).
+    // Flag-OFF → this block is a no-op (pane_is_live stays registry-only).
+    // See docs/REQUIRES-HUMAN-DESIGN-liveness-blindness.md.
+    let reconcile_source: Option<LivenessSource> = {
+        let cfg = read_mcp_config(state_dir);
+        if cfg.reconcile_liveness {
+            let reg_ids: Vec<&str> = if pane_is_live { vec![id] } else { vec![] };
+            let disk_ids_vec = crate::recent_event_ids(state_dir, crate::RECONCILE_DISK_TTL);
+            let disk_ids: Vec<&str> = if disk_ids_vec.iter().any(|d| d == id) {
+                vec![id]
+            } else {
+                vec![]
+            };
+            let observed = agent_teams_core::observed_live_ids(reg_ids, disk_ids);
+            if let Some(&(_, src)) = observed.first() {
+                // The id is in the observed set — treat as live, carry the source tag.
+                pane_is_live = true;
+                Some(src)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
 
     // 1) orchestrate/bridge report — harness-agnostic, the primary "what p4 produced".
     if let Some((path, body)) = newest_report_md(state_dir, repo.as_deref(), id) {
@@ -245,6 +275,9 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
     //    NAMES the liveness state so the read/mutation divergence (R-GATES / liveness blindness)
     //    is observable instead of silently reading as "the pane is gone": `registry_present`
     //    carries the raw signal; the prose explains what it means offline.
+    //    When the Phase-0 reconciler is ON, the liveness_source tag is appended
+    //    (e.g. "▸ observed=Disk") so the consumer can tell which signal placed
+    //    the pane in the live set.
     let (registry_fact, divergence) = if pane_is_live {
         (
             "the live registry lists this pane",
@@ -261,10 +294,19 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
              prove liveness; the running app is the only reconciler.",
         )
     };
+    // Phase-0 reconciler diagnostic: append the liveness_source tag when the
+    // reconciler is ON and found this pane in the observed set. INERT when off
+    // (reconcile_source is None → the suffix is empty).
+    let reconcile_tag = match reconcile_source {
+        Some(LivenessSource::Both) => " ▸ observed=Both (registry+disk-recent)",
+        Some(LivenessSource::Registry) => " ▸ observed=Registry",
+        Some(LivenessSource::Disk) => " ▸ observed=Disk (events.jsonl recent; registry omits)",
+        None => "",
+    };
     let note = format!(
         "No report or transcript on disk for {id}{}; {} — it may not have produced output yet, \
          or this harness keeps no on-disk transcript. Read it live in the Agent Teams app, or ask \
-         the pane to write a report via team_orchestrate.{}{}",
+         the pane to write a report via team_orchestrate.{}{}{}",
         harness
             .as_deref()
             .map(|h| format!(" (harness={h})"))
@@ -272,6 +314,7 @@ pub fn resolve(state_dir: &Path, id: &str, max_bytes: Option<u32>) -> PaneOutput
         registry_fact,
         live_note,
         divergence,
+        reconcile_tag,
     );
     audit_read(state_dir, id, 0, "none");
     PaneOutputResult {
